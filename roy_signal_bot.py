@@ -95,9 +95,9 @@ def sync_from_main_bot():
     last_sync_time = now
 
     try:
-        # Read main bot's Telegram messages for exports
+        # Read signal bot's own messages (main bot sends export here)
         r = requests.get(
-            f"https://api.telegram.org/bot{MAIN_TOKEN}/getUpdates",
+            f"https://api.telegram.org/bot{SIGNAL_TOKEN}/getUpdates",
             params={"limit": 100},
             timeout=10
         )
