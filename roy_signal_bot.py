@@ -547,7 +547,8 @@ def handle_commands():
             for update in updates:
                 last_update_id = update["update_id"]
                 msg  = update.get("message", {})
-                text = msg.get("text", "").strip().upper()
+                raw_text = msg.get("text", "").strip()
+                text = raw_text.upper()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
 
                 if chat_id != ADMIN_CHAT_ID:
