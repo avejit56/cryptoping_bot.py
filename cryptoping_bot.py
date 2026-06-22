@@ -3010,6 +3010,11 @@ def detect_break_retest_pattern(klines_4h, current_price):
 
     # Find the most recent strong-body bullish candle that closed above the
     # highest price seen in the candles before it — that's our breakout candle.
+    # NOTE: relaxed from 0.55 to 0.40 body/range ratio — a genuine breakout
+    # candle often still has a real wick (price pushes higher within the same
+    # candle before settling back somewhat), and requiring a near-full body
+    # was filtering out real breakouts like ENA's, where the close was still
+    # well above the prior resistance even with a wick on top.
     break_i = None
     level_price = None
     for i in range(n - 2, 3, -1):  # leave room for at least 1 candle after it (a retest candle)
@@ -3017,7 +3022,7 @@ def detect_break_retest_pattern(klines_4h, current_price):
         o, c, h, l = float(k[1]), float(k[4]), float(k[2]), float(k[3])
         candle_range = h - l
         body = abs(c - o)
-        if candle_range <= 0 or body / candle_range < 0.55 or c <= o:
+        if candle_range <= 0 or body / candle_range < 0.40 or c <= o:
             continue
         prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
         if c > prior_high * 1.005:  # closed meaningfully above the prior resistance
@@ -3026,7 +3031,9 @@ def detect_break_retest_pattern(klines_4h, current_price):
             break
 
     if break_i is None or level_price is None:
+        print(f"📐 /entry pattern: no qualifying breakout candle found in last {n} 4H candles for this symbol")
         return None
+    print(f"📐 /entry pattern: breakout found at candle -{n - break_i}, level={level_price:.6g}")
 
     candles_since_break = lookback[break_i + 1:]
     if not candles_since_break:
@@ -3037,6 +3044,9 @@ def detect_break_retest_pattern(klines_4h, current_price):
 def _build_retest_guidance(level_price, current_price, candles_since_break):
     near_level = abs(current_price - level_price) / level_price <= 0.05
     still_above = current_price >= level_price * 0.98  # hasn't broken back below it
+    pct_from_level = (current_price - level_price) / level_price * 100
+    print(f"📐 /entry pattern: current={current_price:.6g} level={level_price:.6g} "
+          f"({pct_from_level:+.1f}% from level) near={near_level} still_above={still_above}")
 
     last_candle = candles_since_break[-1]
     last_o, last_c = float(last_candle[1]), float(last_candle[4])
