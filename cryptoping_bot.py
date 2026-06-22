@@ -179,6 +179,7 @@ ZONE_HISTORY_FILE = os.path.join(_BOT_DIR, "zone_history.json")
 SIGNAL_PERFORMANCE_FILE = os.path.join(_BOT_DIR, "signal_performance.json")
 PREPUMP_PHASES_FILE = os.path.join(_BOT_DIR, "prepump_phases.json")
 TRENDLINE_TRACKING_FILE = os.path.join(_BOT_DIR, "trendline_retest_tracking.json")
+COOLDOWN_TRACKERS_FILE = os.path.join(_BOT_DIR, "cooldown_trackers.json")
 
 # ─── PERSISTENT STORAGE ───────────────────────────────────
 WATCHLIST_MSG_ID = None
@@ -327,6 +328,57 @@ def load_trendline_tracking():
     except Exception as e:
         print(f"Trendline tracking load error: {e}")
 
+def save_cooldown_trackers():
+    """
+    Bundles all 9 cooldown/dedup dicts into one file. These were originally left
+    unpersisted (item #29 only covered the 3 analytically-relevant dicts), on the
+    assumption they only prevent duplicate alerts within a single running process
+    and have no historical value. In practice, with frequent redeploys (each one
+    wiping in-memory state), this caused the bot to "forget" it had just sent an
+    alert moments before a deploy and re-send the same signal right after — exactly
+    the duplicate-message-after-update symptom. Persisting these closes that gap.
+    """
+    try:
+        bundle = {
+            "alerted_coins": alerted_coins,
+            "buildup_alerted": buildup_alerted,
+            "trendline_alerted": trendline_alerted,
+            "postpump_alerted": postpump_alerted,
+            "buy_pressure_alerted": buy_pressure_alerted,
+            "volume_surge_alerted": volume_surge_alerted,
+            "zone_high_alerted": zone_high_alerted,
+            "big_pump_alerted": big_pump_alerted,
+            "breakout_alerted": breakout_alerted,
+        }
+        with open(COOLDOWN_TRACKERS_FILE, "w") as f:
+            _json.dump(bundle, f, indent=2)
+    except Exception as e:
+        print(f"Cooldown trackers save error: {e}")
+
+def load_cooldown_trackers():
+    global alerted_coins, buildup_alerted, trendline_alerted, postpump_alerted
+    global buy_pressure_alerted, volume_surge_alerted, zone_high_alerted
+    global big_pump_alerted, breakout_alerted
+    try:
+        if os.path.exists(COOLDOWN_TRACKERS_FILE):
+            with open(COOLDOWN_TRACKERS_FILE) as f:
+                bundle = _json.load(f)
+            alerted_coins.update(bundle.get("alerted_coins", {}))
+            buildup_alerted.update(bundle.get("buildup_alerted", {}))
+            trendline_alerted.update(bundle.get("trendline_alerted", {}))
+            postpump_alerted.update(bundle.get("postpump_alerted", {}))
+            buy_pressure_alerted.update(bundle.get("buy_pressure_alerted", {}))
+            volume_surge_alerted.update(bundle.get("volume_surge_alerted", {}))
+            zone_high_alerted.update(bundle.get("zone_high_alerted", {}))
+            big_pump_alerted.update(bundle.get("big_pump_alerted", {}))
+            breakout_alerted.update(bundle.get("breakout_alerted", {}))
+            total = sum(len(v) for v in bundle.values())
+            print(f"✅ Cooldown trackers loaded: {total} entries across 9 dicts")
+        else:
+            print("⏱ No cooldown trackers file, starting fresh")
+    except Exception as e:
+        print(f"Cooldown trackers load error: {e}")
+
 def save_watchlist_file():
     try:
         extra = [c for c in watchlist if c not in DEFAULT_WATCHLIST]
@@ -395,6 +447,7 @@ def load_from_telegram():
     load_signal_performance()
     load_prepump_phases()
     load_trendline_tracking()
+    load_cooldown_trackers()
 
 # ─── TELEGRAM ─────────────────────────────────────────────
 def send_to(chat_id, message):
@@ -446,6 +499,66 @@ def get_topic_for_message(message):
         return TOPIC_RESULTS
     else:
         return TOPIC_SPIKES  # default
+
+def get_category_for_signal_type(signal_type):
+    """
+    Maps a signal_performance entry's signal_type string to the same category
+    buckets used for topic routing (High Priority / Quick Spikes / Building
+    Momentum), so the /report command's breakdown matches what subscribers
+    actually see in each topic.
+    """
+    st = signal_type.upper()
+    if any(x in st for x in ["ZONE", "RETEST", "EXPLOSIVE", "OB BOUNCE", "TRENDLINE", "PRE-PUMP", "BREAKOUT"]):
+        return "High Priority"
+    elif any(x in st for x in ["VOLUME SPIKE", "VOLUME SURGE", "EARLY SIGNAL", "ABNORMAL"]):
+        return "Quick Spikes"
+    elif any(x in st for x in ["BUILD-UP", "ACCUMULATION", "HIGHER LOW", "DIRECT MOMENTUM"]):
+        return "Building Momentum"
+    else:
+        return "Other"
+
+def build_report(window_seconds, window_label):
+    """
+    Builds a category breakdown report from signal_performance: how many signals
+    fired in the window, and what fraction of those reached +10% or more (using
+    the actual highest price seen, not just the price at signal time — same
+    "highest_after" tracking the SIGNAL RESULT messages use).
+    """
+    now = time.time()
+    cutoff = now - window_seconds
+    by_category = {}
+
+    for perf_key, data in signal_performance.items():
+        if data.get("signal_time", 0) < cutoff:
+            continue
+        category = get_category_for_signal_type(data.get("signal_type", ""))
+        bucket = by_category.setdefault(category, {"total": 0, "hit_10pct": 0})
+        bucket["total"] += 1
+        signal_price = data.get("signal_price", 0)
+        highest = data.get("highest_after", signal_price)
+        if signal_price > 0:
+            gain_pct = (highest - signal_price) / signal_price * 100
+            if gain_pct >= 10.0:
+                bucket["hit_10pct"] += 1
+
+    if not by_category:
+        return f"📊 <b>Report — {window_label}</b>\n\nNo signals recorded in this window yet."
+
+    lines = [f"📊 <b>Report — {window_label}</b>\n"]
+    total_all = 0
+    hit_all = 0
+    for category in ["High Priority", "Quick Spikes", "Building Momentum", "Other"]:
+        if category not in by_category:
+            continue
+        b = by_category[category]
+        total_all += b["total"]
+        hit_all += b["hit_10pct"]
+        pct = (b["hit_10pct"] / b["total"] * 100) if b["total"] else 0
+        lines.append(f"<b>{category}:</b> {b['total']} signals | {b['hit_10pct']} hit +10%+ ({pct:.0f}%)")
+
+    overall_pct = (hit_all / total_all * 100) if total_all else 0
+    lines.append(f"\n<b>Overall:</b> {total_all} signals | {hit_all} hit +10%+ ({overall_pct:.0f}%)")
+    return "\n".join(lines)
 
 def is_important_signal(message):
     """OB, zone, retest — these important signals have no cooldown"""
@@ -3253,12 +3366,14 @@ def monitor_momentum():
             signal_performance.pop(key, None)
 
         # Periodic persistence — signal_performance, prepump_phases,
-        # and trendline_retest_tracking were previously pure in-memory and lost on every
-        # restart. Saving once per pass here (not on every single mutation) keeps disk I/O
-        # reasonable while still persisting within ~60s of any change.
+        # trendline_retest_tracking, and the cooldown trackers were previously pure
+        # in-memory and lost on every restart. Saving once per pass here (not on
+        # every single mutation) keeps disk I/O reasonable while still persisting
+        # within ~60s of any change.
         save_signal_performance()
         save_prepump_phases()
         save_trendline_tracking()
+        save_cooldown_trackers()
 
         time.sleep(60)
 
@@ -3363,6 +3478,23 @@ def handle_commands():
                         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                     )
 
+                elif (text == "/REPORT" or raw_text.upper().startswith("/REPORT ")) and is_admin:
+                    # /report           -> defaults to last 24h
+                    # /report 24h       -> last 24 hours
+                    # /report 7d        -> last 7 days
+                    # /report 12h, 48h, 3d, etc. — any number + h or d
+                    arg = raw_text.strip().split(None, 1)
+                    window_str = arg[1].strip().lower() if len(arg) > 1 else "24h"
+                    import re as _re
+                    m = _re.match(r"^(\d+)([hd])$", window_str)
+                    if not m:
+                        send_to(chat_id, "⚠️ Format: /report 24h  or  /report 7d")
+                    else:
+                        amount, unit = int(m.group(1)), m.group(2)
+                        window_seconds = amount * 3600 if unit == "h" else amount * 86400
+                        window_label = f"Last {amount}{'hr' if unit == 'h' else ' day(s)'}"
+                        send_to(chat_id, build_report(window_seconds, window_label))
+
                 elif raw_text.upper().startswith("/BROADCAST ") and is_admin:
                     broadcast_text = raw_text[11:].strip()
                     if broadcast_text:
@@ -3405,6 +3537,7 @@ def handle_commands():
                         "/remove STRAX — remove a coin\n"
                         "/list — view the watchlist\n"
                         "/status — bot status\n"
+                        "/report [24h|7d|etc] — category breakdown of signals + win rate\n"
                         "/subscribers — subscriber list\n"
                         "/msg [ID] [msg] — personal message\n"
                         "/broadcast [msg] — message everyone\n\n"
