@@ -15,10 +15,31 @@ monitor module, and the /entry on-demand analysis command.
 
 import os
 import requests
+from requests.adapters import HTTPAdapter
 import time
 from datetime import datetime
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ─── SHARED HTTP SESSION (connection-pool fix) ─────────────
+"""
+BUGFIX: scanning 422 coins across multiple timeframes in parallel threads, each
+using a bare http_session.get(...) call, was opening a brand new TCP+TLS connection
+per request instead of reusing any. Under that load this exhausts the OS's
+ephemeral port range within minutes ("High ephemeral port usage detected... Max
+retries exceeded... Cannot assign requested address"), and the bot effectively
+stops being able to reach Binance at all.
+
+A single shared requests.Session() with an HTTPAdapter sized for our concurrency
+keeps connections alive and reused across calls instead of leaking a new socket
+every time. pool_maxsize is set well above our thread pool size so threads don't
+contend for pool slots (which would otherwise just move the bottleneck rather
+than fix it).
+"""
+http_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=2)
+http_session.mount("https://", _adapter)
+http_session.mount("http://", _adapter)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # set in Railway → Variables
 ADMIN_CHAT_ID = "6589114679"
@@ -378,7 +399,7 @@ def load_from_telegram():
 # ─── TELEGRAM ─────────────────────────────────────────────
 def send_to(chat_id, message):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
     except:
         pass
@@ -386,7 +407,7 @@ def send_to(chat_id, message):
 def send_to_topic(topic_id, message):
     """Send a message to a specific topic in the CryptoPing Alerts group"""
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": ALERTS_GROUP_ID,
                 "message_thread_id": topic_id,
@@ -452,7 +473,7 @@ def send_all(message, symbol=None):
 def get_updates():
     global last_update_id
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+        r = http_session.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
             params={"offset": last_update_id + 1, "timeout": 5}, timeout=10)
         if r.status_code == 200:
             return r.json().get("result", [])
@@ -463,7 +484,7 @@ def get_updates():
 # ─── BINANCE ──────────────────────────────────────────────
 def get_klines(symbol, interval="5m", limit=50):
     try:
-        r = requests.get("https://api.binance.com/api/v3/klines",
+        r = http_session.get("https://api.binance.com/api/v3/klines",
             params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         if r.status_code == 200:
             return r.json()
@@ -473,7 +494,7 @@ def get_klines(symbol, interval="5m", limit=50):
 
 def get_ticker(symbol):
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+        r = http_session.get("https://api.binance.com/api/v3/ticker/24hr",
             params={"symbol": symbol}, timeout=10)
         if r.status_code == 200:
             return r.json()
@@ -2434,7 +2455,7 @@ def auto_update_watchlist():
 
     try:
         # Get all Binance Spot USDT pairs
-        r = requests.get(
+        r = http_session.get(
             "https://api.binance.com/api/v3/ticker/24hr",
             timeout=15
         )
@@ -2473,7 +2494,7 @@ def auto_update_watchlist():
 
         added = []
         for sym, chg, vol in to_add:
-            r_check = requests.get(
+            r_check = http_session.get(
                 f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
                 timeout=5
             )
@@ -3247,7 +3268,7 @@ def handle_commands():
                     if symbol in watchlist:
                         send_to(chat_id, f"⚠️ {symbol} is already on the list!")
                     else:
-                        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5)
+                        r = http_session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5)
                         if r.status_code == 200:
                             watchlist.append(symbol)
                             save_watchlist()
@@ -3363,7 +3384,7 @@ def handle_commands():
                     SIGNAL_TOKEN = "8973668144:AAFwvLoZhV1WDC5i0OIs8IpCylbkcx279Z8"
                     text_out = f"WATCHLIST_EXPORT:{_j.dumps(watchlist)}"
                     try:
-                        requests.post(
+                        http_session.post(
                             f"https://api.telegram.org/bot{SIGNAL_TOKEN}/sendMessage",
                             json={"chat_id": ADMIN_CHAT_ID, "text": text_out},
                             timeout=10
@@ -3385,7 +3406,7 @@ def handle_commands():
                     send_to(chat_id, f"🔍 Scanning Binance (min ${min_vol:,.0f} volume)...")
 
                     try:
-                        r = requests.get(
+                        r = http_session.get(
                             "https://api.binance.com/api/v3/ticker/24hr",
                             timeout=15
                         )
@@ -3480,7 +3501,7 @@ def handle_commands():
                                 skipped.append(sym)
                                 continue
                             try:
-                                r = requests.get(
+                                r = http_session.get(
                                     f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
                                     timeout=5
                                 )
@@ -3705,7 +3726,7 @@ def main():
 
     # Skip all old pending messages on startup
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+        r = http_session.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
             params={"limit": 1, "offset": -1}, timeout=10)
         if r.status_code == 200:
             results = r.json().get("result", [])
