@@ -2996,6 +2996,124 @@ decision against fabricated percentages) — it's a transparent breakdown of
 observable technical conditions so the person can make their own informed
 call, consistent with the bot's "honest, no exaggerated claims" positioning.
 """
+# ─── VOLUME SPIKE ─────────────────────────────────────────
+def check_timeframe(symbol, tf):
+    cfg = TIMEFRAMES[tf]
+    klines = get_klines(symbol, interval=tf, limit=50)
+    if not klines or len(klines) < 10:
+        return
+
+    if tf != "5m":
+        check_volume_buildup(symbol, tf, klines)
+        # Trendline breakout/retest restricted to 4H and 1D only — 1H disabled
+        # (timing-sensitive, was a source of missed signals). Manual zone OB
+        # bounce/confirm on 1H stays active separately, since that's a proven
+        # signal source.
+        if tf in ["4h", "1d"]:
+            check_trendline_breakout(symbol, tf, klines)
+    if tf in ["1h", "4h", "1d"]:
+        check_higher_lows(symbol, tf, klines)
+
+    # 5M early detection
+    if tf == "5m":
+        check_5m_spike_early(symbol)
+        check_15m_confirm(symbol)
+
+    candle = klines[-2]
+    current_vol = float(candle[5])
+    open_price = float(candle[1])
+    close_price = float(candle[4])
+    spike_high = float(candle[2])
+
+    prev_vols = [float(k[5]) for k in klines[-9:-2]]
+    avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    if avg_vol == 0:
+        return
+
+    ratio = current_vol / avg_vol
+    if ratio < cfg["multiplier"]:
+        return
+    if close_price <= open_price:
+        return
+
+    closes = [float(k[4]) for k in klines[:-1]]
+    ema20 = calculate_ema(closes, 20)
+    if ema20 and close_price < ema20:
+        return
+
+    if tf in ["1h", "4h", "1d"]:
+        ticker_check = get_ticker(symbol)
+        if ticker_check and float(ticker_check["priceChangePercent"]) < 2.0:
+            return
+        # Daily downtrend filter
+        if is_daily_downtrend(symbol, close_price):
+            return
+
+    if tf == "5m":
+        ticker_check = get_ticker(symbol)
+        if ticker_check and float(ticker_check["priceChangePercent"]) < 0:
+            return
+        # Daily downtrend filter
+        if is_daily_downtrend(symbol, close_price):
+            return
+
+    key = f"{symbol}_{tf}"
+    now = time.time()
+    if now - alerted_coins.get(key, 0) < cfg["cooldown"]:
+        return
+
+    alerted_coins[key] = now
+    ticker = get_ticker(symbol)
+    price = float(ticker["lastPrice"]) if ticker else close_price
+    change_24h = float(ticker["priceChangePercent"]) if ticker else 0
+
+    ft_score, ft_details = calc_followthrough_score(symbol, tf, klines, ratio, 0, price, change_24h)
+    high_potential = ft_score >= 60
+    is_distribution_warning = any("DISTRIBUTION WARNING" in d or "bearish (red)" in d for d in ft_details)
+    ft_tag = ""
+    if high_potential:
+        ft_details_str = "\n   ".join(ft_details)
+        ft_tag = f"\n\n🔥 <b>HIGH FOLLOW-THROUGH POTENTIAL ({ft_score})</b>\n   {ft_details_str}"
+    elif is_distribution_warning:
+        # Always surface this even though it's not a "high potential" tag —
+        # the warning itself is the important information here, not a bonus.
+        ft_details_str = "\n   ".join(ft_details)
+        ft_tag = f"\n\n   {ft_details_str}"
+
+    msg = (
+        f"{cfg['emoji']} <b>VOLUME SPIKE! [{cfg['label']}]</b>\n\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"💰 Price: {format_price(price)}\n"
+        f"📊 24h: {change_24h:+.2f}%\n"
+        f"⚡ Spike: <b>{ratio:.1f}x</b> normal\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
+        f"{ft_tag}\n\n"
+        f"⚠️ <i>Check the chart before entry!</i>"
+    )
+    sent = send_all(msg, symbol=symbol)
+    if sent and high_potential:
+        send_to_topic(TOPIC_HIGH, msg)  # escalate — separate from normal Spikes topic
+    if sent:
+        print(f"✅ [{cfg['label']}] Spike: {symbol} ({ratio:.1f}x) | FT score: {ft_score}{' [DISTRIBUTION WARNING]' if is_distribution_warning else ''}")
+        signal_performance[f"{symbol}_spike_{tf}_{int(now)}"] = {
+            "symbol": symbol, "signal_price": price,
+            "signal_time": now, "signal_type": f"Volume Spike [{cfg['label']}]",
+            "highest_after": price,
+        }
+
+    track_key = f"{symbol}_{tf}"
+    momentum_tracking[track_key] = {
+        "symbol": symbol, "tf": tf, "start_time": now,
+        "spike_close": close_price, "spike_high": spike_high,
+        "lowest_since": close_price, "has_dipped": False,
+        "type1_sent": False, "type2_sent": False,
+    }
+
+    if tf == "5m":
+        accumulation_tracking[symbol] = {
+            "start_time": now, "spike_price": close_price, "alert_sent": False
+        }
+
 def detect_break_retest_pattern(klines_4h, current_price):
     """
     Item: /entry Pattern Context. Looks for a "break → retest → continuation"
