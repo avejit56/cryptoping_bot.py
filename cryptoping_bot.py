@@ -3193,6 +3193,7 @@ def detect_break_retest_pattern(klines_4h, current_price):
     # volume (1.5x+) and buy pressure (52%+) instead of candle shape.
     break_i = None
     level_price = None
+    debug_lines = []
     for i in range(n - 2, 3, -1):  # leave room for at least 1 candle after it (a retest candle)
         k = lookback[i]
         o, c, h, l, v = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
@@ -3200,6 +3201,7 @@ def detect_break_retest_pattern(klines_4h, current_price):
         candle_range = h - l
         body = abs(c - o)
         if candle_range <= 0 or c <= o:
+            debug_lines.append(f"  i={i}: bearish/zero-range (o={o:.6g} c={c:.6g}) — skip")
             continue
 
         body_ratio_ok = body / candle_range >= 0.40
@@ -3209,17 +3211,24 @@ def detect_break_retest_pattern(klines_4h, current_price):
         buy_ratio = buy_v / v if v > 0 else 0
         volume_confirmed_ok = vol_ratio >= 1.5 and buy_ratio >= 0.52
 
+        prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
+        closed_above = c > prior_high * 1.005
+        debug_lines.append(
+            f"  i={i}: body_ratio={body/candle_range:.2f}({body_ratio_ok}) "
+            f"vol_ratio={vol_ratio:.1f}x({volume_confirmed_ok}, buy={buy_ratio:.2f}) "
+            f"close={c:.6g} prior_high={prior_high:.6g} closed_above={closed_above}"
+        )
+
         if not (body_ratio_ok or volume_confirmed_ok):
             continue
-
-        prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
-        if c > prior_high * 1.005:  # closed meaningfully above the prior resistance
+        if closed_above:
             break_i = i
             level_price = prior_high
             break
 
     if break_i is None or level_price is None:
         print(f"📐 /entry pattern: no qualifying breakout candle found in last {n} 4H candles for this symbol")
+        print("📐 /entry pattern debug:\n" + "\n".join(debug_lines))
         return None
     print(f"📐 /entry pattern: breakout found at candle -{n - break_i}, level={level_price:.6g}")
 
