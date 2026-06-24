@@ -3598,6 +3598,61 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def analyze_move_strength(symbol, confirm_price):
+    """
+    After a /watch retest confirms on a smaller timeframe (15m/30m/1H), this
+    looks at how strong the underlying move actually is — volume intensity
+    plus 5m/15m higher-low structure — to suggest whether the move looks
+    strong enough to consider an earlier entry, or whether it's safer to wait
+    for 4H to confirm too. This is explicitly a suggestion based on observable
+    technical conditions, not a probability or guarantee — consistent with
+    how /entry's score is framed.
+    """
+    details = []
+    strength_score = 0
+
+    # Volume intensity check (5m candles around the confirm moment)
+    klines_5m = get_klines(symbol, interval="5m", limit=20)
+    vol_ratio = 0
+    if klines_5m and len(klines_5m) >= 10:
+        closed_5m = klines_5m[:-1]
+        recent_vols = [float(k[5]) for k in closed_5m[-3:]]
+        prior_vols = [float(k[5]) for k in closed_5m[-10:-3]]
+        avg_prior = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+        avg_recent = sum(recent_vols) / len(recent_vols) if recent_vols else 0
+        vol_ratio = avg_recent / avg_prior if avg_prior else 0
+        if vol_ratio >= 5:
+            strength_score += 2
+            details.append(f"✅ Strong volume ({vol_ratio:.1f}x recent vs prior)")
+        elif vol_ratio >= 2:
+            strength_score += 1
+            details.append(f"⚠️ Moderate volume ({vol_ratio:.1f}x recent vs prior)")
+        else:
+            details.append(f"⚠️ Weak volume ({vol_ratio:.1f}x recent vs prior)")
+
+    # 5m and 15m higher-low structure
+    hl_5m = check_hl_only(klines_5m, lookback=6) if klines_5m else False
+    klines_15m_hl = get_klines(symbol, interval="15m", limit=20)
+    hl_15m = check_hl_only(klines_15m_hl, lookback=6) if klines_15m_hl else False
+    if hl_5m:
+        strength_score += 1
+        details.append("✅ Higher lows forming (5M)")
+    if hl_15m:
+        strength_score += 1
+        details.append("✅ Higher lows forming (15M)")
+    if not hl_5m and not hl_15m:
+        details.append("⚠️ No clear higher-low structure yet (5M/15M)")
+
+    # Combined suggestion
+    if strength_score >= 3:
+        suggestion = "🔥 <b>Strong move</b> — volume and structure both look healthy. An earlier entry can be considered, still with a stop-loss."
+    elif strength_score >= 1:
+        suggestion = "⏳ <b>Moderate signs</b> — some support, but consider waiting for 4H to confirm before a full-size entry."
+    else:
+        suggestion = "⚠️ <b>Weak follow-through signs so far</b> — waiting for a 4H retest confirmation is the more cautious path here."
+
+    return suggestion, details
+
 def check_retest_watches():
     """
     Checks every active /watch entry: has the retest completed (strong green
@@ -3642,10 +3697,14 @@ def check_retest_watches():
 
         if confirmed_note:
             tf, pattern_note = confirmed_note
+            suggestion, strength_details = analyze_move_strength(symbol, current_price)
+            strength_str = "\n".join(strength_details)
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
+                f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
+                f"{suggestion}\n\n"
                 f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
             )
             send_to(watch["chat_id"], msg)
