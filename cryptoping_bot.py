@@ -4170,19 +4170,25 @@ def handle_commands():
                         else:
                             details_str = "\n".join(result["details"])
                             pattern_notes = result.get("pattern_notes", {})
-                            pattern_section = ""
-                            if pattern_notes:
-                                tf_order = ["15m", "30m", "1h", "4h"]
-                                active_tfs = [tf for tf in tf_order if tf in pattern_notes]
-                                retest_tfs = [tf for tf in active_tfs
-                                              if "in progress" in pattern_notes[tf] or "confirmed" in pattern_notes[tf]]
-                                lines = []
-                                if len(retest_tfs) >= 2:
-                                    tf_label = " and ".join(t.upper() for t in retest_tfs)
-                                    lines.append(f"🎯 <b>Confluence — {tf_label} all show a retest setup:</b>\n")
-                                for tf in active_tfs:
+                            tf_order = ["15m", "30m", "1h", "4h"]
+                            retest_tfs = [tf for tf in tf_order
+                                          if tf in pattern_notes and
+                                          ("in progress" in pattern_notes[tf] or "confirmed" in pattern_notes[tf])]
+                            lines = []
+                            if len(retest_tfs) >= 2:
+                                tf_label = " and ".join(t.upper() for t in retest_tfs)
+                                lines.append(f"🎯 <b>Confluence — {tf_label} all show a retest setup:</b>\n")
+                            for tf in tf_order:
+                                if tf in pattern_notes:
                                     lines.append(f"📐 <b>Pattern Context ({tf.upper()}):</b>\n{pattern_notes[tf]}")
-                                pattern_section = "\n" + "\n\n".join(lines) + "\n"
+                                else:
+                                    # FIX (after the AVNT case): timeframes with no detected
+                                    # pattern were silently omitted entirely, which looked
+                                    # identical to "this timeframe wasn't checked" — now every
+                                    # timeframe always gets a line, even when it's just "nothing
+                                    # notable here", so silence never gets mistaken for a gap.
+                                    lines.append(f"📐 <b>Pattern Context ({tf.upper()}):</b>\nNo clear breakout/retest setup detected on this timeframe right now.")
+                            pattern_section = "\n" + "\n\n".join(lines) + "\n"
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
