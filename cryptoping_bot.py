@@ -3310,6 +3310,17 @@ def _build_retest_guidance(level_price, current_price, candles_since_break):
     elif current_price < level_price * 0.98:
         return (f"⚠️ <b>Retest failed</b> — price broke {format_price(level_price)} but has since closed back "
                 f"below it. This weakens the breakout; treat it with caution.")
+    elif still_above and not near_level and pct_from_level > 0:
+        # FIX (after the SOPH case): price broke out and kept moving well past
+        # the level (+6-8% or more) without ever pulling back to retest it.
+        # The old code silently returned None here, which made the bot look
+        # broken ("no qualifying breakout" was misleading — a breakout WAS
+        # found, there's just no retest opportunity left). This is an honest,
+        # informative case: the move has already extended past the point
+        # where a retest entry makes sense.
+        return (f"✅ <b>Breakout extended</b> — price broke {format_price(level_price)} and has moved "
+                f"+{pct_from_level:.1f}% past it without retesting. No retest opportunity right now — "
+                f"this is already an extended move, not an entry-on-pullback setup.")
     return None
 
 def calc_entry_score(symbol):
@@ -3425,12 +3436,36 @@ def calc_entry_score(symbol):
     # break" on the larger timeframes yet). Checking all four and reporting
     # each independently lets the person see exactly which timeframes agree.
     pattern_notes = {}
-    for tf_label, klines_tf in [("15m", klines_15m), ("30m", klines_30m),
-                                  ("1h", klines_1h), ("4h", klines_4h)]:
+    klines_by_tf_for_pattern = {"15m": klines_15m, "30m": klines_30m, "1h": klines_1h, "4h": klines_4h}
+    for tf_label, klines_tf in klines_by_tf_for_pattern.items():
         if klines_tf:
             note = detect_break_retest_pattern(klines_tf, current_price)
             if note:
                 pattern_notes[tf_label] = note
+
+    # FIX (after the SOPH live case): if a retest is actively "in progress" on
+    # any timeframe, check whether that timeframe's most recent candle is red.
+    # The old score had no awareness of this — it showed "90/90 HIGH" at the
+    # exact moment a live retest candle was bearish, which is precisely the
+    # situation where entry should be paused and the next candle's close
+    # watched, not treated as a green light. This doesn't override the
+    # technical score (which reflects broader trend/structure, still valid),
+    # but it adds a direct, visible warning for the live moment.
+    active_retest_red_candle_tf = None
+    for tf_label, note in pattern_notes.items():
+        if "in progress" in note:
+            klines_tf = klines_by_tf_for_pattern.get(tf_label)
+            if klines_tf and len(klines_tf) >= 2:
+                last_closed = klines_tf[-2]
+                if float(last_closed[4]) < float(last_closed[1]):  # close < open = red
+                    active_retest_red_candle_tf = tf_label
+                    break
+    if active_retest_red_candle_tf:
+        details.append(
+            f"🔴 Live retest candle on {active_retest_red_candle_tf.upper()} is currently RED — "
+            f"this is a normal part of a retest, but it's not yet confirmed. Wait for a green "
+            f"candle to close above the level before treating this as a green light."
+        )
 
     label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
     return {
