@@ -3416,13 +3416,21 @@ def calc_entry_score(symbol):
             score += 10
             details.append(f"🎯 Daily confluence — {conf_note}")
 
-    # ── Pattern context: break-retest-continuation (4H) ──
-    pattern_note = detect_break_retest_pattern(klines_4h, current_price) if klines_4h else None
+    # ── Pattern context: break-retest-continuation, checked on BOTH 4H and 1H ──
+    # Previously only 4H was checked. If both timeframes independently show a
+    # retest in progress (or confirmed), that's a stronger confluence signal
+    # than either alone — worth surfacing distinctly rather than just picking
+    # one timeframe.
+    pattern_note_4h = detect_break_retest_pattern(klines_4h, current_price) if klines_4h else None
+    pattern_note_1h = detect_break_retest_pattern(klines_1h, current_price) if klines_1h else None
 
     label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
     return {
         "score": score, "max_score": max_score, "label": label,
-        "details": details, "price": current_price, "pattern_note": pattern_note,
+        "details": details, "price": current_price,
+        "pattern_note": pattern_note_4h,       # kept for backward compatibility
+        "pattern_note_4h": pattern_note_4h,
+        "pattern_note_1h": pattern_note_1h,
     }
 
 
@@ -3552,6 +3560,9 @@ def check_retest_watches():
     candle closed back above the broken level)? If so, notify the requesting
     subscriber personally AND post to Top Picks (public visibility), then
     remove the watch — it's a one-time alert per request, not ongoing tracking.
+    Checks whichever timeframe(s) were in progress when /watch was created
+    (4H, 1H, or both) — older watches without a stored "timeframes" key
+    default to 4H only for backward compatibility.
     """
     if not retest_watch_list:
         return
@@ -3566,15 +3577,29 @@ def check_retest_watches():
             to_remove.append(watch_key)
             continue
 
-        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        timeframes = watch.get("timeframes", ["4h"])
         ticker = get_ticker(symbol)
-        if not klines_4h or not ticker:
+        if not ticker:
             continue
         current_price = float(ticker["lastPrice"])
-        pattern_note = detect_break_retest_pattern(klines_4h, current_price)
-        if pattern_note and "Retest confirmed" in pattern_note:
+
+        confirmed_note = None
+        failed_note = None
+        for tf in timeframes:
+            klines_tf = get_klines(symbol, interval=tf, limit=30)
+            if not klines_tf:
+                continue
+            pattern_note = detect_break_retest_pattern(klines_tf, current_price)
+            if pattern_note and "Retest confirmed" in pattern_note:
+                confirmed_note = (tf, pattern_note)
+                break  # one confirmed timeframe is enough to notify
+            elif pattern_note and "Retest failed" in pattern_note:
+                failed_note = (tf, pattern_note)
+
+        if confirmed_note:
+            tf, pattern_note = confirmed_note
             msg = (
-                f"🔥 <b>Retest Complete — {symbol}</b>\n\n"
+                f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
                 f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
@@ -3583,9 +3608,10 @@ def check_retest_watches():
             send_to_topic(TOPIC_TOP_PICKS, msg)
             print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}")
             to_remove.append(watch_key)
-        elif pattern_note and "Retest failed" in pattern_note:
+        elif failed_note and not confirmed_note:
+            tf, _ = failed_note
             send_to(watch["chat_id"],
-                f"⚠️ <b>{symbol} retest failed</b> — price closed back below the broken level. "
+                f"⚠️ <b>{symbol} retest failed [{tf.upper()}]</b> — price closed back below the broken level. "
                 f"Removing this from your watch list."
             )
             to_remove.append(watch_key)
@@ -4099,9 +4125,20 @@ def handle_commands():
                             send_to(chat_id, f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
                         else:
                             details_str = "\n".join(result["details"])
+                            note_4h = result.get("pattern_note_4h")
+                            note_1h = result.get("pattern_note_1h")
                             pattern_section = ""
-                            if result.get("pattern_note"):
-                                pattern_section = f"\n📐 <b>Pattern Context (4H):</b>\n{result['pattern_note']}\n"
+                            if note_4h or note_1h:
+                                lines = []
+                                # Confluence callout when both timeframes show a retest situation
+                                if note_4h and note_1h and ("in progress" in note_4h or "confirmed" in note_4h) \
+                                        and ("in progress" in note_1h or "confirmed" in note_1h):
+                                    lines.append("🎯 <b>Confluence — both 4H and 1H show a retest setup:</b>\n")
+                                if note_4h:
+                                    lines.append(f"📐 <b>Pattern Context (4H):</b>\n{note_4h}")
+                                if note_1h:
+                                    lines.append(f"📐 <b>Pattern Context (1H):</b>\n{note_1h}")
+                                pattern_section = "\n" + "\n\n".join(lines) + "\n"
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
@@ -4123,25 +4160,35 @@ def handle_commands():
                             send_to(chat_id, f"👁 Already watching {sym} for a retest completion.")
                         else:
                             klines_4h_check = get_klines(sym, interval="4h", limit=30)
+                            klines_1h_check = get_klines(sym, interval="1h", limit=30)
                             ticker_check = get_ticker(sym)
-                            if not klines_4h_check or not ticker_check:
+                            if not (klines_4h_check or klines_1h_check) or not ticker_check:
                                 send_to(chat_id, f"⚠️ Couldn't fetch data for {sym}. Check the symbol and try again.")
                             else:
                                 current_price_check = float(ticker_check["lastPrice"])
-                                pattern_now = detect_break_retest_pattern(klines_4h_check, current_price_check)
-                                if not pattern_now or "Retest in progress" not in pattern_now:
+                                pattern_4h = detect_break_retest_pattern(klines_4h_check, current_price_check) if klines_4h_check else None
+                                pattern_1h = detect_break_retest_pattern(klines_1h_check, current_price_check) if klines_1h_check else None
+                                tfs_in_progress = []
+                                if pattern_4h and "Retest in progress" in pattern_4h:
+                                    tfs_in_progress.append("4h")
+                                if pattern_1h and "Retest in progress" in pattern_1h:
+                                    tfs_in_progress.append("1h")
+
+                                if not tfs_in_progress:
                                     send_to(chat_id,
-                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 4H. "
+                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 4H or 1H. "
                                         f"/watch works best right after /entry shows a \"Retest in progress\" Pattern Context."
                                     )
                                 else:
                                     retest_watch_list[watch_key] = {
                                         "symbol": sym, "chat_id": chat_id,
                                         "requested_time": time.time(), "name": first_name,
+                                        "timeframes": tfs_in_progress,
                                     }
                                     save_retest_watch()
+                                    tf_label = " and ".join(t.upper() for t in tfs_in_progress)
                                     send_to(chat_id,
-                                        f"👁 <b>Watching {sym}</b> for retest completion.\n\n"
+                                        f"👁 <b>Watching {sym}</b> for retest completion ({tf_label}).\n\n"
                                         f"You'll get a personal alert here (and it'll also post to Top Picks) "
                                         f"once a strong green candle closes back above the broken level.\n\n"
                                         f"Use /unwatch {sym_raw} to stop."
