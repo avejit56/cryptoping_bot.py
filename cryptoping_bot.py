@@ -1774,8 +1774,47 @@ def check_manual_zones():
             if current_price < zone.get("lowest_in_zone", z_low):
                 manual_zones[zone_id]["lowest_in_zone"] = current_price
 
-            klines_tf = get_klines(symbol, interval=tf, limit=10)
-            if not klines_tf or len(klines_tf) < 6:
+            # FIX (AWE case): the full confirm below only fires once the zone's
+            # OWN timeframe (e.g. 4H) candle closes — for a fast vertical spike,
+            # that can mean a multi-hour wait while price is already far above
+            # the zone by the time confirm fires. This fast-spike check runs
+            # independently of `tf`'s own candle cycle: if price has already
+            # moved well past the zone with real volume behind it (checked on
+            # 1H, falling back to 15M), it sends an early heads-up immediately —
+            # the normal tf confirm still follows later as usual.
+            if not zone.get("fast_spike_alerted"):
+                pct_above_zone = (current_price - z_high) / z_high * 100 if z_high > 0 else 0
+                if pct_above_zone >= 5:
+                    fast_klines = get_klines(symbol, interval="1h", limit=8)
+                    fast_tf_label = "1H"
+                    if not fast_klines or len(fast_klines) < 6:
+                        fast_klines = get_klines(symbol, interval="15m", limit=8)
+                        fast_tf_label = "15M"
+                    if fast_klines and len(fast_klines) >= 6:
+                        fk_last = fast_klines[-2]
+                        fk_open, fk_close = float(fk_last[1]), float(fk_last[4])
+                        fk_vol = float(fk_last[5])
+                        fk_prev_vols = [float(k[5]) for k in fast_klines[-6:-2]]
+                        fk_avg_vol = sum(fk_prev_vols) / len(fk_prev_vols) if fk_prev_vols else 1
+                        fk_vol_ratio = fk_vol / fk_avg_vol if fk_avg_vol > 0 else 0
+                        if fk_close > fk_open and fk_vol_ratio >= 2.0:
+                            manual_zones[zone_id]["fast_spike_alerted"] = True
+                            save_zones()
+                            send_to_topic(TOPIC_HIGH,
+                                f"⚡ <b>FAST SPIKE — Zone Already Cleared [{fast_tf_label}]</b>\n\n"
+                                f"🪙 <b>{symbol}</b> | {tf.upper()} OB\n"
+                                f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
+                                f"💰 Price: {format_price(current_price)} (+{pct_above_zone:.1f}% above zone high)\n"
+                                f"⚡ Volume: {fk_vol_ratio:.1f}x on {fast_tf_label}\n\n"
+                                f"⏳ Moving fast — the full {tf.upper()} confirmation may still take "
+                                f"a while to close. This is an early heads-up so you're not caught off "
+                                f"guard waiting for it.\n\n"
+                                f"⚠️ <i>Check the chart before entry.</i>"
+                            )
+                            print(f"⚡ Fast spike alert: {zone_id}")
+
+            klines_tf = get_klines(symbol, interval=tf, limit=15)
+            if not klines_tf or len(klines_tf) < 10:
                 continue
 
             last   = klines_tf[-2]
@@ -1784,22 +1823,73 @@ def check_manual_zones():
             l_high = float(last[2])
             l_low  = float(last[3])
 
-            # Item #19: wick-rejection early warning. A candle at/near the zone
-            # with a long lower wick and a small body signals sellers got rejected
-            # fast (buyers stepped in before the close) — this is visible BEFORE
-            # the full body-close+volume confirmation fires, so it gives an early
-            # heads-up to watch the next candle closely instead of being caught
-            # off guard by a sharp bounce (e.g. the ALICEUSDT case).
+            # UPGRADE (liquidity sweep, was: wick-rejection): the old check only
+            # looked at the current candle's wick/body shape near the zone — any
+            # long-lower-wick candle near the zone would fire, regardless of
+            # whether there was an actual established low underneath it. A real
+            # liquidity sweep needs a genuine sell-side liquidity pool: a swing
+            # low that's been TESTED MULTIPLE TIMES (so stop-losses/limit orders
+            # have realistically clustered there), then a sweep below it and a
+            # reclaim back above — exactly the "down e liquidity thakle pump
+            # ney" pattern. This runs on whichever tf the zone itself uses (1H
+            # or 4H, both supported via /addzone).
             candle_range = l_high - l_low
-            if candle_range > 0:
+            if candle_range > 0 and len(klines_tf) >= 10:
                 lower_wick = min(l_open, l_close) - l_low
                 body = abs(l_close - l_open)
                 wick_dominant = lower_wick / candle_range >= 0.55
                 small_body = body / candle_range <= 0.35
                 near_zone = l_low <= z_high and l_low >= z_low * 0.97
-                wick_key = f"{zone_id}_wick_{int(last[0])}"  # candle open-time, so each candle only triggers once
-                if wick_dominant and small_body and near_zone and not zone.get("last_wick_alert_candle") == last[0]:
-                    manual_zones[zone_id]["last_wick_alert_candle"] = last[0]
+
+                # Find a prior swing low in the lookback window (before this
+                # candle) that's been touched 2+ times within a tight band —
+                # that clustering is what makes it a real liquidity pool, not
+                # just a random dip.
+                lookback = klines_tf[-10:-2]  # 8 candles strictly before `last` (klines_tf[-2])
+                swing_low = min(float(k[3]) for k in lookback) if lookback else None
+                touches = sum(
+                    1 for k in lookback
+                    if swing_low and abs(float(k[3]) - swing_low) / swing_low <= 0.015
+                ) if swing_low else 0
+                established_liquidity = touches >= 2
+
+                swept_below = swing_low is not None and l_low < swing_low * 0.998
+                reclaimed = l_close > swing_low if swing_low else False
+
+                # Volume on the reclaim candle vs recent average — a genuine
+                # sweep+absorb should show real volume, not a thin wick on no volume.
+                m_vol = float(last[5])
+                prev_vols_sweep = [float(k[5]) for k in klines_tf[-8:-2]]
+                avg_vol_sweep = sum(prev_vols_sweep) / len(prev_vols_sweep) if prev_vols_sweep else 1
+                vol_ratio_sweep = m_vol / avg_vol_sweep if avg_vol_sweep > 0 else 0
+
+                is_liquidity_sweep = (
+                    established_liquidity and swept_below and reclaimed and
+                    wick_dominant and vol_ratio_sweep >= 1.3
+                )
+                is_plain_wick_rejection = (
+                    wick_dominant and small_body and near_zone and not is_liquidity_sweep
+                )
+
+                wick_key_candle = int(last[0])  # candle open-time, so each candle only triggers once
+                if is_liquidity_sweep and zone.get("last_wick_alert_candle") != wick_key_candle:
+                    manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
+                    save_zones()
+                    send_to_topic(TOPIC_HIGH,
+                        f"🩸 <b>LIQUIDITY SWEEP — {symbol} [{tf.upper()} OB]</b>\n\n"
+                        f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
+                        f"💰 Current: {format_price(current_price)}\n"
+                        f"📍 Swept below {format_price(swing_low)} (tested {touches}x prior) "
+                        f"and reclaimed it on the close\n"
+                        f"⚡ Volume: {vol_ratio_sweep:.1f}x on the reclaim candle\n\n"
+                        f"💡 <i>Sell-side stops below that low likely got triggered and absorbed — "
+                        f"this is the classic setup before a move up. Not a full zone confirmation "
+                        f"yet, but a strong early signal.</i>\n\n"
+                        f"⚠️ <i>Check the chart before entry.</i>"
+                    )
+                    print(f"🩸 Liquidity sweep: {zone_id}")
+                elif is_plain_wick_rejection and zone.get("last_wick_alert_candle") != wick_key_candle:
+                    manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
                     send_to_topic(TOPIC_HIGH,
                         f"👀 <b>WATCH CLOSELY — Wick Rejection at Zone</b>\n\n"
@@ -2124,6 +2214,7 @@ def check_manual_zones():
                 manual_zones[zone_id]["state"] = "in_zone"
                 manual_zones[zone_id]["confirmed"] = False
                 manual_zones[zone_id]["zone_high_touched"] = False
+                manual_zones[zone_id]["fast_spike_alerted"] = False
                 save_zones()
             continue
 
@@ -5083,6 +5174,7 @@ def handle_commands():
                             manual_zones[zone_id]["layer1_sent"] = False
                             manual_zones[zone_id]["layer2_sent"] = False
                             manual_zones[zone_id]["entered_notified_time"] = 0
+                            manual_zones[zone_id]["fast_spike_alerted"] = False
                             save_zones()
                             send_to(chat_id, f"♻️ Zone reset: <code>{zone_id}</code>\nMonitoring has restarted.")
                         else:
