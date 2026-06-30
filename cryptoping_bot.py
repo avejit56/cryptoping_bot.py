@@ -740,6 +740,66 @@ KLINES_CACHE_TTL = {
     "5m": 30, "15m": 60, "1h": 120, "4h": 300, "1d": 900,
 }
 
+# ─── BINANCE CONNECTIVITY MONITOR ──────────────────────────
+"""
+FIX (after a real incident: Binance became unreachable for several minutes —
+connect timeouts across every symbol/timeframe, not a rate-limit ban — with
+no notification, the only way to know was manually checking Railway logs).
+
+This tracks consecutive failures across get_klines + the ticker cache
+refresh (both hit api.binance.com). Past a threshold, it sends ONE admin DM
+saying Binance looks unreachable, with how long it's been failing. It then
+stays quiet (no spam on every subsequent failure) until a call succeeds
+again, at which point it sends a single "reachable again" DM. This doesn't
+fix connectivity issues (those are infrastructure/region-routing, not
+something code can resolve) — it just makes sure you find out promptly
+instead of discovering it later in the logs.
+"""
+_binance_failure_state = {
+    "consecutive_failures": 0,
+    "first_failure_time": None,
+    "alert_sent": False,
+}
+_binance_failure_lock = Lock()
+BINANCE_FAILURE_ALERT_THRESHOLD = 15  # consecutive failures before alerting
+BINANCE_FAILURE_RESET_TIME = 6 * 3600  # forget old failure streaks after 6h of inactivity, just in case
+
+def _record_binance_call_result(success):
+    with _binance_failure_lock:
+        now = time.time()
+        if success:
+            was_down = _binance_failure_state["alert_sent"]
+            _binance_failure_state["consecutive_failures"] = 0
+            _binance_failure_state["first_failure_time"] = None
+            _binance_failure_state["alert_sent"] = False
+            if was_down:
+                send_to(ADMIN_CHAT_ID,
+                    "✅ <b>Binance reachable again</b>\n\n"
+                    "Connection to api.binance.com has recovered — scanning is back to normal."
+                )
+                print("✅ Binance connectivity recovered")
+            return
+
+        if _binance_failure_state["first_failure_time"] is None:
+            _binance_failure_state["first_failure_time"] = now
+        _binance_failure_state["consecutive_failures"] += 1
+
+        if (not _binance_failure_state["alert_sent"]
+                and _binance_failure_state["consecutive_failures"] >= BINANCE_FAILURE_ALERT_THRESHOLD):
+            duration_min = (now - _binance_failure_state["first_failure_time"]) / 60
+            _binance_failure_state["alert_sent"] = True
+            send_to(ADMIN_CHAT_ID,
+                f"🔴 <b>Binance unreachable</b>\n\n"
+                f"{_binance_failure_state['consecutive_failures']} consecutive failed requests "
+                f"over the last {duration_min:.0f} minute(s) — connection timeouts, not a rate-limit "
+                f"ban (that shows a different error). Scanning is effectively paused until this clears.\n\n"
+                f"This is usually a Railway region-routing issue on Binance's end, not something fixable "
+                f"in the bot itself. If it doesn't recover on its own in a while, a redeploy or switching "
+                f"Railway region (Settings → Source) has fixed this before.\n\n"
+                f"You'll get another message here once it's reachable again."
+            )
+            print(f"🔴 Binance connectivity alert sent ({_binance_failure_state['consecutive_failures']} failures, {duration_min:.0f}m)")
+
 def get_klines(symbol, interval="5m", limit=50):
     cache_key = (symbol, interval, limit)
     ttl = KLINES_CACHE_TTL.get(interval, 60)
@@ -760,11 +820,19 @@ def get_klines(symbol, interval="5m", limit=50):
             if r.status_code == 200:
                 data = r.json()
                 _klines_cache[cache_key] = {"data": data, "fetched_at": time.time()}
+                _record_binance_call_result(success=True)
                 return data
             else:
                 print(f"⚠️ get_klines {symbol} {interval}: HTTP {r.status_code} — {r.text[:200]}")
+                # 418/429 are rate-limit responses, not connectivity failures —
+                # they resolve on their own timer and the rate limiter already
+                # exists to prevent them; don't conflate them with Binance
+                # being unreachable.
+                if r.status_code not in (418, 429):
+                    _record_binance_call_result(success=False)
         except Exception as e:
             print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
+            _record_binance_call_result(success=False)
     return None
 
 # ─── BULK TICKER CACHE (rate-limit fix) ────────────────────
@@ -793,10 +861,14 @@ def _refresh_ticker_cache():
             all_tickers = r.json()
             _ticker_cache["data"] = {t["symbol"]: t for t in all_tickers}
             _ticker_cache["fetched_at"] = time.time()
+            _record_binance_call_result(success=True)
         else:
             print(f"⚠️ ticker cache refresh: HTTP {r.status_code} — {r.text[:200]}")
+            if r.status_code not in (418, 429):
+                _record_binance_call_result(success=False)
     except Exception as e:
         print(f"⚠️ ticker cache refresh exception: {e}")
+        _record_binance_call_result(success=False)
 
 def get_ticker(symbol):
     now = time.time()
