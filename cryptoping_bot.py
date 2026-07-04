@@ -5066,7 +5066,7 @@ def handle_commands():
                         else:
                             ticker_check = get_ticker(sym)
                             klines_by_tf = {
-                                tf: get_klines(sym, interval=tf, limit=30)
+                                tf: get_klines(sym, interval=tf, limit=50)
                                 for tf in ["15m", "30m", "1h", "4h"]
                             }
                             if not any(klines_by_tf.values()) or not ticker_check:
@@ -5078,13 +5078,15 @@ def handle_commands():
                                     if not klines_tf:
                                         continue
                                     pattern_note = detect_break_retest_pattern(klines_tf, current_price_check)
-                                    if pattern_note and "Retest in progress" in pattern_note:
+                                    if pattern_note and ("Retest in progress" in pattern_note or "Retest confirmed" in pattern_note):
                                         tfs_in_progress.append(tf)
 
                                 if not tfs_in_progress:
                                     send_to(chat_id,
-                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 15m/30m/1H/4H. "
-                                        f"/watch works best right after /entry shows a \"Retest in progress\" Pattern Context."
+                                        f"⚠️ {sym} doesn't currently show an active retest on 15m/30m/1H/4H.\n\n"
+                                        f"If /entry showed \"Retest in progress\" a moment ago, the candle may "
+                                        f"have shifted since — try /entry again to get the latest state, then "
+                                        f"/watch immediately after."
                                     )
                                 else:
                                     retest_watch_list[watch_key] = {
