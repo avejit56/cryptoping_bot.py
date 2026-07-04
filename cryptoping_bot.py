@@ -192,7 +192,10 @@ momentum_tracking = {}
 accumulation_tracking = {}
 buildup_alerted = {}
 gradual_buildup_alerted = {}   # {f"{symbol}_{tf}_gradual": last_alert_time}
-range_breakout_alerted = {}    # {f"{symbol}_{tf}_breakout": last_alert_time}
+range_breakout_alerted = {}    # {f"{symbol}_breakout": last_alert_time} — 4H confirmed alerts only
+range_breakout_tracking = {}   # {symbol: {range_high, range_low, breakout_close, breakout_vol_ratio,
+                               #           breakout_time, near_top_touches, range_width_pct}}
+                               # 1H breakouts go here silently; alert fires when 4H confirms the hold
 trendline_alerted = {}
 postpump_alerted = {}
 ob_fvg_zone_tracking = {}
@@ -410,6 +413,7 @@ def save_cooldown_trackers():
             "buildup_alerted": buildup_alerted,
             "gradual_buildup_alerted": gradual_buildup_alerted,
             "range_breakout_alerted": range_breakout_alerted,
+            "range_breakout_tracking": range_breakout_tracking,
             "trendline_alerted": trendline_alerted,
             "postpump_alerted": postpump_alerted,
             "buy_pressure_alerted": buy_pressure_alerted,
@@ -425,7 +429,7 @@ def save_cooldown_trackers():
 
 def load_cooldown_trackers():
     global alerted_coins, buildup_alerted, gradual_buildup_alerted, range_breakout_alerted
-    global trendline_alerted, postpump_alerted
+    global range_breakout_tracking, trendline_alerted, postpump_alerted
     global buy_pressure_alerted, volume_surge_alerted, zone_high_alerted
     global big_pump_alerted, breakout_alerted
     try:
@@ -436,6 +440,7 @@ def load_cooldown_trackers():
             buildup_alerted.update(bundle.get("buildup_alerted", {}))
             gradual_buildup_alerted.update(bundle.get("gradual_buildup_alerted", {}))
             range_breakout_alerted.update(bundle.get("range_breakout_alerted", {}))
+            range_breakout_tracking.update(bundle.get("range_breakout_tracking", {}))
             trendline_alerted.update(bundle.get("trendline_alerted", {}))
             postpump_alerted.update(bundle.get("postpump_alerted", {}))
             buy_pressure_alerted.update(bundle.get("buy_pressure_alerted", {}))
@@ -1558,22 +1563,75 @@ highs that formed a ceiling) with at least 3x volume confirmation — a
 "coiled spring" breakout. Fires to Top Picks.
 """
 def check_range_breakout(symbol, tf, klines):
+    """
+    Two-stage range-breakout detector to reduce noise (after seeing too many
+    1H breakout alerts that turned out to be short-lived spikes):
+
+    Stage 1 — 1H: if a coin breaks above a tight range (coiling ≤15%, 2+
+    touches at the top, 3x+ volume), record it silently in
+    range_breakout_tracking. No alert fires yet.
+
+    Stage 2 — 4H: on the next 4H candle close, check if the 1H-detected
+    breakout is still holding (price above the original range_high). If yes,
+    fire the Top Picks alert. If not, discard silently.
+
+    4H breakouts still fire an immediate alert (they're already slower/more
+    reliable by nature and don't need the extra confirmation step).
+    """
     if tf not in ("1h", "4h") or len(klines) < 20:
         return
     now = time.time()
-    key = f"{symbol}_{tf}_breakout"
-    cooldown = 12 * 3600 if tf == "1h" else 24 * 3600
-    if now - range_breakout_alerted.get(key, 0) < cooldown:
-        return
 
     ticker = get_ticker(symbol)
     if not ticker:
         return
     change_24h = float(ticker["priceChangePercent"])
+    current_price = float(ticker["lastPrice"])
+
+    # ── Stage 2: check pending 1H tracking entries on every 4H scan ──
+    if tf == "4h" and symbol in range_breakout_tracking:
+        tracked = range_breakout_tracking[symbol]
+        age_hours = (now - tracked["breakout_time"]) / 3600
+        range_high = tracked["range_high"]
+        alerted_key = f"{symbol}_breakout"
+
+        # Expire after 24h if no 4H confirmation came
+        if age_hours > 24:
+            range_breakout_tracking.pop(symbol, None)
+        elif (current_price >= range_high * 1.002
+              and now - range_breakout_alerted.get(alerted_key, 0) > 24 * 3600):
+            # 4H scan sees price still holding above range_high — fire the alert
+            range_breakout_alerted[alerted_key] = now
+            range_breakout_tracking.pop(symbol, None)
+            breakout_pct = (current_price - range_high) / range_high * 100
+            send_to_topic(TOPIC_TOP_PICKS,
+                f"🚀 <b>RANGE BREAKOUT CONFIRMED [1H→4H]</b>\n\n"
+                f"🪙 <b>{symbol}</b>\n"
+                f"💰 Price: {format_price(current_price)}\n"
+                f"📊 24h: {change_24h:+.2f}%\n"
+                f"📐 Range: {format_price(tracked['range_low'])} — {format_price(range_high)} "
+                f"({tracked['range_width_pct']:.1f}% wide, {tracked['near_top_touches']} touches at top)\n"
+                f"⚡ Holding +{breakout_pct:.1f}% above {format_price(range_high)} after a 4H close\n"
+                f"💥 Breakout volume was {tracked['vol_ratio']:.1f}x range average\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"⚠️ <i>Check the chart before entry.</i>"
+            )
+            signal_performance[f"{symbol}_range_breakout_{int(now)}"] = {
+                "symbol": symbol, "signal_price": current_price,
+                "signal_time": now, "signal_type": "Range Breakout [1H→4H]",
+                "highest_after": current_price,
+            }
+            print(f"🚀 Range breakout CONFIRMED (4H hold): {symbol} +{breakout_pct:.1f}% above range")
+        elif current_price < range_high * 0.97:
+            # Price dropped back below the range — false breakout, discard
+            range_breakout_tracking.pop(symbol, None)
+            print(f"❌ Range breakout FAILED (price dropped back): {symbol}")
+        return  # whether we alerted or not, stage-2 check is done for this coin
+
+    # ── Stage 1 (1H) and direct 4H detection ──
     if change_24h < 0:
         return
 
-    # Look at the 10 candles before the last one to define the range
     lookback = klines[-12:-2]
     if len(lookback) < 8:
         return
@@ -1584,26 +1642,20 @@ def check_range_breakout(symbol, tf, klines):
     range_low = min(lows)
     range_width_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 100
 
-    # Range must be tight (coiling) — not already in a strong trend
     if range_width_pct > 15:
         return
 
-    # Range must have been "tested" — price touched near the top multiple times
-    # (equal highs = real resistance ceiling with orders stacked there)
     near_top_touches = sum(1 for h in highs if h >= range_high * 0.99)
     if near_top_touches < 2:
         return
 
-    # Last closed candle must break above range_high with a strong body
     last = klines[-2]
     l_open, l_close = float(last[1]), float(last[4])
-    l_high = float(last[2])
     if l_close <= l_open:
         return
-    if l_close <= range_high * 1.002:  # must clearly close above the range
+    if l_close <= range_high * 1.002:
         return
 
-    # Volume confirmation: must be meaningfully higher than the range average
     range_vols = [float(k[5]) for k in lookback]
     avg_range_vol = sum(range_vols) / len(range_vols) if range_vols else 1
     breakout_vol = float(last[5])
@@ -1611,31 +1663,46 @@ def check_range_breakout(symbol, tf, klines):
     if vol_ratio < 3.0:
         return
 
-    # Price still near the breakout (not already dumped since the candle closed)
-    current_price = float(ticker["lastPrice"])
     if current_price < l_close * 0.92:
         return
 
-    range_breakout_alerted[key] = now
-    breakout_pct = (l_close - range_high) / range_high * 100
-    send_to_topic(TOPIC_TOP_PICKS,
-        f"🚀 <b>RANGE BREAKOUT [{tf.upper()}]</b>\n\n"
-        f"🪙 <b>{symbol}</b>\n"
-        f"💰 Price: {format_price(current_price)}\n"
-        f"📊 24h: {change_24h:+.2f}%\n"
-        f"📐 Range: {format_price(range_low)} — {format_price(range_high)} "
-        f"({range_width_pct:.1f}% wide, {near_top_touches} touches at top)\n"
-        f"⚡ Broke above {format_price(range_high)} by +{breakout_pct:.1f}%\n"
-        f"💥 Volume: {vol_ratio:.1f}x range average\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-        f"⚠️ <i>Check the chart before entry — confirm on your own timeframe.</i>"
-    )
-    signal_performance[f"{symbol}_range_breakout_{tf}_{int(now)}"] = {
-        "symbol": symbol, "signal_price": current_price,
-        "signal_time": now, "signal_type": f"Range Breakout [{tf.upper()}]",
-        "highest_after": current_price,
-    }
-    print(f"🚀 Range breakout: {symbol} [{tf}] vol={vol_ratio:.1f}x range_width={range_width_pct:.1f}%")
+    if tf == "1h":
+        # Silent tracking — no alert yet, wait for 4H confirmation
+        if symbol not in range_breakout_tracking:
+            range_breakout_tracking[symbol] = {
+                "range_high": range_high, "range_low": range_low,
+                "range_width_pct": range_width_pct,
+                "near_top_touches": near_top_touches,
+                "breakout_close": l_close, "vol_ratio": vol_ratio,
+                "breakout_time": now,
+            }
+            print(f"👁 Range breakout TRACKED (1H, waiting 4H confirm): {symbol} "
+                  f"vol={vol_ratio:.1f}x range_width={range_width_pct:.1f}%")
+    else:
+        # 4H direct: reliable enough to alert immediately
+        alerted_key = f"{symbol}_breakout"
+        if now - range_breakout_alerted.get(alerted_key, 0) < 24 * 3600:
+            return
+        range_breakout_alerted[alerted_key] = now
+        breakout_pct = (l_close - range_high) / range_high * 100
+        send_to_topic(TOPIC_TOP_PICKS,
+            f"🚀 <b>RANGE BREAKOUT [4H]</b>\n\n"
+            f"🪙 <b>{symbol}</b>\n"
+            f"💰 Price: {format_price(current_price)}\n"
+            f"📊 24h: {change_24h:+.2f}%\n"
+            f"📐 Range: {format_price(range_low)} — {format_price(range_high)} "
+            f"({range_width_pct:.1f}% wide, {near_top_touches} touches at top)\n"
+            f"⚡ Broke above {format_price(range_high)} by +{breakout_pct:.1f}%\n"
+            f"💥 Volume: {vol_ratio:.1f}x range average\n"
+            f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"⚠️ <i>Check the chart before entry.</i>"
+        )
+        signal_performance[f"{symbol}_range_breakout_4h_{int(now)}"] = {
+            "symbol": symbol, "signal_price": current_price,
+            "signal_time": now, "signal_type": "Range Breakout [4H]",
+            "highest_after": current_price,
+        }
+        print(f"🚀 Range breakout (4H direct): {symbol} vol={vol_ratio:.1f}x")
 
 
 # ─── HIGHER LOWS ──────────────────────────────────────────
