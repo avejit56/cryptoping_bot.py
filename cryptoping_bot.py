@@ -191,6 +191,8 @@ alerted_coins = {}
 momentum_tracking = {}
 accumulation_tracking = {}
 buildup_alerted = {}
+gradual_buildup_alerted = {}   # {f"{symbol}_{tf}_gradual": last_alert_time}
+range_breakout_alerted = {}    # {f"{symbol}_{tf}_breakout": last_alert_time}
 trendline_alerted = {}
 postpump_alerted = {}
 ob_fvg_zone_tracking = {}
@@ -402,19 +404,12 @@ def load_trendline_tracking():
         print(f"Trendline tracking load error: {e}")
 
 def save_cooldown_trackers():
-    """
-    Bundles all 9 cooldown/dedup dicts into one file. These were originally left
-    unpersisted (item #29 only covered the 3 analytically-relevant dicts), on the
-    assumption they only prevent duplicate alerts within a single running process
-    and have no historical value. In practice, with frequent redeploys (each one
-    wiping in-memory state), this caused the bot to "forget" it had just sent an
-    alert moments before a deploy and re-send the same signal right after — exactly
-    the duplicate-message-after-update symptom. Persisting these closes that gap.
-    """
     try:
         bundle = {
             "alerted_coins": alerted_coins,
             "buildup_alerted": buildup_alerted,
+            "gradual_buildup_alerted": gradual_buildup_alerted,
+            "range_breakout_alerted": range_breakout_alerted,
             "trendline_alerted": trendline_alerted,
             "postpump_alerted": postpump_alerted,
             "buy_pressure_alerted": buy_pressure_alerted,
@@ -429,7 +424,8 @@ def save_cooldown_trackers():
         print(f"Cooldown trackers save error: {e}")
 
 def load_cooldown_trackers():
-    global alerted_coins, buildup_alerted, trendline_alerted, postpump_alerted
+    global alerted_coins, buildup_alerted, gradual_buildup_alerted, range_breakout_alerted
+    global trendline_alerted, postpump_alerted
     global buy_pressure_alerted, volume_surge_alerted, zone_high_alerted
     global big_pump_alerted, breakout_alerted
     try:
@@ -438,6 +434,8 @@ def load_cooldown_trackers():
                 bundle = _json.load(f)
             alerted_coins.update(bundle.get("alerted_coins", {}))
             buildup_alerted.update(bundle.get("buildup_alerted", {}))
+            gradual_buildup_alerted.update(bundle.get("gradual_buildup_alerted", {}))
+            range_breakout_alerted.update(bundle.get("range_breakout_alerted", {}))
             trendline_alerted.update(bundle.get("trendline_alerted", {}))
             postpump_alerted.update(bundle.get("postpump_alerted", {}))
             buy_pressure_alerted.update(bundle.get("buy_pressure_alerted", {}))
@@ -445,8 +443,8 @@ def load_cooldown_trackers():
             zone_high_alerted.update(bundle.get("zone_high_alerted", {}))
             big_pump_alerted.update(bundle.get("big_pump_alerted", {}))
             breakout_alerted.update(bundle.get("breakout_alerted", {}))
-            total = sum(len(v) for v in bundle.values())
-            print(f"✅ Cooldown trackers loaded: {total} entries across 9 dicts")
+            total = sum(len(v) if isinstance(v, dict) else 0 for v in bundle.values())
+            print(f"✅ Cooldown trackers loaded: {total} entries across {len(bundle)} dicts")
         else:
             print("⏱ No cooldown trackers file, starting fresh")
     except Exception as e:
@@ -1448,6 +1446,197 @@ def check_volume_buildup(symbol, tf, klines):
                 "signal_time": now, "signal_type": f"Volume Build-up [{cfg['label']}]",
                 "highest_after": price,
             }
+
+# ─── GRADUAL BUILDUP DETECTOR (HMSTR case) ────────────────
+"""
+The existing check_volume_buildup() catches 3 consecutive candles each with
+2.5x+ volume — a short burst pattern. But some coins pump after a multi-day
+gradual accumulation: volume slowly rises across 5-8 candles (no single candle
+meets 2.5x threshold alone), then a breakout candle fires on the elevated base.
+This detector looks for that pattern on 4H and 1D specifically — the slope of
+the last N candles' volume being consistently upward, plus a strong final candle.
+Fires to Top Picks since it's a high-confidence setup when it triggers.
+"""
+def check_gradual_buildup(symbol, tf, klines):
+    if tf not in ("4h", "1d") or len(klines) < 15:
+        return
+    now = time.time()
+    key = f"{symbol}_{tf}_gradual"
+    cooldown = 48 * 3600 if tf == "4h" else 72 * 3600
+    if now - gradual_buildup_alerted.get(key, 0) < cooldown:
+        return
+
+    ticker = get_ticker(symbol)
+    if not ticker:
+        return
+    change_24h = float(ticker["priceChangePercent"])
+    if change_24h < 2.0:
+        return
+    if is_daily_downtrend(symbol, float(ticker["lastPrice"])):
+        return
+
+    # Look at the last 7 closed candles (excluding the forming one)
+    window = klines[-8:-1]
+    if len(window) < 6:
+        return
+    vols = [float(k[5]) for k in window]
+
+    # Baseline: average of the first half of the window
+    half = len(vols) // 2
+    baseline_avg = sum(vols[:half]) / half if half else 1
+
+    # Check: is there a consistent upward slope in volume?
+    # Use a simple linear regression slope — positive slope = ascending volume
+    n = len(vols)
+    mean_x = (n - 1) / 2
+    mean_y = sum(vols) / n
+    slope_num = sum((i - mean_x) * (vols[i] - mean_y) for i in range(n))
+    slope_den = sum((i - mean_x) ** 2 for i in range(n))
+    vol_slope = slope_num / slope_den if slope_den else 0
+
+    # Slope must be clearly positive (volume growing over time)
+    if vol_slope <= 0:
+        return
+
+    # Most recent volume must be meaningfully above the baseline
+    recent_vol_ratio = vols[-1] / baseline_avg if baseline_avg > 0 else 0
+    if recent_vol_ratio < 1.8:
+        return
+
+    # Last closed candle must be bullish with a decent body
+    last = klines[-2]
+    l_open, l_close = float(last[1]), float(last[4])
+    l_high, l_low = float(last[2]), float(last[3])
+    if l_close <= l_open:
+        return
+    candle_range = l_high - l_low
+    body_ratio = (l_close - l_open) / candle_range if candle_range > 0 else 0
+    if body_ratio < 0.35:
+        return
+
+    # Price above 20EMA
+    closes = [float(k[4]) for k in klines[:-1]]
+    ema20 = calculate_ema(closes, 20)
+    if ema20 and l_close < ema20:
+        return
+
+    gradual_buildup_alerted[key] = now
+    price = float(ticker["lastPrice"])
+    send_to_topic(TOPIC_TOP_PICKS,
+        f"🌊 <b>GRADUAL BUILDUP DETECTED [{tf.upper()}]</b>\n\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"💰 Price: {format_price(price)}\n"
+        f"📊 24h: {change_24h:+.2f}%\n"
+        f"📈 Volume rising across last {n} candles "
+        f"(recent: {recent_vol_ratio:.1f}x baseline)\n"
+        f"✅ Strong green close on the latest candle\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"💡 <i>Volume has been building up steadily — "
+        f"this type of slow accumulation before a breakout can produce "
+        f"larger moves than sudden spikes. Check the chart.</i>"
+    )
+    signal_performance[f"{symbol}_gradual_{tf}_{int(now)}"] = {
+        "symbol": symbol, "signal_price": price,
+        "signal_time": now, "signal_type": f"Gradual Buildup [{tf.upper()}]",
+        "highest_after": price,
+    }
+    print(f"🌊 Gradual buildup: {symbol} [{tf}] vol_slope={vol_slope:.1f} ratio={recent_vol_ratio:.1f}x")
+
+
+# ─── RANGE BREAKOUT DETECTOR (ARPA case) ──────────────────
+"""
+ARPA pumped +69% from a ranging base in 1-2 candles with no prior signal.
+The existing volume spike detector (check_timeframe) requires 8x (4H) or
+15x (1H) volume — a bar that fast vertical moves can miss if the preceding
+range had very low volume (making the average low, so the spike ratio is
+technically high, but the candle was already well past its range by the time
+the scan ran, triggering the current_price < c1_close*0.90 guard).
+
+This detector takes a different approach: instead of volume ratio alone,
+it looks for price CLOSING above the top of a tight preceding range (equal
+highs that formed a ceiling) with at least 3x volume confirmation — a
+"coiled spring" breakout. Fires to Top Picks.
+"""
+def check_range_breakout(symbol, tf, klines):
+    if tf not in ("1h", "4h") or len(klines) < 20:
+        return
+    now = time.time()
+    key = f"{symbol}_{tf}_breakout"
+    cooldown = 12 * 3600 if tf == "1h" else 24 * 3600
+    if now - range_breakout_alerted.get(key, 0) < cooldown:
+        return
+
+    ticker = get_ticker(symbol)
+    if not ticker:
+        return
+    change_24h = float(ticker["priceChangePercent"])
+    if change_24h < 0:
+        return
+
+    # Look at the 10 candles before the last one to define the range
+    lookback = klines[-12:-2]
+    if len(lookback) < 8:
+        return
+
+    highs = [float(k[2]) for k in lookback]
+    lows = [float(k[3]) for k in lookback]
+    range_high = max(highs)
+    range_low = min(lows)
+    range_width_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 100
+
+    # Range must be tight (coiling) — not already in a strong trend
+    if range_width_pct > 15:
+        return
+
+    # Range must have been "tested" — price touched near the top multiple times
+    # (equal highs = real resistance ceiling with orders stacked there)
+    near_top_touches = sum(1 for h in highs if h >= range_high * 0.99)
+    if near_top_touches < 2:
+        return
+
+    # Last closed candle must break above range_high with a strong body
+    last = klines[-2]
+    l_open, l_close = float(last[1]), float(last[4])
+    l_high = float(last[2])
+    if l_close <= l_open:
+        return
+    if l_close <= range_high * 1.002:  # must clearly close above the range
+        return
+
+    # Volume confirmation: must be meaningfully higher than the range average
+    range_vols = [float(k[5]) for k in lookback]
+    avg_range_vol = sum(range_vols) / len(range_vols) if range_vols else 1
+    breakout_vol = float(last[5])
+    vol_ratio = breakout_vol / avg_range_vol if avg_range_vol > 0 else 0
+    if vol_ratio < 3.0:
+        return
+
+    # Price still near the breakout (not already dumped since the candle closed)
+    current_price = float(ticker["lastPrice"])
+    if current_price < l_close * 0.92:
+        return
+
+    range_breakout_alerted[key] = now
+    breakout_pct = (l_close - range_high) / range_high * 100
+    send_to_topic(TOPIC_TOP_PICKS,
+        f"🚀 <b>RANGE BREAKOUT [{tf.upper()}]</b>\n\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"📊 24h: {change_24h:+.2f}%\n"
+        f"📐 Range: {format_price(range_low)} — {format_price(range_high)} "
+        f"({range_width_pct:.1f}% wide, {near_top_touches} touches at top)\n"
+        f"⚡ Broke above {format_price(range_high)} by +{breakout_pct:.1f}%\n"
+        f"💥 Volume: {vol_ratio:.1f}x range average\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"⚠️ <i>Check the chart before entry — confirm on your own timeframe.</i>"
+    )
+    signal_performance[f"{symbol}_range_breakout_{tf}_{int(now)}"] = {
+        "symbol": symbol, "signal_price": current_price,
+        "signal_time": now, "signal_type": f"Range Breakout [{tf.upper()}]",
+        "highest_after": current_price,
+    }
+    print(f"🚀 Range breakout: {symbol} [{tf}] vol={vol_ratio:.1f}x range_width={range_width_pct:.1f}%")
+
 
 # ─── HIGHER LOWS ──────────────────────────────────────────
 def check_higher_lows(symbol, tf, klines):
@@ -3489,10 +3678,8 @@ def check_timeframe(symbol, tf):
 
     if tf != "5m":
         check_volume_buildup(symbol, tf, klines)
-        # Trendline breakout/retest restricted to 4H and 1D only — 1H disabled
-        # (timing-sensitive, was a source of missed signals). Manual zone OB
-        # bounce/confirm on 1H stays active separately, since that's a proven
-        # signal source.
+        check_gradual_buildup(symbol, tf, klines)   # HMSTR-style multi-day accumulation
+        check_range_breakout(symbol, tf, klines)    # ARPA-style tight-range breakout
         if tf in ["4h", "1d"]:
             check_trendline_breakout(symbol, tf, klines)
     if tf in ["1h", "4h", "1d"]:
@@ -4818,10 +5005,31 @@ def handle_commands():
                             details_str = "\n".join(result["details"])
                             pattern_notes = result.get("pattern_notes", {})
                             tf_order = ["15m", "30m", "1h", "4h"]
+                            confirmed_tfs = [tf for tf in tf_order
+                                             if tf in pattern_notes and "confirmed" in pattern_notes[tf]]
+                            inprogress_tfs = [tf for tf in tf_order
+                                              if tf in pattern_notes and "in progress" in pattern_notes[tf]]
                             retest_tfs = [tf for tf in tf_order
                                           if tf in pattern_notes and
                                           ("in progress" in pattern_notes[tf] or "confirmed" in pattern_notes[tf])]
+                            # FIX (DOGS/MUBARAK case): when lower TF confirms but higher
+                            # TF is still in progress, output looked contradictory. Add a
+                            # clear summary so the situation is immediately understandable.
+                            mixed_signal_note = ""
+                            if confirmed_tfs and inprogress_tfs:
+                                lower_confirmed = [tf for tf in confirmed_tfs if tf in ["15m", "30m"]]
+                                higher_pending = [tf for tf in inprogress_tfs if tf in ["1h", "4h"]]
+                                if lower_confirmed and higher_pending:
+                                    mixed_signal_note = (
+                                        f"⚠️ <b>Mixed timeframe signals</b> — "
+                                        f"{'/'.join(t.upper() for t in lower_confirmed)} confirmed "
+                                        f"but {'/'.join(t.upper() for t in higher_pending)} still in progress. "
+                                        f"Wait for the higher TF to also close a strong green candle "
+                                        f"before treating this as fully aligned.\n\n"
+                                    )
                             lines = []
+                            if mixed_signal_note:
+                                lines.append(mixed_signal_note)
                             if len(retest_tfs) >= 2:
                                 tf_label = " and ".join(t.upper() for t in retest_tfs)
                                 lines.append(f"🎯 <b>Confluence — {tf_label} all show a retest setup:</b>\n")
