@@ -101,6 +101,7 @@ TOPIC_TRADES      = 1463  # 💼 Trade Monitor (admin-only — Avejit's own trad
 TOPIC_USER_TRADES = 3042  # 👥 User Trades (admin-only — subscriber trade activity log)
 TOPIC_USER_RESULTS = 3045 # 🏆 User Trade Results (admin-only — subscriber win/loss log)
 TOPIC_TOP_PICKS   = 3046  # 🔥 Top Picks (highest-confidence prospects only)
+TOPIC_MY_SETUPS   = 6386  # 📍 My Setups (manual zones, lines, watches — Avejit's own marked levels)
 
 # ─── TRADE MONITOR SETTINGS ──────────────────────────
 TRADE_EMA_PERIOD       = 20     # EMA period for base trend filter
@@ -2128,7 +2129,7 @@ def check_manual_zones():
                         if fk_close > fk_open and fk_vol_ratio >= 2.0:
                             manual_zones[zone_id]["fast_spike_alerted"] = True
                             save_zones()
-                            send_to_topic(TOPIC_HIGH,
+                            send_to_topic(TOPIC_MY_SETUPS,
                                 f"⚡ <b>FAST SPIKE — Zone Already Cleared [{fast_tf_label}]</b>\n\n"
                                 f"🪙 <b>{symbol}</b> | {tf.upper()} OB\n"
                                 f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
@@ -2199,18 +2200,20 @@ def check_manual_zones():
                     wick_dominant and small_body and near_zone and not is_liquidity_sweep
                 )
 
-                wick_key_candle = int(last[0])  # candle open-time, so each candle only triggers once
+                wick_key_candle = int(last[0])
                 if is_liquidity_sweep and zone.get("last_wick_alert_candle") != wick_key_candle:
                     manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
-                    send_to_topic(TOPIC_HIGH,
+                    tl_sweep_note_liq = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+                    send_to_topic(TOPIC_MY_SETUPS,
                         f"🩸 <b>LIQUIDITY SWEEP — {symbol} [{tf.upper()} OB]</b>\n\n"
                         f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
                         f"💰 Current: {format_price(current_price)}\n"
                         f"📍 Swept below {format_price(swing_low)} (tested {touches}x prior) "
                         f"and reclaimed it on the close\n"
-                        f"⚡ Volume: {vol_ratio_sweep:.1f}x on the reclaim candle\n\n"
-                        f"💡 <i>Sell-side stops below that low likely got triggered and absorbed — "
+                        f"⚡ Volume: {vol_ratio_sweep:.1f}x on the reclaim candle\n"
+                        + (f"\n{tl_sweep_note_liq}\n" if tl_sweep_note_liq else "") +
+                        f"\n💡 <i>Sell-side stops below that low likely got triggered and absorbed — "
                         f"this is the classic setup before a move up. Not a full zone confirmation "
                         f"yet, but a strong early signal.</i>\n\n"
                         f"⚠️ <i>Check the chart before entry.</i>"
@@ -2219,7 +2222,7 @@ def check_manual_zones():
                 elif is_plain_wick_rejection and zone.get("last_wick_alert_candle") != wick_key_candle:
                     manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
-                    send_to_topic(TOPIC_HIGH,
+                    send_to_topic(TOPIC_MY_SETUPS,
                         f"👀 <b>WATCH CLOSELY — Wick Rejection at Zone</b>\n\n"
                         f"🪙 <b>{symbol}</b> | {tf.upper()} OB\n"
                         f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
@@ -2320,6 +2323,9 @@ def check_manual_zones():
                 elif coiling_days >= 14:
                     coiling_tag = f"⏳ Coiling — active {coiling_days:.0f} days\n"
 
+                # Check for trendline liquidity sweep confluence
+                tl_sweep_note = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+
                 msg = (
                     f"🎯 <b>ZONE CONFIRMED! [{tf.upper()} OB]</b>\n\n"
                     f"🪙 <b>{symbol}</b>\n"
@@ -2332,18 +2338,11 @@ def check_manual_zones():
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
                     f"📈 From zone low: +{recovery_pct:.1f}%\n\n"
                     f"📊 <b>Confidence: {conf_label}</b>\n"
-                    f"   {details_str}\n\n"
-                    f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    f"   {details_str}\n"
+                    + (f"\n{tl_sweep_note}\n" if tl_sweep_note else "") +
+                    f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                     f"⚠️ <i>Check the chart before entry.</i>"
                 )
-                # Items #20/#21: Top Picks — the highest-confidence prospects get
-                # their own topic, separated from the High Priority noise. Since
-                # most manual zones are already 4H, requiring timeframe alone would
-                # make almost everything a "Top Pick" and defeat the purpose. Instead
-                # require at least 2 of these strong signals together: long coiling,
-                # daily confluence, 1D timeframe specifically, or exceptional volume.
-                # When this fires, the message goes ONLY to Top Picks, not also to
-                # High Priority — no duplication, per explicit preference.
                 top_pick_signals = sum([
                     coiling_days >= 30,
                     bool(confluence_tag),
@@ -2352,16 +2351,14 @@ def check_manual_zones():
                 ])
                 is_top_pick = top_pick_signals >= 2
 
-                # Zone alerts → routed automatically by send_all via get_topic_for_message,
-                # UNLESS this qualifies as a Top Pick, in which case it goes only there.
+                # Route to My Setups (manual zone) always, plus Top Picks if qualifies
+                send_to_topic(TOPIC_MY_SETUPS, msg)
                 if is_top_pick:
                     send_to_topic(TOPIC_TOP_PICKS, msg)
-                    # Still broadcast to subscribers' personal DMs, just not to High Priority
-                    for sub_chat_id in subscribers:
-                        send_to(sub_chat_id, msg)
-                else:
-                    send_all(msg, symbol=symbol)
-                print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}")
+                # Subscriber DMs
+                for sub_chat_id in subscribers:
+                    send_to(sub_chat_id, msg)
+                print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}{' [TL SWEEP]' if tl_sweep_note else ''}")
                 signal_performance[f"{symbol}_zone_{int(now)}"] = {
                     "symbol": symbol, "signal_price": current_price,
                     "signal_time": now, "signal_type": f"Zone OB [{tf.upper()}]",
@@ -2675,6 +2672,7 @@ def check_manual_lines():
                 suggestion, strength_details = analyze_move_strength(symbol, current_price)
                 strength_str = "\n".join(strength_details) if strength_details else ""
                 is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
+                tl_sweep_line = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
 
                 intro_line = (
                     f"⚠️ Price broke {format_price(level)} and the candle that closed back "
@@ -2690,13 +2688,15 @@ def check_manual_lines():
                     f"💰 Price: {format_price(current_price)}\n"
                     f"📍 Level: {format_price(level)}\n\n"
                     f"{intro_line}\n\n"
-                    f"📊 <b>Move Strength:</b>\n{strength_str}\n\n{suggestion}\n\n"
+                    f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
+                    + (f"{tl_sweep_line}\n\n" if tl_sweep_line else "") +
+                    f"{suggestion}\n\n"
                     f"⏳ <i>Tracking the next 3 candles to confirm this holds — you'll get a follow-up.</i>"
                 )
-                send_to_topic(TOPIC_TOP_PICKS, msg)
+                send_to_topic(TOPIC_MY_SETUPS, msg)
                 if chat_id:
                     send_to(chat_id, msg)
-                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}{' [TL SWEEP]' if tl_sweep_line else ''}")
             continue
 
         # ── followup: confirm already fired, check whether it actually holds ──
@@ -4147,14 +4147,10 @@ def calc_entry_score(symbol):
 
     if tf != "5m":
         check_volume_buildup(symbol, tf, klines)
-        # Item #16: trendline breakout/retest restricted to 4H and 1D only.
-        # 1H trendline breakout was disabled because its timing-sensitive single-
-        # candle check was a major source of missed signals (same root cause class
-        # as the RARE/TNSR explosive-pump misses) — fast 1H moves often blew past
-        # the breakout level before the scan loop caught up. Volume Spike/Buildup
-        # and the manual zone OB BOUNCE/CONFIRMED path stay active on 1H, since
-        # those are still proven sources of good signals (e.g. BICO, SYN).
-        if tf in ["4h", "1d"]:
+        # Trendline breakout: 4H/1D fire to existing High Priority flow.
+        # 1H re-enabled — retests route to My Setups (not High Priority),
+        # so the old noise concern no longer applies.
+        if tf in ["4h", "1d", "1h"]:
             check_trendline_breakout(symbol, tf, klines)
     if tf in ["1h", "4h", "1d"]:
         check_higher_lows(symbol, tf, klines)
@@ -4260,6 +4256,74 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def check_trendline_sweep_confluence(symbol, confirm_price, tf="1h"):
+    """
+    Checks whether the current retest/bounce happened at or after a trendline
+    liquidity sweep — price dipped below a descending trendline (drawn from
+    recent swing highs on the given TF), triggering sell stops, then reclaimed
+    back above it with volume. When this is present alongside a zone/line/watch
+    retest, it's a significantly stronger setup (institutional absorption of
+    sell-side liquidity before the move up). Returns a string to embed in the
+    retest message, or None if no sweep detected.
+    """
+    klines = get_klines(symbol, interval=tf, limit=30)
+    if not klines or len(klines) < 15:
+        return None
+    closed = klines[:-1]
+
+    # Find the two most recent swing highs (local maxima) to define the trendline
+    swing_highs = []
+    for i in range(2, len(closed) - 2):
+        h = float(closed[i][2])
+        if (h > float(closed[i-1][2]) and h > float(closed[i-2][2]) and
+                h > float(closed[i+1][2]) and h > float(closed[i+2][2])):
+            swing_highs.append((i, h))
+    if len(swing_highs) < 2:
+        return None
+
+    # Use the two most recent swing highs to build the descending trendline
+    sh1_idx, sh1_h = swing_highs[-2]
+    sh2_idx, sh2_h = swing_highs[-1]
+    if sh2_h >= sh1_h:
+        return None  # not descending
+
+    # Project trendline value at the last closed candle
+    slope = (sh2_h - sh1_h) / (sh2_idx - sh1_idx) if sh2_idx != sh1_idx else 0
+    last_idx = len(closed) - 1
+    trendline_at_last = sh2_h + slope * (last_idx - sh2_idx)
+
+    # Check the last 3 candles for a sweep below and reclaim
+    recent = closed[-3:]
+    sweep_candle = None
+    for k in recent:
+        k_low = float(k[3])
+        k_close = float(k[4])
+        if k_low < trendline_at_last * 0.999 and k_close > trendline_at_last:
+            sweep_candle = k
+            break
+
+    if not sweep_candle:
+        return None
+
+    # Volume on the sweep/reclaim candle vs average
+    sw_vol = float(sweep_candle[5])
+    avg_vol = sum(float(k[5]) for k in closed[-10:-3]) / 7 if len(closed) >= 10 else sw_vol
+    vol_ratio = sw_vol / avg_vol if avg_vol > 0 else 0
+    if vol_ratio < 1.5:
+        return None
+
+    # Current price must still be above the trendline (reclaim held)
+    if confirm_price < trendline_at_last * 0.99:
+        return None
+
+    return (
+        f"📉➡️📈 <b>Trendline Liquidity Sweep</b> — price swept below the descending "
+        f"trendline ({format_price(trendline_at_last)}) on {vol_ratio:.1f}x volume then "
+        f"reclaimed it. Sell-side stops likely absorbed before this move — "
+        f"adds meaningful confluence to the retest."
+    )
+
+
 def analyze_move_strength(symbol, confirm_price):
     """
     After a /watch or /addline retest confirms on a smaller timeframe (15m/30m/1H),
@@ -4525,18 +4589,20 @@ def check_retest_watches():
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             strength_str = "\n".join(strength_details)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
+            tl_sweep = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
                 f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
+                + (f"{tl_sweep}\n\n" if tl_sweep else "") +
                 f"{suggestion}\n\n"
                 f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
                 f"you'll get a follow-up.</i>"
             )
             send_to(watch["chat_id"], msg)
-            send_to_topic(TOPIC_TOP_PICKS, msg)
-            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+            send_to_topic(TOPIC_MY_SETUPS, msg)
+            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}{' [TL SWEEP]' if tl_sweep else ''}")
 
             # Extract the level that was confirmed, from the pattern note text,
             # so follow-up can check against it without re-running detection.
@@ -4845,7 +4911,8 @@ def monitor_momentum():
                     pv = [float(k[5]) for k in klines_tf[-9:-2]]
                     vol_ratio = cv / (sum(pv)/len(pv)) if pv else 1
                 gain_pct = (current_price - breakout_price) / breakout_price * 100
-                sent = send_all(
+                tl_sweep_retest = check_trendline_sweep_confluence(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
+                retest_msg = (
                     f"🏆 <b>TRENDLINE RETEST CONFIRMED! [{tf_r.upper()}]</b>\n\n"
                     f"🪙 <b>{symbol}</b>\n"
                     f"💰 Price: {format_price(current_price)}\n"
@@ -4853,12 +4920,19 @@ def monitor_momentum():
                     f"📐 Break → retest → continuation\n"
                     f"📈 From breakout: <b>+{gain_pct:.1f}%</b>\n"
                     f"⚡ Volume: {vol_ratio:.1f}x\n"
-                    f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-                    f"⚠️ <i>Strong setup! Check OB/FVG before entry.</i>",
-                    symbol=symbol
+                    + (f"\n{tl_sweep_retest}\n" if tl_sweep_retest else "") +
+                    f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    f"⚠️ <i>Strong setup! Check OB/FVG before entry.</i>"
                 )
+                if tf_r == "1h":
+                    # 1H trendline retests go to My Setups — informative but not
+                    # High Priority noise for all subscribers
+                    send_to_topic(TOPIC_MY_SETUPS, retest_msg)
+                    sent = True
+                else:
+                    sent = send_all(retest_msg, symbol=symbol)
                 if sent:
-                    print(f"🏆 [{tf_r.upper()}] Trendline Retest: {symbol}")
+                    print(f"🏆 [{tf_r.upper()}] Trendline Retest: {symbol}{' [TL SWEEP]' if tl_sweep_retest else ''}")
                     signal_performance[f"{symbol}_tl_retest"] = {
                         "symbol": symbol, "signal_price": current_price,
                         "signal_time": now, "signal_type": f"Trendline Retest [{tf_r.upper()}]",
