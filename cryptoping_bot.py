@@ -1218,6 +1218,39 @@ def check_postpump_retracement(symbol):
     retrace_pct = (data["pump_high"] - lowest) / data["pump_high"] * 100 if data["pump_high"] else 0
     recovery_pct = (current_price - lowest) / lowest * 100
 
+    # Fibonacci retracement level detection
+    fib_label = ""
+    if data["pump_high"] and lowest and data["pump_high"] > lowest:
+        swing_high = data["pump_high"]
+        swing_low = lowest
+        fib_range = swing_high - swing_low
+        fib_levels = {
+            "0.236": swing_high - 0.236 * fib_range,
+            "0.382": swing_high - 0.382 * fib_range,
+            "0.500": swing_high - 0.500 * fib_range,
+            "0.618": swing_high - 0.618 * fib_range,
+            "0.786": swing_high - 0.786 * fib_range,
+        }
+        closest_fib = None
+        closest_dist = float("inf")
+        for level_name, level_price in fib_levels.items():
+            dist = abs(current_price - level_price) / level_price
+            if dist < closest_dist and dist <= 0.03:  # within 3% of level
+                closest_dist = dist
+                closest_fib = (level_name, level_price)
+        if closest_fib:
+            fname, fprice = closest_fib
+            if fname == "0.618":
+                fib_label = f"📐 Fib: <b>0.618 🎯 GOLDEN POCKET</b> (~{format_price(fprice)}) — OB + Fibonacci confluence\n"
+            elif fname == "0.500":
+                fib_label = f"📐 Fib: 0.500 ({format_price(fprice)}) — mid-range bounce, institutional level\n"
+            elif fname == "0.382":
+                fib_label = f"📐 Fib: 0.382 ({format_price(fprice)}) — shallow pullback, trend still strong\n"
+            elif fname == "0.786":
+                fib_label = f"📐 Fib: 0.786 ({format_price(fprice)}) — deep pullback, last support before trend break\n"
+            else:
+                fib_label = f"📐 Fib: {fname} (~{format_price(fprice)})\n"
+
     # MTF label for alert
     mtf_confirm = "4H OB → 1H retest ✅" if ob_label == "4H OB" else "1H OB → 15M retest ✅"
 
@@ -1232,6 +1265,7 @@ def check_postpump_retracement(symbol):
         f"📉 Retraced: -{retrace_pct:.1f}% from pump high\n"
         f"📈 Recovery: +{recovery_pct:.1f}% from zone low\n"
         f"🔲 Zone: {data['zone_type']} ({format_price(data['zone_bottom'])} — {format_price(data['zone_top'])})\n"
+        f"{fib_label}"
         f"⚡ Volume: {vol_ratio:.1f}x\n"
         f"📐 MTF: {mtf_confirm}\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
@@ -1239,7 +1273,7 @@ def check_postpump_retracement(symbol):
         symbol=symbol
     )
     if sent:
-        print(f"🎯 {ob_label} MTF bounce confirmed: {symbol}")
+        print(f"🎯 {ob_label} MTF bounce confirmed: {symbol}{' [FIB ' + closest_fib[0] + ']' if closest_fib else ''}")
         signal_performance[f"{symbol}_ob_bounce_{int(now)}"] = {
             "symbol": symbol, "signal_price": current_price,
             "signal_time": now, "signal_type": f"OB Bounce [{data['zone_type']}]",
@@ -2100,6 +2134,18 @@ def check_manual_zones():
 
         # ── in_zone ──
         if state == "in_zone":
+            # If price has moved far above the zone since we entered it,
+            # this zone is no longer the relevant level — move to post_confirm
+            # silently so we stop generating misleading alerts from a stale zone.
+            if current_price > z_high * 1.40:
+                manual_zones[zone_id]["state"] = "post_confirm"
+                manual_zones[zone_id]["confirmed"] = True
+                manual_zones[zone_id]["confirmed_time"] = now
+                manual_zones[zone_id]["went_up"] = True
+                save_zones()
+                print(f"⚠️ Zone {zone_id} auto-advanced to post_confirm: price already "
+                      f"{((current_price/z_high)-1)*100:.0f}% above zone high")
+                continue
             if current_price < zone.get("lowest_in_zone", z_low):
                 manual_zones[zone_id]["lowest_in_zone"] = current_price
 
@@ -2284,6 +2330,16 @@ def check_manual_zones():
             if confirm_ok and now - zone.get("confirmed_time", 0) > 6 * 3600:
                 lowest = zone.get("lowest_in_zone", z_low)
                 recovery_pct = (current_price - lowest) / lowest * 100
+
+                # Guard: if price is already >40% above the zone high, this zone
+                # is stale — it was added when price was near the zone, but price
+                # has since moved far away. A confirm at this distance is not
+                # actionable and would just confuse (e.g. SYN zone at $0.17 when
+                # price is already at $0.34 — "+98.9% from zone low").
+                if current_price > z_high * 1.40:
+                    print(f"⚠️ Zone {zone_id} skipped: price {format_price(current_price)} is "
+                          f"+{recovery_pct:.0f}% above zone high {format_price(z_high)} — too far, zone is stale")
+                    continue
                 score, conf_label, details = calc_confidence(symbol, tf, current_price, z_low, z_high)
 
                 # NOTE (item #9 fix): manual zones are YOUR own hand-picked levels —
@@ -3852,6 +3908,146 @@ def check_timeframe(symbol, tf):
             "start_time": now, "spike_price": close_price, "alert_sent": False
         }
 
+def detect_patterns(symbol, klines_4h, klines_1d, current_price):
+    """
+    Detects common chart patterns on 4H and 1D timeframes for use in /entry
+    output. Returns a list of pattern description strings (plain text, ready
+    to embed in the message). Patterns are context/information only — they
+    don't affect the numeric entry score, since seeing a pattern and deciding
+    to enter are separate judgments that should always include chart confirmation.
+
+    Patterns detected:
+      Ascending Triangle   — flat resistance + higher lows (bullish coiling)
+      Symmetrical Triangle — converging highs + lows (neutral coiling, bias=breakout direction)
+      Descending Triangle  — flat support + lower highs (warning: bearish pressure)
+      Double Bottom (W)    — two equal lows + neckline break (reversal)
+      Bull Flag            — strong rally + tight sideways consolidation
+      Cup & Handle         — rounded bottom + small handle pullback
+      Higher Lows Trend    — simple ascending low structure
+      Range Breakout       — flat top + bottom range cleared with volume
+    """
+    results = []
+
+    def _scan(klines, tf_label):
+        if not klines or len(klines) < 20:
+            return
+        closed = klines[:-1]
+        highs  = [float(k[2]) for k in closed[-20:]]
+        lows   = [float(k[3]) for k in closed[-20:]]
+        closes = [float(k[4]) for k in closed[-20:]]
+        vols   = [float(k[5]) for k in closed[-20:]]
+        n = len(highs)
+
+        # ── Ascending Triangle ──────────────────────────────────────────
+        # Flat resistance (equal highs within 1.5%) + higher lows
+        recent_highs = highs[-10:]
+        max_h = max(recent_highs)
+        near_top = [h for h in recent_highs if h >= max_h * 0.985]
+        if len(near_top) >= 3:
+            recent_lows = lows[-10:]
+            hl_count = sum(1 for i in range(1, len(recent_lows))
+                           if recent_lows[i] > recent_lows[i-1] * 1.005)
+            if hl_count >= 3:
+                touch_count = len(near_top)
+                pct_below = (max_h - current_price) / max_h * 100
+                if pct_below < 5:
+                    results.append(
+                        f"🔺 [{tf_label}] <b>Ascending Triangle</b> — flat resistance "
+                        f"~{format_price(max_h)} ({touch_count} touches), higher lows forming. "
+                        f"Breakout above {format_price(max_h)} with volume = strong entry signal."
+                    )
+
+        # ── Symmetrical Triangle / Wedge ────────────────────────────────
+        # Converging highs and lows over last 12 candles
+        h12 = highs[-12:]
+        l12 = lows[-12:]
+        h_slope = (h12[-1] - h12[0]) / len(h12)
+        l_slope = (l12[-1] - l12[0]) / len(l12)
+        range_now  = h12[-1] - l12[-1]
+        range_then = h12[0]  - l12[0]
+        if (h_slope < -0.0001 and l_slope > 0.0001 and
+                range_now < range_then * 0.65 and range_then > 0):
+            compression = (1 - range_now / range_then) * 100
+            results.append(
+                f"🔻 [{tf_label}] <b>Symmetrical Triangle (Coiling)</b> — price "
+                f"compressing {compression:.0f}% from {format_price(range_then)} to "
+                f"{format_price(range_now)} range. Breakout direction = strong move. "
+                f"Current bias: {'bullish 📈' if closes[-1] > closes[-6] else 'bearish 📉'}."
+            )
+
+        # ── Double Bottom (W Pattern) ────────────────────────────────────
+        # Two lows within 2% of each other with a peak in between
+        if n >= 15:
+            region = lows[-15:]
+            min_idx = region.index(min(region))
+            if 3 <= min_idx <= len(region) - 4:
+                left_lows  = region[:min_idx]
+                right_lows = region[min_idx+1:]
+                left_min   = min(left_lows)  if left_lows  else 999
+                right_min  = min(right_lows) if right_lows else 999
+                neckline   = max(closes[max(0, -15+min_idx-3):-15+min_idx+3] or [0])
+                if (abs(left_min - right_min) / right_min < 0.025 and
+                        current_price > neckline * 0.99):
+                    results.append(
+                        f"🅆 [{tf_label}] <b>Double Bottom (W Pattern)</b> — two lows "
+                        f"at ~{format_price(min(left_min, right_min))}, neckline "
+                        f"~{format_price(neckline)}. "
+                        f"{'✅ Breaking above neckline — reversal signal.' if current_price > neckline else '⏳ Watch for neckline break above ' + format_price(neckline) + '.'}"
+                    )
+
+        # ── Bull Flag ────────────────────────────────────────────────────
+        # Strong rally (5+ candles up) followed by tight sideways consolidation
+        if n >= 12:
+            rally = closes[-12:-6]
+            flag  = closes[-6:]
+            rally_gain = (rally[-1] - rally[0]) / rally[0] * 100 if rally[0] > 0 else 0
+            flag_range = (max(flag) - min(flag)) / min(flag) * 100 if min(flag) > 0 else 100
+            if rally_gain >= 8 and flag_range <= 5:
+                results.append(
+                    f"🚩 [{tf_label}] <b>Bull Flag</b> — +{rally_gain:.1f}% rally followed by "
+                    f"tight {flag_range:.1f}% consolidation (flag). "
+                    f"Breakout above {format_price(max(flag))} with volume = continuation entry."
+                )
+
+        # ── Cup & Handle ─────────────────────────────────────────────────
+        # Rounded bottom over 10+ candles + small handle pullback (3-5 candles)
+        if n >= 18:
+            cup   = lows[-18:-5]
+            handle= closes[-5:]
+            cup_low  = min(cup)
+            cup_high = max(closes[-18:-5])
+            handle_low = min(handle)
+            handle_pullback = (cup_high - handle_low) / cup_high * 100 if cup_high > 0 else 100
+            # Cup: lows form a U shape (middle lower than edges)
+            mid_cup = cup[len(cup)//2]
+            if (mid_cup <= cup_low * 1.03 and
+                    handle_pullback <= 15 and handle_pullback >= 3 and
+                    current_price >= handle_low * 1.01):
+                results.append(
+                    f"☕ [{tf_label}] <b>Cup & Handle</b> — rounded bottom with handle "
+                    f"pullback of {handle_pullback:.1f}%. "
+                    f"Breakout above {format_price(cup_high)} = high-probability continuation."
+                )
+
+        # ── Higher Lows Trend ─────────────────────────────────────────────
+        # Simple: last 3 swing lows each higher than the previous
+        swing_lows = []
+        for i in range(2, n - 2):
+            if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+                swing_lows.append(lows[i])
+        if len(swing_lows) >= 3 and all(swing_lows[i] > swing_lows[i-1] for i in range(1, len(swing_lows[-3:]))):
+            trend_strength = (swing_lows[-1] - swing_lows[-3]) / swing_lows[-3] * 100
+            results.append(
+                f"📈 [{tf_label}] <b>Higher Lows Trend</b> — 3 consecutive higher swing lows "
+                f"(+{trend_strength:.1f}% rise in lows). Uptrend structure intact — "
+                f"dips are buying opportunities while this holds."
+            )
+
+    _scan(klines_4h, "4H")
+    _scan(klines_1d, "1D")
+    return results
+
+
 def detect_break_retest_pattern(klines_4h, current_price):
     """
     Item: /entry Pattern Context. Looks for a "break → retest → continuation"
@@ -3988,6 +4184,7 @@ def _build_retest_guidance(level_price, current_price, candles_since_break):
 def calc_entry_score(symbol):
     klines_1h = get_klines(symbol, interval="1h", limit=30)
     klines_4h = get_klines(symbol, interval="4h", limit=30)
+    klines_1d = get_klines(symbol, interval="1d", limit=30)
     klines_15m = get_klines(symbol, interval="15m", limit=30)
     klines_30m = get_klines(symbol, interval="30m", limit=30)
     ticker = get_ticker(symbol)
@@ -4130,6 +4327,9 @@ def calc_entry_score(symbol):
         )
 
     label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
+    # ── Chart Pattern Recognition (4H + 1D) ──
+    chart_patterns = detect_patterns(symbol, klines_4h, klines_1d, current_price)
+
     return {
         "score": score, "max_score": max_score, "label": label,
         "details": details, "price": current_price,
@@ -4137,6 +4337,7 @@ def calc_entry_score(symbol):
         "pattern_note_4h": pattern_notes.get("4h"),
         "pattern_note_1h": pattern_notes.get("1h"),
         "pattern_notes": pattern_notes,  # {tf_label: note} for all timeframes that had one
+        "chart_patterns": chart_patterns,  # list of detected pattern strings
     }
 
 
@@ -4684,6 +4885,110 @@ def auto_cleanup_poor_performers():
     )
     print(f"🧹 Auto-cleanup removed {len(to_remove)} coins: {[s for s, _ in to_remove]}")
 
+_btc_condition = {
+    "state": "neutral",        # "neutral" | "warning" | "bearish"
+    "alert_sent": False,
+    "recovery_sent": False,
+    "last_check": 0,
+    "consecutive_red_4h": 0,
+}
+
+def check_btc_market_condition():
+    """
+    Monitors BTC's 4H and 1D structure for signs of a trend shift that would
+    make altcoin entries significantly riskier. Fires a personal admin DM
+    (not a subscriber broadcast) when BTC looks like it's turning bearish,
+    and a recovery DM when it stabilises. Checks every 4H candle.
+    """
+    now = time.time()
+    if now - _btc_condition["last_check"] < 3600:  # max once per hour
+        return
+    _btc_condition["last_check"] = now
+
+    klines_4h = get_klines("BTCUSDT", interval="4h", limit=20)
+    klines_1d  = get_klines("BTCUSDT", interval="1d", limit=10)
+    ticker = get_ticker("BTCUSDT")
+    if not klines_4h or len(klines_4h) < 10 or not ticker:
+        return
+
+    btc_price   = float(ticker["lastPrice"])
+    change_24h  = float(ticker["priceChangePercent"])
+    closed_4h   = klines_4h[:-1]
+    closes_4h   = [float(k[4]) for k in closed_4h]
+    ema20_4h    = calculate_ema(closes_4h, 20)
+
+    # Consecutive red 4H candles
+    consec_red = 0
+    for k in reversed(closed_4h[-6:]):
+        if float(k[4]) < float(k[1]):
+            consec_red += 1
+        else:
+            break
+    _btc_condition["consecutive_red_4h"] = consec_red
+
+    # Single 4H dump ≥ 3%
+    last_4h_change = (float(closed_4h[-1][4]) - float(closed_4h[-1][1])) / float(closed_4h[-1][1]) * 100
+
+    # 4H EMA cross (price below EMA)
+    below_ema_4h = ema20_4h and btc_price < ema20_4h
+
+    # 1D EMA
+    below_ema_1d = False
+    if klines_1d and len(klines_1d) >= 5:
+        closed_1d  = klines_1d[:-1]
+        closes_1d  = [float(k[4]) for k in closed_1d]
+        ema20_1d   = calculate_ema(closes_1d, 20)
+        below_ema_1d = ema20_1d and btc_price < ema20_1d
+
+    # Trigger conditions
+    is_warning = consec_red >= 3 or last_4h_change <= -3.0 or below_ema_4h
+    is_bearish = (consec_red >= 4 or below_ema_1d or
+                  (below_ema_4h and consec_red >= 2))
+
+    new_state = "bearish" if is_bearish else ("warning" if is_warning else "neutral")
+    old_state = _btc_condition["state"]
+
+    if new_state in ("warning", "bearish") and not _btc_condition["alert_sent"]:
+        _btc_condition["state"] = new_state
+        _btc_condition["alert_sent"] = True
+        _btc_condition["recovery_sent"] = False
+        emoji = "🔴" if new_state == "bearish" else "🟠"
+        reasons = []
+        if consec_red >= 3:
+            reasons.append(f"{consec_red} consecutive red 4H candles")
+        if last_4h_change <= -3.0:
+            reasons.append(f"last 4H candle: {last_4h_change:.1f}%")
+        if below_ema_4h:
+            reasons.append(f"price below 4H 20EMA ({format_price(ema20_4h)})")
+        if below_ema_1d:
+            reasons.append("price below 1D 20EMA — serious")
+        send_to(ADMIN_CHAT_ID,
+            f"{emoji} <b>BTC TREND SHIFT — {'BEARISH' if new_state == 'bearish' else 'WARNING'}</b>\n\n"
+            f"💰 BTC: {format_price(btc_price)} ({change_24h:+.2f}% 24h)\n"
+            f"⚠️ Signals:\n" + "\n".join(f"  • {r}" for r in reasons) + "\n\n"
+            f"Altcoin signals are significantly higher risk during BTC weakness.\n"
+            f"Consider:\n"
+            f"  • Tightening SL on open positions\n"
+            f"  • Pausing new entries until BTC stabilises\n"
+            f"  • Watching BTC support around {format_price(btc_price * 0.95)}\n\n"
+            f"You'll get another message when BTC stabilises. 🟡"
+        )
+        print(f"🔴 BTC condition alert: {new_state} — {', '.join(reasons)}")
+
+    elif new_state == "neutral" and old_state in ("warning", "bearish") and not _btc_condition["recovery_sent"]:
+        _btc_condition["state"] = "neutral"
+        _btc_condition["alert_sent"] = False
+        _btc_condition["recovery_sent"] = True
+        send_to(ADMIN_CHAT_ID,
+            f"✅ <b>BTC Stabilising</b>\n\n"
+            f"💰 BTC: {format_price(btc_price)} ({change_24h:+.2f}% 24h)\n"
+            f"4H structure looks healthier — {consec_red} red candles, "
+            f"{'above' if not below_ema_4h else 'near'} 4H EMA.\n\n"
+            f"Altcoin conditions improving — normal scan resuming."
+        )
+        print("✅ BTC condition recovered to neutral")
+
+
 def monitor_momentum():
     while True:
         now = time.time()
@@ -5037,6 +5342,7 @@ def monitor_momentum():
             signal_performance.pop(key, None)
 
         check_retest_watches()
+        check_btc_market_condition()  # admin DM if BTC shows trend shift
 
         # Weekly auto-cleanup (cost control) — only runs once every 7 days
         global _last_cleanup_check
@@ -5108,7 +5414,7 @@ def handle_commands():
                             f"a personal alert (and a Top Picks post) the moment it completes.\n"
                             f"Use /unwatch BTC to stop, or /mywatches to see your list.\n\n"
                             f"📏 <b>Mark your own level:</b>\n"
-                            f"Drawn a resistance/support line yourself? /addline BTC 95000 4h\n"
+                            f"Drawn a resistance/support line yourself? /addline BTC 95000 1h\n"
                             f"tracks it for a strong-body break, then alerts again when the\n"
                             f"retest confirms. Use /removeline or /mylines to manage.\n\n"
                             f"⚠️ <b>Keep in mind:</b>\n"
@@ -5185,12 +5491,19 @@ def handle_commands():
                                     # notable here", so silence never gets mistaken for a gap.
                                     lines.append(f"📐 <b>Pattern Context ({tf.upper()}):</b>\nNo clear breakout/retest setup detected on this timeframe right now.")
                             pattern_section = "\n" + "\n\n".join(lines) + "\n"
+                            chart_patterns = result.get("chart_patterns", [])
+                            patterns_section = (
+                                "\n\n🔍 <b>Chart Patterns (4H/1D):</b>\n" +
+                                "\n\n".join(chart_patterns)
+                                if chart_patterns else ""
+                            )
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
                                 f"📈 Score: {result['score']}/{result['max_score']} ({result['label']})\n\n"
                                 f"{details_str}\n"
-                                f"{pattern_section}\n"
+                                f"{pattern_section}"
+                                f"{patterns_section}\n\n"
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
@@ -5658,15 +5971,15 @@ def handle_commands():
                 elif raw_text.upper().startswith("/ADDLINE "):
                     parts = raw_text.strip().split()
                     if len(parts) != 4:
-                        send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h\n(timeframe must be 4h or 1d)")
+                        send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h\n(timeframe must be 1h, 4h or 1d)")
                     else:
                         _, sym, price_s, ltf = parts
                         sym = sym.upper()
                         if not sym.endswith("USDT"):
                             sym += "USDT"
                         ltf = ltf.lower()
-                        if ltf not in ["4h", "1d"]:
-                            send_to(chat_id, "⚠️ Timeframe must be 4h or 1d for /addline")
+                        if ltf not in ["1h", "4h", "1d"]:
+                            send_to(chat_id, "⚠️ Timeframe must be 1h, 4h or 1d for /addline")
                         else:
                             try:
                                 level_price = float(price_s)
@@ -5691,13 +6004,13 @@ def handle_commands():
                                         f"🆔 ID: <code>{line_id}</code>\n\n"
                                         f"Watching for a strong-body break above this level, "
                                         f"then a confirmed retest. You'll get a personal alert "
-                                        f"at each stage (it'll also post to Top Picks on retest "
+                                        f"at each stage (it'll also post to My Setups on retest "
                                         f"confirmation).\n\n"
                                         f"Use /removeline {line_id} to stop."
                                     )
                                     print(f"📏 Line added: {line_id}")
                             except ValueError:
-                                send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h")
+                                send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 1h")
 
                 elif raw_text.upper().startswith("/REMOVELINE "):
                     line_id = raw_text.strip().split(None, 1)[1].strip()
@@ -5711,7 +6024,7 @@ def handle_commands():
                 elif text == "/MYLINES":
                     mine = {k: v for k, v in manual_lines.items() if v.get("chat_id") == chat_id}
                     if not mine:
-                        send_to(chat_id, "📏 You have no active lines. Use /addline SYMBOL PRICE 4h to add one.")
+                        send_to(chat_id, "📏 You have no active lines. Use /addline SYMBOL PRICE 1h to add one.")
                     else:
                         lines_out = []
                         for lid, ln in mine.items():
