@@ -1253,6 +1253,7 @@ def check_postpump_retracement(symbol):
 
     # MTF label for alert
     mtf_confirm = "4H OB → 1H retest ✅" if ob_label == "4H OB" else "1H OB → 15M retest ✅"
+    full_confluence_ob = build_full_confluence_block(symbol, current_price, tf="4h")
 
     postpump_alerted[key] = now
     ob_fvg_zone_tracking[key]["alert_sent"] = True
@@ -1268,7 +1269,8 @@ def check_postpump_retracement(symbol):
         f"{fib_label}"
         f"⚡ Volume: {vol_ratio:.1f}x\n"
         f"📐 MTF: {mtf_confirm}\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        + (f"\n{full_confluence_ob}\n" if full_confluence_ob else "") +
+        f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
         f"⚠️ <i>OB bounce! Check the chart before entry.</i>",
         symbol=symbol
     )
@@ -2250,7 +2252,7 @@ def check_manual_zones():
                 if is_liquidity_sweep and zone.get("last_wick_alert_candle") != wick_key_candle:
                     manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
-                    tl_sweep_note_liq = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+                    full_confluence_liq = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
                     send_to_topic(TOPIC_MY_SETUPS,
                         f"🩸 <b>LIQUIDITY SWEEP — {symbol} [{tf.upper()} OB]</b>\n\n"
                         f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
@@ -2258,7 +2260,7 @@ def check_manual_zones():
                         f"📍 Swept below {format_price(swing_low)} (tested {touches}x prior) "
                         f"and reclaimed it on the close\n"
                         f"⚡ Volume: {vol_ratio_sweep:.1f}x on the reclaim candle\n"
-                        + (f"\n{tl_sweep_note_liq}\n" if tl_sweep_note_liq else "") +
+                        + (f"\n{full_confluence_liq}\n" if full_confluence_liq else "") +
                         f"\n💡 <i>Sell-side stops below that low likely got triggered and absorbed — "
                         f"this is the classic setup before a move up. Not a full zone confirmation "
                         f"yet, but a strong early signal.</i>\n\n"
@@ -2380,7 +2382,7 @@ def check_manual_zones():
                     coiling_tag = f"⏳ Coiling — active {coiling_days:.0f} days\n"
 
                 # Check for trendline liquidity sweep confluence
-                tl_sweep_note = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+                full_confluence = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
 
                 msg = (
                     f"🎯 <b>ZONE CONFIRMED! [{tf.upper()} OB]</b>\n\n"
@@ -2395,7 +2397,7 @@ def check_manual_zones():
                     f"📈 From zone low: +{recovery_pct:.1f}%\n\n"
                     f"📊 <b>Confidence: {conf_label}</b>\n"
                     f"   {details_str}\n"
-                    + (f"\n{tl_sweep_note}\n" if tl_sweep_note else "") +
+                    + (f"\n{full_confluence}\n" if full_confluence else "") +
                     f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                     f"⚠️ <i>Check the chart before entry.</i>"
                 )
@@ -2752,10 +2754,6 @@ def check_manual_lines():
             )
 
             if retest_confirmed:
-                # FIX (JST case, same root cause as /watch): a single confirming
-                # candle doesn't guarantee the breakout holds. Instead of removing
-                # the line here, move it into a "followup" state that checks the
-                # next up-to-3 candle closes before declaring the outcome.
                 manual_lines[line_id]["last_retest_candle"] = candle_key
                 manual_lines[line_id]["state"] = "followup"
                 manual_lines[line_id]["followup_candles_checked"] = 0
@@ -2763,14 +2761,11 @@ def check_manual_lines():
                 save_manual_lines()
 
                 suggestion, strength_details = analyze_move_strength(symbol, current_price)
-                strength_str = "\n".join(strength_details) if strength_details else ""
                 is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
-                tl_sweep_line = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+                full_confluence_line = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
 
                 intro_line = (
-                    f"⚠️ Price broke {format_price(level)} and the candle that closed back "
-                    f"above it on its own looks like a retest confirm — but see the warning below "
-                    f"before treating this as a green light."
+                    f"⚠️ Price broke {format_price(level)} — distribution risk detected, see analysis below."
                     if is_distribution_flagged else
                     f"✅ Price broke {format_price(level)}, retested, and just closed "
                     f"back above it with a strong green candle. Continuation looks favorable."
@@ -2781,15 +2776,14 @@ def check_manual_lines():
                     f"💰 Price: {format_price(current_price)}\n"
                     f"📍 Level: {format_price(level)}\n\n"
                     f"{intro_line}\n\n"
-                    f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
-                    + (f"{tl_sweep_line}\n\n" if tl_sweep_line else "") +
+                    + (f"{full_confluence_line}\n\n" if full_confluence_line else "") +
                     f"{suggestion}\n\n"
                     f"⏳ <i>Tracking the next 3 candles to confirm this holds — you'll get a follow-up.</i>"
                 )
                 send_to_topic(TOPIC_MY_SETUPS, msg)
                 if chat_id:
                     send_to(chat_id, msg)
-                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}{' [TL SWEEP]' if tl_sweep_line else ''}")
+                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
             continue
 
         # ── followup: confirm already fired, check whether it actually holds ──
@@ -4494,6 +4488,206 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def analyze_key_levels(symbol, current_price):
+    """
+    Automatically finds key support and resistance levels from 4H klines,
+    then for each resistance level above current price: counts how many
+    times it's been tested and compares the volume of each test to see
+    if buying pressure is increasing (sellers getting absorbed = breakout
+    more likely) or decreasing (buyers not committed).
+
+    Returns a formatted string ready to embed in any confirmation message.
+    """
+    klines = get_klines(symbol, interval="4h", limit=100)
+    if not klines or len(klines) < 20:
+        return None
+
+    closed = klines[:-1]
+    highs  = [float(k[2]) for k in closed]
+    lows   = [float(k[3]) for k in closed]
+    closes = [float(k[4]) for k in closed]
+    vols   = [float(k[5]) for k in closed]
+
+    # ── Find swing highs (resistance) and swing lows (support) ──
+    swing_highs = []
+    swing_lows  = []
+    for i in range(3, len(closed) - 3):
+        h = highs[i]
+        if (h > highs[i-1] and h > highs[i-2] and h > highs[i-3] and
+                h > highs[i+1] and h > highs[i+2] and h > highs[i+3]):
+            swing_highs.append((i, h, vols[i]))
+        l = lows[i]
+        if (l < lows[i-1] and l < lows[i-2] and l < lows[i-3] and
+                l < lows[i+1] and l < lows[i+2] and l < lows[i+3]):
+            swing_lows.append((i, l, vols[i]))
+
+    # ── Cluster nearby levels (within 1.5%) ──
+    def cluster_levels(raw_levels):
+        if not raw_levels:
+            return []
+        clustered = []
+        used = set()
+        for i, (idx_i, price_i, vol_i) in enumerate(raw_levels):
+            if i in used:
+                continue
+            group = [(idx_i, price_i, vol_i)]
+            for j, (idx_j, price_j, vol_j) in enumerate(raw_levels):
+                if j != i and j not in used:
+                    if abs(price_i - price_j) / price_i <= 0.015:
+                        group.append((idx_j, price_j, vol_j))
+                        used.add(j)
+            used.add(i)
+            avg_price = sum(p for _, p, _ in group) / len(group)
+            touch_vols = [v for _, _, v in group]
+            clustered.append({
+                "price": avg_price,
+                "touches": len(group),
+                "touch_vols": sorted(touch_vols),  # chronological order
+                "indices": [idx for idx, _, _ in group],
+            })
+        return sorted(clustered, key=lambda x: x["price"])
+
+    res_levels = cluster_levels([(i, h, v) for i, h, v in swing_highs if h > current_price * 1.005])
+    sup_levels = cluster_levels([(i, l, v) for i, l, v in swing_lows  if l < current_price * 0.995])
+
+    avg_vol_overall = sum(vols[-20:]) / 20
+
+    def vol_trend_label(touch_vols):
+        if len(touch_vols) < 2:
+            return None
+        last = touch_vols[-1]
+        prev_avg = sum(touch_vols[:-1]) / len(touch_vols[:-1])
+        ratio = last / prev_avg if prev_avg > 0 else 1
+        last_x = last / avg_vol_overall if avg_vol_overall > 0 else 1
+        if ratio >= 1.3:
+            return (f"⚡ This touch volume: {last_x:.1f}x avg — "
+                    f"🔥 INCREASING vs prior tests ({ratio:.1f}x more) — "
+                    f"sellers getting absorbed, breakout pressure building")
+        elif ratio <= 0.7:
+            return (f"⚡ This touch volume: {last_x:.1f}x avg — "
+                    f"⬇️ DECREASING vs prior tests — "
+                    f"buyers not committed yet, may need more tests")
+        else:
+            return (f"⚡ This touch volume: {last_x:.1f}x avg — "
+                    f"↔️ Similar to prior tests — no clear absorption signal yet")
+
+    lines = ["📍 <b>Key Levels (4H):</b>"]
+
+    # Nearest support (just below current price)
+    near_supports = [s for s in sup_levels if s["price"] < current_price]
+    if near_supports:
+        nearest_sup = near_supports[-1]  # closest below
+        lines.append(
+            f"🟢 Support: {format_price(nearest_sup['price'])} "
+            f"({nearest_sup['touches']} touch{'es' if nearest_sup['touches'] > 1 else ''}) "
+            f"— {'holds as floor' if current_price > nearest_sup['price'] * 1.01 else 'being tested now'}"
+        )
+
+    # Resistance levels above (nearest + major)
+    near_resistances = [r for r in res_levels if r["price"] > current_price][:3]
+    for i, res in enumerate(near_resistances):
+        label = "Next resistance" if i == 0 else "Major resistance" if i == 1 else "Extended target"
+        vt = vol_trend_label(res["touch_vols"])
+        touches_str = f"{res['touches']} touch{'es' if res['touches'] > 1 else ''}"
+        lines.append(f"🔴 {label}: {format_price(res['price'])} ({touches_str})")
+        if vt and res["touches"] >= 2:
+            lines.append(f"   {vt}")
+
+    if len(lines) == 1:
+        return None  # no useful levels found
+
+    # Clear sky detection — if nearest resistance is far away, highlight it
+    if near_resistances:
+        nearest_res_price = near_resistances[0]["price"]
+        gap_pct = (nearest_res_price - current_price) / current_price * 100
+        if gap_pct >= 15:
+            lines.insert(1,
+                f"🚀 <b>CLEAR SKY</b> — no significant resistance until "
+                f"{format_price(nearest_res_price)} (+{gap_pct:.1f}% away). "
+                f"Price has cleared all nearby levels — momentum moves tend "
+                f"to be faster and larger here with less friction."
+            )
+    elif not near_resistances:
+        lines.insert(1,
+            f"🚀 <b>CLEAR SKY</b> — no resistance detected above current price "
+            f"in recent 4H history. Price is in uncharted territory — "
+            f"momentum moves can be very fast here."
+        )
+
+    return "\n".join(lines)
+
+
+def build_full_confluence_block(symbol, current_price, tf="4h", swing_high=None, swing_low=None):
+    """
+    Builds the complete confluence analysis block used in all confirmation
+    messages. Combines:
+      - Trendline sweep confluence
+      - Fibonacci retracement level (if swing_high/low provided or detectable)
+      - Volume + HL structure (from analyze_move_strength)
+      - Key levels with clear-sky breakout detection
+    Returns a formatted string or empty string if nothing notable found.
+    """
+    parts = []
+
+    # Trendline sweep confluence
+    tl_sweep = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+    if tl_sweep:
+        parts.append(tl_sweep)
+
+    # Fibonacci retracement (auto-detect swing high/low from 4H if not provided)
+    if not swing_high or not swing_low:
+        klines_fib = get_klines(symbol, interval="4h", limit=50)
+        if klines_fib and len(klines_fib) >= 10:
+            closed_fib = klines_fib[:-1]
+            swing_high = max(float(k[2]) for k in closed_fib[-30:])
+            swing_low  = min(float(k[3]) for k in closed_fib[-30:])
+    if swing_high and swing_low and swing_high > swing_low:
+        fib_range = swing_high - swing_low
+        fib_levels = {
+            "0.236": swing_high - 0.236 * fib_range,
+            "0.382": swing_high - 0.382 * fib_range,
+            "0.500": swing_high - 0.500 * fib_range,
+            "0.618": swing_high - 0.618 * fib_range,
+            "0.786": swing_high - 0.786 * fib_range,
+        }
+        closest_fib = None
+        closest_dist = float("inf")
+        for fname, fprice in fib_levels.items():
+            dist = abs(current_price - fprice) / fprice
+            if dist < closest_dist and dist <= 0.03:
+                closest_dist = dist
+                closest_fib = (fname, fprice)
+        if closest_fib:
+            fname, fprice = closest_fib
+            if fname == "0.618":
+                parts.append(f"📐 <b>Fibonacci: 0.618 🎯 GOLDEN POCKET</b> (~{format_price(fprice)}) — strongest institutional confluence level")
+            elif fname == "0.500":
+                parts.append(f"📐 Fibonacci: 0.500 ({format_price(fprice)}) — mid-range, institutional level")
+            elif fname == "0.382":
+                parts.append(f"📐 Fibonacci: 0.382 ({format_price(fprice)}) — shallow pullback, trend still strong")
+            elif fname == "0.786":
+                parts.append(f"📐 Fibonacci: 0.786 ({format_price(fprice)}) — deep pullback, last support before trend break")
+            else:
+                parts.append(f"📐 Fibonacci: {fname} (~{format_price(fprice)})")
+
+    # Volume + HL structure
+    suggestion, strength_details = analyze_move_strength(symbol, current_price)
+    if strength_details:
+        struct_lines = [d for d in strength_details if "Distribution" not in d]
+        dist_lines   = [d for d in strength_details if "Distribution" in d]
+        if struct_lines:
+            parts.append("📊 <b>Move Strength:</b>\n" + "\n".join(struct_lines))
+        if dist_lines:
+            parts.append("\n".join(dist_lines))
+
+    # Key levels (support/resistance + clear sky)
+    key_levels = analyze_key_levels(symbol, current_price)
+    if key_levels:
+        parts.append(key_levels)
+
+    return "\n\n".join(parts) if parts else ""
+
+
 def check_trendline_sweep_confluence(symbol, confirm_price, tf="1h"):
     """
     Checks whether the current retest/bounce happened at or after a trendline
@@ -4825,15 +5019,13 @@ def check_retest_watches():
         if confirmed_note:
             tf, pattern_note, klines_tf = confirmed_note
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
-            strength_str = "\n".join(strength_details)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
-            tl_sweep = check_trendline_sweep_confluence(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+            full_confluence_watch = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
-                f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
-                + (f"{tl_sweep}\n\n" if tl_sweep else "") +
+                + (f"{full_confluence_watch}\n\n" if full_confluence_watch else "") +
                 f"{suggestion}\n\n"
                 f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
                 f"you'll get a follow-up.</i>"
@@ -5254,6 +5446,7 @@ def monitor_momentum():
                     vol_ratio = cv / (sum(pv)/len(pv)) if pv else 1
                 gain_pct = (current_price - breakout_price) / breakout_price * 100
                 tl_sweep_retest = check_trendline_sweep_confluence(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
+                full_confluence_tl = build_full_confluence_block(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
                 retest_msg = (
                     f"🏆 <b>TRENDLINE RETEST CONFIRMED! [{tf_r.upper()}]</b>\n\n"
                     f"🪙 <b>{symbol}</b>\n"
@@ -5262,7 +5455,7 @@ def monitor_momentum():
                     f"📐 Break → retest → continuation\n"
                     f"📈 From breakout: <b>+{gain_pct:.1f}%</b>\n"
                     f"⚡ Volume: {vol_ratio:.1f}x\n"
-                    + (f"\n{tl_sweep_retest}\n" if tl_sweep_retest else "") +
+                    + (f"\n{full_confluence_tl}\n" if full_confluence_tl else "") +
                     f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                     f"⚠️ <i>Strong setup! Check OB/FVG before entry.</i>"
                 )
@@ -5291,7 +5484,8 @@ def monitor_momentum():
         # (e.g. continuing to +50%+ over the next 2-3 days) hadn't happened yet. Now the
         # bot keeps tracking the actual highest price for at least RESULT_MIN_HOURS before
         # it's allowed to lock in any result — short-term noise no longer ends tracking early.
-        RESULT_MIN_HOURS = 60  # ~2.5 days minimum before a result can be finalized
+        RESULT_MIN_HOURS = 24   # minimum 24h before a result can be finalized
+        RESULT_AUTO_HOURS = 48  # after 48h, send result regardless of dump
         perf_remove = []
         symbol_best = {}  # {symbol: best_data_key} — highest peak per symbol
 
@@ -5335,20 +5529,28 @@ def monitor_momentum():
             highest = best["highest"]
             peak_pct = best["peak_pct"]
 
-            if peak_pct < 10.0:
+            if peak_pct < 5.0:
                 continue
 
             ticker = get_ticker(symbol)
             if not ticker:
                 continue
             current_price = float(ticker["lastPrice"])
-            dumped = current_price < highest * 0.92  # 8%+ dump from peak
+            dumped = current_price < highest * 0.90  # 10%+ pullback from peak
             window_passed = (now - data["signal_time"]) >= RESULT_MIN_HOURS * 3600
+            auto_window = (now - data["signal_time"]) >= RESULT_AUTO_HOURS * 3600
 
-            if dumped and window_passed and not data.get("result_sent"):
+            # Fire result if: dumped after minimum window, OR 48h has passed
+            should_send = not data.get("result_sent") and (
+                (dumped and window_passed) or auto_window
+            )
+
+            if should_send:
                 peak_time = data.get("peak_time", data["signal_time"])
                 peak_hrs = (peak_time - data["signal_time"]) / 3600
-                emoji = "🚀" if peak_pct >= 20 else "🟠"
+                emoji = "🚀" if peak_pct >= 20 else "🟢" if peak_pct >= 10 else "🟡"
+                result_type = "Auto (48h)" if auto_window and not dumped else "Peak reached"
+                current_vs_signal = (current_price - data["signal_price"]) / data["signal_price"] * 100
 
                 # Send to subscribers
                 send_all(
@@ -5356,7 +5558,9 @@ def monitor_momentum():
                     f"🪙 <b>{symbol}</b>\n"
                     f"📊 {data['signal_type']}\n"
                     f"💰 {format_price(data['signal_price'])} → {format_price(highest)}\n"
-                    f"📈 <b>+{peak_pct:.1f}%</b> | ⏱ {peak_hrs:.1f}hr",
+                    f"📈 <b>Peak: +{peak_pct:.1f}%</b> | ⏱ {peak_hrs:.1f}hr\n"
+                    f"💰 Now: {format_price(current_price)} ({current_vs_signal:+.1f}% from signal)\n"
+                    f"📋 {result_type}",
                     symbol=None
                 )
                 # Mark all signals for this symbol as sent
