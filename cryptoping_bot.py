@@ -2662,7 +2662,41 @@ def check_manual_lines():
             buy_ratio >= 0.52
         )
 
-        # ── waiting → break ──
+        # ── LIVE cross early alert (forming candle, before close) ──
+        # FIX (BEL case): waiting for the candle to close before alerting meant
+        # price was already far above the level by the time the message arrived.
+        # This checks the FORMING candle (klines_tf[-1]) via current_price —
+        # if price has already moved above the level with the forming candle
+        # showing real body momentum, fire an immediate early heads-up so
+        # monitoring can start right now, not at candle close.
+        if state == "waiting" and not line.get("live_cross_alerted"):
+            forming = klines_tf[-1]
+            f_open = float(forming[1])
+            f_vol  = float(forming[5])
+            f_buy  = float(forming[9]) if len(forming) > 9 else f_vol * 0.5
+            f_vol_ratio = f_vol / avg_vol if avg_vol > 0 else 0
+            f_buy_ratio = f_buy / f_vol if f_vol > 0 else 0
+            live_body_above = current_price > level and current_price > f_open * 1.002
+            live_vol_ok = f_vol_ratio >= 1.3 and f_buy_ratio >= 0.50
+            if live_body_above and live_vol_ok:
+                manual_lines[line_id]["live_cross_alerted"] = True
+                save_manual_lines()
+                live_msg = (
+                    f"⚡ <b>LINE CROSSED (Live) — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"💰 Price: {format_price(current_price)}\n"
+                    f"📍 Level: {format_price(level)}\n"
+                    f"⚡ Volume: {f_vol_ratio:.1f}x | Buy: {f_buy_ratio*100:.0f}%\n\n"
+                    f"🕐 Candle still forming — this is an early heads-up so you can "
+                    f"start monitoring now. A confirmed break alert will follow "
+                    f"when the candle closes above {format_price(level)}.\n\n"
+                    f"⚠️ <i>Candle not closed yet — treat as a watch signal, not full confirmation.</i>"
+                )
+                send_to_topic(TOPIC_MY_SETUPS, live_msg)
+                if chat_id:
+                    send_to(chat_id, live_msg)
+                print(f"⚡ Line live cross: {line_id} @ {format_price(current_price)}")
+
+        # ── waiting → break (closed candle confirm) ──
         if state == "waiting":
             if strong_break and line.get("last_break_candle") != candle_key:
                 manual_lines[line_id]["state"] = "broken"
@@ -2670,19 +2704,22 @@ def check_manual_lines():
                 manual_lines[line_id]["break_time"] = now
                 manual_lines[line_id]["last_break_candle"] = candle_key
                 manual_lines[line_id]["lowest_since_break"] = l_close
+                manual_lines[line_id]["live_cross_alerted"] = False  # reset for next level
                 save_manual_lines()
                 msg = (
-                    f"📏 <b>Line Break — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"📏 <b>Line Break Confirmed — {symbol} [{tf.upper()}]</b>\n\n"
                     f"💰 Price: {format_price(current_price)}\n"
                     f"📍 Level: {format_price(level)}\n"
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n\n"
+                    f"✅ Candle closed above {format_price(level)} with body confirmation.\n"
                     f"⏳ Watching for a retest now — you'll get another alert "
                     f"if/when it confirms.\n\n"
                     f"⚠️ <i>Confirm on the chart before treating this as actionable.</i>"
                 )
+                send_to_topic(TOPIC_MY_SETUPS, msg)
                 if chat_id:
                     send_to(chat_id, msg)
-                print(f"📏 Line break: {line_id}")
+                print(f"📏 Line break confirmed: {line_id}")
             continue
 
         # ── broken → retest confirmed / failed ──
