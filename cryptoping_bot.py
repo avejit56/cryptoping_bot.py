@@ -1253,7 +1253,7 @@ def check_postpump_retracement(symbol):
 
     # MTF label for alert
     mtf_confirm = "4H OB → 1H retest ✅" if ob_label == "4H OB" else "1H OB → 15M retest ✅"
-    full_confluence_ob = build_full_confluence_block(symbol, current_price, tf="4h")
+    full_confluence_ob = build_entry_decision_block(symbol, current_price, tf="4h")
 
     postpump_alerted[key] = now
     ob_fvg_zone_tracking[key]["alert_sent"] = True
@@ -2252,7 +2252,7 @@ def check_manual_zones():
                 if is_liquidity_sweep and zone.get("last_wick_alert_candle") != wick_key_candle:
                     manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
-                    full_confluence_liq = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+                    full_confluence_liq = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
                     send_to_topic(TOPIC_MY_SETUPS,
                         f"🩸 <b>LIQUIDITY SWEEP — {symbol} [{tf.upper()} OB]</b>\n\n"
                         f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
@@ -2382,7 +2382,7 @@ def check_manual_zones():
                     coiling_tag = f"⏳ Coiling — active {coiling_days:.0f} days\n"
 
                 # Check for trendline liquidity sweep confluence
-                full_confluence = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
+                full_confluence = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "4h")
 
                 msg = (
                     f"🎯 <b>ZONE CONFIRMED! [{tf.upper()} OB]</b>\n\n"
@@ -2762,7 +2762,7 @@ def check_manual_lines():
 
                 suggestion, strength_details = analyze_move_strength(symbol, current_price)
                 is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
-                full_confluence_line = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+                full_confluence_line = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
 
                 intro_line = (
                     f"⚠️ Price broke {format_price(level)} — distribution risk detected, see analysis below."
@@ -4488,6 +4488,189 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def build_entry_decision_block(symbol, current_price, tf="4h"):
+    """
+    Generates a complete entry decision block for retest completion messages
+    (/watch, /addline, zone confirm). Combines confluence analysis with a
+    ready-to-use trade plan: entry confirmation, SL, TP targets, and a
+    one-line decision summary so the user can act immediately without
+    having to run /entry separately.
+    """
+    # Full confluence (trendline sweep + fib + volume/HL + key levels)
+    confluence = build_full_confluence_block(symbol, current_price, tf=tf)
+
+    # Get key levels for trade plan
+    klines_4h = get_klines(symbol, interval="4h", limit=100)
+    ticker    = get_ticker(symbol)
+    if not klines_4h or not ticker:
+        return confluence  # fallback to just confluence if data unavailable
+
+    change_24h = float(ticker["priceChangePercent"])
+    closed_4h  = klines_4h[:-1]
+    highs = [float(k[2]) for k in closed_4h]
+    lows  = [float(k[3]) for k in closed_4h]
+
+    res_above = sorted([h for h in highs if h > current_price * 1.005])
+    sup_below = sorted([l for l in lows  if l < current_price * 0.995], reverse=True)
+
+    nearest_res = res_above[0] if res_above else current_price * 1.05
+    second_res  = res_above[1] if len(res_above) > 1 else nearest_res * 1.05
+    nearest_sup = sup_below[0] if sup_below else current_price * 0.95
+    sl          = nearest_sup * 0.985
+
+    risk      = (current_price - sl) / current_price * 100
+    reward1   = (nearest_res - current_price) / current_price * 100
+    reward2   = (second_res  - current_price) / current_price * 100
+    rr        = reward1 / risk if risk > 0 else 0
+
+    # Decision quality
+    is_bearish = change_24h < -5
+    rr_ok      = rr >= 2.0
+
+    if is_bearish and not rr_ok:
+        decision_emoji = "⚠️"
+        decision_text  = "Daily trend bearish + R/R weak — consider skipping or very small size"
+    elif is_bearish:
+        decision_emoji = "🟡"
+        decision_text  = "Daily trend bearish but R/R acceptable — small position, tight SL"
+    elif not rr_ok:
+        decision_emoji = "🟡"
+        decision_text  = "R/R below 2:1 — consider waiting for a deeper retest or skip"
+    else:
+        decision_emoji = "✅"
+        decision_text  = "Setup looks clean — R/R favorable, confirm on chart then enter"
+
+    trade_block = (
+        f"\n🎯 <b>Entry Decision:</b>\n"
+        f"   💰 Entry: {format_price(current_price)} (current)\n"
+        f"   🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
+        f"   🟢 TP1: {format_price(nearest_res)} (+{reward1:.1f}%)\n"
+        f"   🟢 TP2: {format_price(second_res)} (+{reward2:.1f}%)\n"
+        f"   ⚖️ R/R: {rr:.1f}x\n\n"
+        f"{decision_emoji} {decision_text}"
+    )
+
+    parts = []
+    if confluence:
+        parts.append(confluence)
+    parts.append(trade_block)
+    return "\n\n".join(parts)
+
+
+def suggest_entry_action(symbol, current_price, score, label, pattern_notes, chart_patterns):
+    """
+    Generates ready-to-use /addline commands for 1H, 4H, and 1D timeframes
+    based on the nearest resistance levels, pattern context, and trend.
+    Also calculates SL (below nearest support) and TP targets (next resistances).
+    Returns a formatted string ready to embed in /entry output.
+    """
+    # Get key levels
+    klines_4h = get_klines(symbol, interval="4h", limit=100)
+    klines_1h = get_klines(symbol, interval="1h", limit=50)
+    ticker    = get_ticker(symbol)
+    if not klines_4h or not ticker:
+        return ""
+
+    change_24h = float(ticker["priceChangePercent"])
+
+    # Find supports and resistances from 4H
+    closed_4h = klines_4h[:-1]
+    highs = [float(k[2]) for k in closed_4h]
+    lows  = [float(k[3]) for k in closed_4h]
+
+    # Swing highs above current price (resistances)
+    res_above = sorted(set(
+        round(h, 8) for h in highs
+        if h > current_price * 1.005
+    ))
+    # Swing lows below current price (supports)
+    sup_below = sorted(set(
+        round(l, 8) for l in lows
+        if l < current_price * 0.995
+    ), reverse=True)
+
+    nearest_res  = res_above[0]  if len(res_above) > 0 else current_price * 1.05
+    second_res   = res_above[1]  if len(res_above) > 1 else nearest_res  * 1.05
+    major_res    = res_above[2]  if len(res_above) > 2 else second_res   * 1.05
+    nearest_sup  = sup_below[0]  if len(sup_below) > 0 else current_price * 0.95
+
+    # SL: just below nearest support (1.5% buffer)
+    sl = nearest_sup * 0.985
+
+    # TP targets
+    tp1 = nearest_res
+    tp2 = second_res
+    tp3 = major_res
+
+    # Risk/reward
+    risk    = (current_price - sl) / current_price * 100
+    reward1 = (tp1 - current_price) / current_price * 100
+    rr1     = reward1 / risk if risk > 0 else 0
+
+    # Determine best entry strategy per timeframe
+    # 1H: aggressive — nearest resistance breakout
+    line_1h = nearest_res * 1.002  # just above resistance
+
+    # 4H: confirmed — second resistance (more reliable breakout)
+    line_4h = nearest_res * 1.005
+
+    # 1D: conservative — well above, only if strong momentum
+    line_1d = second_res * 1.002
+
+    # Context flags
+    is_bearish_daily = change_24h < -5 or "bearish" in " ".join(pattern_notes.values()).lower()
+    has_retest = any("in progress" in v or "confirmed" in v for v in pattern_notes.values())
+    is_high_score = score >= 70
+
+    lines = ["\n💡 <b>Suggested Entry Levels:</b>"]
+
+    # 1H — fastest entry
+    lines.append(
+        f"⚡ <b>1H (Aggressive)</b> — catch the move early:\n"
+        f"   <code>/addline {symbol.replace('USDT','')} {format_price(line_1h)} 1h</code>\n"
+        f"   Alert fires as soon as {format_price(nearest_res)} breaks with volume"
+    )
+
+    # 4H — balanced
+    lines.append(
+        f"📊 <b>4H (Balanced)</b> — confirmed breakout:\n"
+        f"   <code>/addline {symbol.replace('USDT','')} {format_price(line_4h)} 4h</code>\n"
+        f"   Waits for 4H candle close above resistance"
+    )
+
+    # 1D — conservative (especially if bearish daily)
+    conservative_note = "recommended given daily bearish trend" if is_bearish_daily else "safest entry, least noise"
+    lines.append(
+        f"🛡 <b>1D (Conservative)</b> — {conservative_note}:\n"
+        f"   <code>/addline {symbol.replace('USDT','')} {format_price(line_1d)} 1d</code>\n"
+        f"   Only triggers after strong daily momentum confirms"
+    )
+
+    # SL + TP
+    lines.append(
+        f"\n📐 <b>Trade Plan:</b>\n"
+        f"   🔴 SL: {format_price(sl)} (-{risk:.1f}% from current)\n"
+        f"   🟢 TP1: {format_price(tp1)} (+{reward1:.1f}%)\n"
+        f"   🟢 TP2: {format_price(tp2)} (+{(tp2-current_price)/current_price*100:.1f}%)\n"
+        f"   🟢 TP3: {format_price(tp3)} (+{(tp3-current_price)/current_price*100:.1f}%)\n"
+        f"   ⚖️ R/R (TP1): {rr1:.1f}x"
+    )
+
+    # Quick decision summary
+    if not is_high_score:
+        decision = "⚠️ Score is moderate — wait for retest confirmation before entry"
+    elif is_bearish_daily:
+        decision = "⚠️ Daily trend bearish — use 1D option, smaller position size"
+    elif has_retest:
+        decision = "✅ Retest in progress — 1H entry is valid if next candle closes green"
+    else:
+        decision = "✅ Setup looks clean — pick your timeframe based on risk tolerance"
+
+    lines.append(f"\n{decision}")
+
+    return "\n".join(lines)
+
+
 def analyze_key_levels(symbol, current_price):
     """
     Automatically finds key support and resistance levels from 4H klines,
@@ -5020,7 +5203,7 @@ def check_retest_watches():
             tf, pattern_note, klines_tf = confirmed_note
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
-            full_confluence_watch = build_full_confluence_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+            full_confluence_watch = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
@@ -5446,7 +5629,7 @@ def monitor_momentum():
                     vol_ratio = cv / (sum(pv)/len(pv)) if pv else 1
                 gain_pct = (current_price - breakout_price) / breakout_price * 100
                 tl_sweep_retest = check_trendline_sweep_confluence(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
-                full_confluence_tl = build_full_confluence_block(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
+                full_confluence_tl = build_entry_decision_block(symbol, current_price, tf=tf_r if tf_r in ("1h","4h") else "4h")
                 retest_msg = (
                     f"🏆 <b>TRENDLINE RETEST CONFIRMED! [{tf_r.upper()}]</b>\n\n"
                     f"🪙 <b>{symbol}</b>\n"
@@ -5738,13 +5921,21 @@ def handle_commands():
                                 "\n\n".join(chart_patterns)
                                 if chart_patterns else ""
                             )
+                            # Suggested entry action — ready-to-use /addline commands
+                            entry_suggestion = suggest_entry_action(
+                                sym, result["price"],
+                                result["score"], result["label"],
+                                result.get("pattern_notes", {}),
+                                chart_patterns,
+                            )
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
                                 f"📈 Score: {result['score']}/{result['max_score']} ({result['label']})\n\n"
                                 f"{details_str}\n"
                                 f"{pattern_section}"
-                                f"{patterns_section}\n\n"
+                                f"{patterns_section}\n"
+                                f"{entry_suggestion}\n\n"
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
