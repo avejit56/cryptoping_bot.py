@@ -4510,18 +4510,30 @@ def build_entry_decision_block(symbol, current_price, tf="4h"):
     highs = [float(k[2]) for k in closed_4h]
     lows  = [float(k[3]) for k in closed_4h]
 
+    # Wider lookback — include 1D for meaningful targets
+    klines_1d_tp = get_klines(symbol, interval="1d", limit=60)
+    if klines_1d_tp:
+        highs += [float(k[2]) for k in klines_1d_tp[:-1]]
+
     res_above = sorted([h for h in highs if h > current_price * 1.005])
     sup_below = sorted([l for l in lows  if l < current_price * 0.995], reverse=True)
 
-    nearest_res = res_above[0] if res_above else current_price * 1.05
-    second_res  = res_above[1] if len(res_above) > 1 else nearest_res * 1.05
     nearest_sup = sup_below[0] if sup_below else current_price * 0.95
     sl          = nearest_sup * 0.985
 
-    risk      = (current_price - sl) / current_price * 100
-    reward1   = (nearest_res - current_price) / current_price * 100
-    reward2   = (second_res  - current_price) / current_price * 100
-    rr        = reward1 / risk if risk > 0 else 0
+    def find_res_min(res_list, min_pct):
+        min_price = current_price * (1 + min_pct / 100)
+        candidates = [r for r in res_list if r >= min_price]
+        return candidates[0] if candidates else current_price * (1 + min_pct / 100)
+
+    tp1 = find_res_min(res_above, 5)
+    tp2 = find_res_min(res_above, 10)
+    tp2 = max(tp2, tp1 * 1.05)
+
+    risk    = (current_price - sl) / current_price * 100
+    reward1 = (tp1 - current_price) / current_price * 100
+    reward2 = (tp2 - current_price) / current_price * 100
+    rr      = reward1 / risk if risk > 0 else 0
 
     # Decision quality
     is_bearish = change_24h < -5
@@ -4541,11 +4553,11 @@ def build_entry_decision_block(symbol, current_price, tf="4h"):
         decision_text  = "Setup looks clean — R/R favorable, confirm on chart then enter"
 
     trade_block = (
-        f"\n🎯 <b>Entry Decision:</b>\n"
-        f"   💰 Entry: {format_price(current_price)} (current)\n"
+        f"\n🎯 <b>Entry Decision (2-10 day hold):</b>\n"
+        f"   💰 Entry: {format_price(current_price)}\n"
         f"   🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
-        f"   🟢 TP1: {format_price(nearest_res)} (+{reward1:.1f}%)\n"
-        f"   🟢 TP2: {format_price(second_res)} (+{reward2:.1f}%)\n"
+        f"   🟢 TP1: {format_price(tp1)} (+{reward1:.1f}%)\n"
+        f"   🟢 TP2: {format_price(tp2)} (+{reward2:.1f}%)\n"
         f"   ⚖️ R/R: {rr:.1f}x\n\n"
         f"{decision_emoji} {decision_text}"
     )
@@ -4578,9 +4590,14 @@ def suggest_entry_action(symbol, current_price, score, label, pattern_notes, cha
     highs = [float(k[2]) for k in closed_4h]
     lows  = [float(k[3]) for k in closed_4h]
 
-    # Swing highs above current price (resistances)
+    # Swing highs above current price (resistances) — use wider lookback
+    klines_1d_tp = get_klines(symbol, interval="1d", limit=60)
+    all_highs = highs[:]
+    if klines_1d_tp:
+        all_highs += [float(k[2]) for k in klines_1d_tp[:-1]]
+
     res_above = sorted(set(
-        round(h, 8) for h in highs
+        round(h, 8) for h in all_highs
         if h > current_price * 1.005
     ))
     # Swing lows below current price (supports)
@@ -4589,18 +4606,27 @@ def suggest_entry_action(symbol, current_price, score, label, pattern_notes, cha
         if l < current_price * 0.995
     ), reverse=True)
 
-    nearest_res  = res_above[0]  if len(res_above) > 0 else current_price * 1.05
-    second_res   = res_above[1]  if len(res_above) > 1 else nearest_res  * 1.05
-    major_res    = res_above[2]  if len(res_above) > 2 else second_res   * 1.05
-    nearest_sup  = sup_below[0]  if len(sup_below) > 0 else current_price * 0.95
-
-    # SL: just below nearest support (1.5% buffer)
+    nearest_sup = sup_below[0] if sup_below else current_price * 0.95
     sl = nearest_sup * 0.985
 
-    # TP targets
-    tp1 = nearest_res
-    tp2 = second_res
-    tp3 = major_res
+    # TP targets — enforce minimum distances for 2-10 day holds
+    # TP1: at least 5% away, TP2: at least 10%, TP3: at least 20%
+    def find_res_above_min(res_list, min_pct):
+        min_price = current_price * (1 + min_pct / 100)
+        candidates = [r for r in res_list if r >= min_price]
+        return candidates[0] if candidates else current_price * (1 + min_pct / 100)
+
+    tp1 = find_res_above_min(res_above, 5)
+    tp2 = find_res_above_min(res_above, 10)
+    tp3 = find_res_above_min(res_above, 20)
+
+    # Ensure they're strictly increasing
+    tp2 = max(tp2, tp1 * 1.05)
+    tp3 = max(tp3, tp2 * 1.08)
+
+    # Use nearest res for entry line (not TP)
+    nearest_res = res_above[0] if res_above else current_price * 1.02
+    second_res  = res_above[1] if len(res_above) > 1 else nearest_res * 1.05
 
     # Risk/reward
     risk    = (current_price - sl) / current_price * 100
@@ -4608,14 +4634,9 @@ def suggest_entry_action(symbol, current_price, score, label, pattern_notes, cha
     rr1     = reward1 / risk if risk > 0 else 0
 
     # Determine best entry strategy per timeframe
-    # 1H: aggressive — nearest resistance breakout
-    line_1h = nearest_res * 1.002  # just above resistance
-
-    # 4H: confirmed — second resistance (more reliable breakout)
+    line_1h = nearest_res * 1.002
     line_4h = nearest_res * 1.005
-
-    # 1D: conservative — well above, only if strong momentum
-    line_1d = second_res * 1.002
+    line_1d = second_res  * 1.002
 
     # Context flags
     is_bearish_daily = change_24h < -5 or "bearish" in " ".join(pattern_notes.values()).lower()
@@ -4648,9 +4669,9 @@ def suggest_entry_action(symbol, current_price, score, label, pattern_notes, cha
 
     # SL + TP
     lines.append(
-        f"\n📐 <b>Trade Plan:</b>\n"
-        f"   🔴 SL: {format_price(sl)} (-{risk:.1f}% from current)\n"
-        f"   🟢 TP1: {format_price(tp1)} (+{reward1:.1f}%)\n"
+        f"\n📐 <b>Trade Plan (2-10 day hold):</b>\n"
+        f"   🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
+        f"   🟢 TP1: {format_price(tp1)} (+{(tp1-current_price)/current_price*100:.1f}%)\n"
         f"   🟢 TP2: {format_price(tp2)} (+{(tp2-current_price)/current_price*100:.1f}%)\n"
         f"   🟢 TP3: {format_price(tp3)} (+{(tp3-current_price)/current_price*100:.1f}%)\n"
         f"   ⚖️ R/R (TP1): {rr1:.1f}x"
@@ -6324,6 +6345,8 @@ def handle_commands():
                         if len(parts) == 5:
                             _, sym, low_s, high_s, ztf = parts
                             sym = sym.upper()
+                            low_s  = low_s.replace("$", "").replace(",", "")
+                            high_s = high_s.replace("$", "").replace(",", "")
                             if not sym.endswith("USDT"):
                                 sym += "USDT"
                             ztf = ztf.lower()
@@ -6407,6 +6430,7 @@ def handle_commands():
                     else:
                         _, sym, price_s, ltf = parts
                         sym = sym.upper()
+                        price_s = price_s.replace("$", "").replace(",", "")  # strip $ and commas
                         if not sym.endswith("USDT"):
                             sym += "USDT"
                         ltf = ltf.lower()
