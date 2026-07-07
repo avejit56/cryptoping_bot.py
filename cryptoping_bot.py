@@ -197,6 +197,7 @@ range_breakout_alerted = {}    # {f"{symbol}_breakout": last_alert_time} — 4H 
 range_breakout_tracking = {}   # {symbol: {range_high, range_low, breakout_close, breakout_vol_ratio,
                                #           breakout_time, near_top_touches, range_width_pct}}
                                # 1H breakouts go here silently; alert fires when 4H confirms the hold
+building_signal_tracker = {}   # {symbol: {"signals": [...], "last_combined_alert": time, "window_start": time}}
 trendline_alerted = {}
 postpump_alerted = {}
 ob_fvg_zone_tracking = {}
@@ -1564,7 +1565,16 @@ def check_gradual_buildup(symbol, tf, klines):
 
     gradual_buildup_alerted[key] = now
     price = float(ticker["lastPrice"])
-    send_to_topic(TOPIC_TOP_PICKS,
+
+    # Check if the forming candle (klines[-1]) is already showing strong movement
+    # so we can label this as "live" vs "closed candle" confirmed
+    forming = klines[-1]
+    f_open  = float(forming[1])
+    f_vol   = float(forming[5])
+    live_moving = price > f_open * 1.01 and f_vol > baseline_avg * 2.0
+    live_tag = "⚡ <b>LIVE — forming candle already moving!</b>\n" if live_moving else ""
+
+    send_to_topic(TOPIC_HIGH,
         f"🌊 <b>GRADUAL BUILDUP DETECTED [{tf.upper()}]</b>\n\n"
         f"🪙 <b>{symbol}</b>\n"
         f"💰 Price: {format_price(price)}\n"
@@ -1572,6 +1582,7 @@ def check_gradual_buildup(symbol, tf, klines):
         f"📈 Volume rising across last {n} candles "
         f"(recent: {recent_vol_ratio:.1f}x baseline)\n"
         f"✅ Strong green close on the latest candle\n"
+        f"{live_tag}"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
         f"💡 <i>Volume has been building up steadily — "
         f"this type of slow accumulation before a breakout can produce "
@@ -1582,7 +1593,8 @@ def check_gradual_buildup(symbol, tf, klines):
         "signal_time": now, "signal_type": f"Gradual Buildup [{tf.upper()}]",
         "highest_after": price,
     }
-    print(f"🌊 Gradual buildup: {symbol} [{tf}] vol_slope={vol_slope:.1f} ratio={recent_vol_ratio:.1f}x")
+    print(f"🌊 Gradual buildup: {symbol} [{tf}] vol_slope={vol_slope:.1f} ratio={recent_vol_ratio:.1f}x{' [LIVE]' if live_moving else ''}")
+    track_building_signal(symbol, f"Gradual Buildup [{tf.upper()}]", price)
 
 
 # ─── RANGE BREAKOUT DETECTOR (ARPA case) ──────────────────
@@ -1641,7 +1653,7 @@ def check_range_breakout(symbol, tf, klines):
             range_breakout_alerted[alerted_key] = now
             range_breakout_tracking.pop(symbol, None)
             breakout_pct = (current_price - range_high) / range_high * 100
-            send_to_topic(TOPIC_TOP_PICKS,
+            send_to_topic(TOPIC_HIGH,
                 f"🚀 <b>RANGE BREAKOUT CONFIRMED [1H→4H]</b>\n\n"
                 f"🪙 <b>{symbol}</b>\n"
                 f"💰 Price: {format_price(current_price)}\n"
@@ -1659,6 +1671,7 @@ def check_range_breakout(symbol, tf, klines):
                 "highest_after": current_price,
             }
             print(f"🚀 Range breakout CONFIRMED (4H hold): {symbol} +{breakout_pct:.1f}% above range")
+            track_building_signal(symbol, "Range Breakout [1H→4H]", current_price)
         elif current_price < range_high * 0.97:
             # Price dropped back below the range — false breakout, discard
             range_breakout_tracking.pop(symbol, None)
@@ -1686,6 +1699,43 @@ def check_range_breakout(symbol, tf, klines):
     if near_top_touches < 2:
         return
 
+    range_vols = [float(k[5]) for k in lookback]
+    avg_range_vol = sum(range_vols) / len(range_vols) if range_vols else 1
+
+    # ── LIVE detection (forming candle) ──
+    # FIX (OPG/ARPA case): waiting for the candle to close meant the alert arrived
+    # after the pump was already done. Check the FORMING candle via current_price —
+    # if price has already broken above range_high with real volume forming, fire
+    # an immediate early alert. Uses a separate live_key cooldown so it doesn't
+    # interfere with the closed-candle tracking path.
+    live_key = f"{symbol}_{tf}_breakout_live"
+    forming = klines[-1]
+    f_open = float(forming[1])
+    f_vol  = float(forming[5])
+    f_vol_ratio = f_vol / avg_range_vol if avg_range_vol > 0 else 0
+    live_crossed = (
+        current_price > range_high * 1.002 and
+        current_price > f_open * 1.005 and
+        f_vol_ratio >= 2.5 and
+        now - range_breakout_alerted.get(live_key, 0) > 4 * 3600
+    )
+    if live_crossed:
+        range_breakout_alerted[live_key] = now
+        breakout_pct_live = (current_price - range_high) / range_high * 100
+        send_to_topic(TOPIC_HIGH,
+            f"⚡ <b>RANGE BREAKOUT — LIVE [{tf.upper()}]</b>\n\n"
+            f"🪙 <b>{symbol}</b>\n"
+            f"💰 Price: {format_price(current_price)} (+{breakout_pct_live:.1f}% above range)\n"
+            f"📊 24h: {change_24h:+.2f}%\n"
+            f"📐 Range: {format_price(range_low)} — {format_price(range_high)} "
+            f"({range_width_pct:.1f}% wide, {near_top_touches} touches at top)\n"
+            f"💥 Volume: {f_vol_ratio:.1f}x range avg (forming candle)\n\n"
+            f"⏳ <i>Candle still forming — early heads-up. "
+            f"A confirmed alert follows when the candle closes.</i>\n\n"
+            f"⚠️ <i>Check the chart before entry.</i>"
+        )
+        print(f"⚡ Range breakout LIVE: {symbol} [{tf}] +{breakout_pct_live:.1f}%")
+
     last = klines[-2]
     l_open, l_close = float(last[1]), float(last[4])
     if l_close <= l_open:
@@ -1693,8 +1743,6 @@ def check_range_breakout(symbol, tf, klines):
     if l_close <= range_high * 1.002:
         return
 
-    range_vols = [float(k[5]) for k in lookback]
-    avg_range_vol = sum(range_vols) / len(range_vols) if range_vols else 1
     breakout_vol = float(last[5])
     vol_ratio = breakout_vol / avg_range_vol if avg_range_vol > 0 else 0
     if vol_ratio < 3.0:
@@ -1722,7 +1770,7 @@ def check_range_breakout(symbol, tf, klines):
             return
         range_breakout_alerted[alerted_key] = now
         breakout_pct = (l_close - range_high) / range_high * 100
-        send_to_topic(TOPIC_TOP_PICKS,
+        send_to_topic(TOPIC_HIGH,
             f"🚀 <b>RANGE BREAKOUT [4H]</b>\n\n"
             f"🪙 <b>{symbol}</b>\n"
             f"💰 Price: {format_price(current_price)}\n"
@@ -1740,6 +1788,7 @@ def check_range_breakout(symbol, tf, klines):
             "highest_after": current_price,
         }
         print(f"🚀 Range breakout (4H direct): {symbol} vol={vol_ratio:.1f}x")
+        track_building_signal(symbol, "Range Breakout [4H]", current_price)
 
 
 # ─── HIGHER LOWS ──────────────────────────────────────────
@@ -2270,7 +2319,7 @@ def check_manual_zones():
                 elif is_plain_wick_rejection and zone.get("last_wick_alert_candle") != wick_key_candle:
                     manual_zones[zone_id]["last_wick_alert_candle"] = wick_key_candle
                     save_zones()
-                    send_to_topic(TOPIC_MY_SETUPS,
+                    send_to(ADMIN_CHAT_ID,
                         f"👀 <b>WATCH CLOSELY — Wick Rejection at Zone</b>\n\n"
                         f"🪙 <b>{symbol}</b> | {tf.upper()} OB\n"
                         f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
@@ -3119,6 +3168,7 @@ def check_explosive_pump(symbol):
             "signal_time": now, "signal_type": "Explosive Pump [5M]",
             "highest_after": current_price,
         }
+        track_building_signal(symbol, "Explosive Pump [5M]", current_price)
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
 def is_daily_downtrend(symbol, current_price):
@@ -3382,6 +3432,7 @@ def check_prepump(symbol):
             "highest_after": current_price,
         }
         print(f"🔔 Phase 2: {symbol}")
+        track_building_signal(symbol, "Pre-pump Phase 2", current_price)
         return
 
     # ── PHASE 3: Breakout — High Priority ──
@@ -3403,18 +3454,13 @@ def check_prepump(symbol):
         )
         send_all(msg, symbol=symbol)
 
-        # ENTRY DETAILS (ATR-based auto SL/TP suggestion) — DISABLED per request.
-        # Was firing automatically on every Phase 3 breakout; turned off, function kept
-        # below in case it's wanted again later (e.g. wired into /entry on-demand instead).
-        # if klines_4h:
-        #     send_entry_exit(symbol, current_price, klines_4h)
-
         signal_performance[f"{symbol}_prepump_{int(now)}"] = {
             "symbol": symbol, "signal_price": current_price,
             "signal_time": now, "signal_type": "Pre-pump Setup [1H]",
             "highest_after": current_price,
         }
         print(f"🚀 Phase 3: {symbol}")
+        track_building_signal(symbol, "Pre-pump Phase 3 🚀", current_price)
 
 
 
@@ -3925,6 +3971,7 @@ def check_timeframe(symbol, tf):
             "signal_time": now, "signal_type": f"Volume Spike [{cfg['label']}]",
             "highest_after": price,
         }
+        track_building_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
 
     track_key = f"{symbol}_{tf}"
     momentum_tracking[track_key] = {
@@ -4473,6 +4520,7 @@ def calc_entry_score(symbol):
             "signal_time": now, "signal_type": f"Volume Spike [{cfg['label']}]",
             "highest_after": price,
         }
+        track_building_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
 
     track_key = f"{symbol}_{tf}"
     momentum_tracking[track_key] = {
@@ -4819,6 +4867,72 @@ def analyze_key_levels(symbol, current_price):
         )
 
     return "\n".join(lines)
+
+
+def track_building_signal(symbol, signal_type, current_price):
+    """
+    Tracks signals on the same coin across a 12h window. When 2+ different
+    signal types fire on the same coin within that window, sends a combined
+    'Building Signal' alert to Top Picks — so the progressive confirmation
+    pattern (Phase 2 → Volume Spike 1H → Volume Spike 4H → Explosive) is
+    visible as a single coherent alert rather than scattered messages across
+    different topics that get lost in noise.
+    """
+    now = time.time()
+    window = 12 * 3600  # 12h window
+
+    if symbol not in building_signal_tracker:
+        building_signal_tracker[symbol] = {
+            "signals": [],
+            "last_combined_alert": 0,
+            "window_start": now,
+        }
+
+    tracker = building_signal_tracker[symbol]
+
+    # Reset window if it's been more than 12h since first signal
+    if now - tracker["window_start"] > window:
+        tracker["signals"] = []
+        tracker["window_start"] = now
+        tracker["last_combined_alert"] = 0
+
+    # Add this signal if it's a new type
+    existing_types = {s["type"] for s in tracker["signals"]}
+    if signal_type not in existing_types:
+        tracker["signals"].append({
+            "type": signal_type,
+            "price": current_price,
+            "time": now,
+        })
+
+    # Fire combined alert if 2+ signals and not alerted in last 6h
+    signals = tracker["signals"]
+    if (len(signals) >= 2 and
+            now - tracker["last_combined_alert"] > 6 * 3600):
+        tracker["last_combined_alert"] = now
+
+        # Format progression
+        signal_lines = []
+        for s in sorted(signals, key=lambda x: x["time"]):
+            from datetime import datetime as _dt
+            t = _dt.fromtimestamp(s["time"]).strftime("%H:%M")
+            signal_lines.append(f"  {t} — {s['type']}")
+
+        ticker = get_ticker(symbol)
+        change_24h = float(ticker["priceChangePercent"]) if ticker else 0
+
+        urgency = "🚨" if len(signals) >= 3 else "🔥"
+        send_to_topic(TOPIC_TOP_PICKS,
+            f"{urgency} <b>BUILDING SIGNAL — {symbol}</b>\n\n"
+            f"💰 Price: {format_price(current_price)}\n"
+            f"📊 24h: {change_24h:+.2f}%\n\n"
+            f"⏱ <b>Signal progression (last 12h):</b>\n"
+            + "\n".join(signal_lines) +
+            f"\n\n💡 <i>{len(signals)} timeframes/patterns confirming — "
+            f"{'high conviction setup, watch closely for entry' if len(signals) >= 3 else 'building confirmation, watch for next signal'}.</i>\n\n"
+            f"⚠️ <i>Check the chart before entry.</i>"
+        )
+        print(f"🔥 Building signal alert: {symbol} ({len(signals)} signals)")
 
 
 def build_full_confluence_block(symbol, current_price, tf="4h", swing_high=None, swing_low=None):
@@ -5422,6 +5536,170 @@ def check_btc_market_condition():
         print("✅ BTC condition recovered to neutral")
 
 
+_last_watchlist_validate = 0
+
+_vol_accum_alerted  = {}  # {symbol: last_alert_time}
+_postpump_retest_alerted = {}  # {symbol: last_alert_time}
+
+def scan_volume_accumulation():
+    """
+    Scans all watchlist coins for quiet volume accumulation — price barely
+    moved but volume is rising steadily. Classic pre-pump signal. Fires to
+    Top Picks. Runs every 2 hours.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        if now - _vol_accum_alerted.get(symbol, 0) < 8 * 3600:
+            continue
+        try:
+            klines = get_klines(symbol, interval="1h", limit=25)
+            ticker = get_ticker(symbol)
+            if not klines or len(klines) < 15 or not ticker:
+                continue
+            closed = klines[:-1]
+            price_change = abs(float(ticker["priceChangePercent"]))
+            if price_change > 5:
+                continue  # already pumping, not accumulation
+
+            vols = [float(k[5]) for k in closed[-12:]]
+            baseline = sum(vols[:5]) / 5 if len(vols) >= 5 else 1
+            recent   = sum(vols[-4:]) / 4 if len(vols) >= 4 else 0
+            vol_ratio = recent / baseline if baseline > 0 else 0
+            if vol_ratio < 3.0:
+                continue
+
+            # Volume slope must be positive
+            n = len(vols)
+            mean_x = (n-1)/2
+            mean_y = sum(vols)/n
+            slope = sum((i-mean_x)*(vols[i]-mean_y) for i in range(n))
+            slope /= sum((i-mean_x)**2 for i in range(n)) or 1
+            if slope <= 0:
+                continue
+
+            current_price = float(ticker["lastPrice"])
+            _vol_accum_alerted[symbol] = now
+            send_to_topic(TOPIC_HIGH,
+                f"🔍 <b>VOLUME ACCUMULATION — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(current_price)} ({float(ticker['priceChangePercent']):+.1f}% 24h)\n"
+                f"📈 Volume {vol_ratio:.1f}x above baseline — rising steadily\n"
+                f"😴 Price barely moved — quiet accumulation pattern\n\n"
+                f"💡 <i>This is how pumps start — volume before price. "
+                f"Watch for a breakout candle.</i>"
+            )
+            print(f"🔍 Volume accumulation: {symbol} vol={vol_ratio:.1f}x")
+        except Exception as e:
+            print(f"Volume accum scan error {symbol}: {e}")
+
+
+def scan_postpump_retest():
+    """
+    Scans watchlist coins for post-pump retest opportunities — coins that
+    pumped significantly (>20%) in the last 7 days and are now retesting
+    their breakout level / OB zone on 15M, 1H, or 4H. Fires to Top Picks.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        if now - _postpump_retest_alerted.get(symbol, 0) < 12 * 3600:
+            continue
+        try:
+            klines_4h = get_klines(symbol, interval="4h", limit=50)
+            klines_1h = get_klines(symbol, interval="1h", limit=30)
+            ticker = get_ticker(symbol)
+            if not klines_4h or not ticker:
+                continue
+
+            current_price = float(ticker["lastPrice"])
+            change_24h    = float(ticker["priceChangePercent"])
+
+            # Find recent pump high (last 7 days = ~42 4H candles)
+            closed_4h = klines_4h[:-1]
+            recent_high = max(float(k[2]) for k in closed_4h[-42:])
+            recent_low  = min(float(k[3]) for k in closed_4h[-42:])
+            pump_pct = (recent_high - recent_low) / recent_low * 100 if recent_low > 0 else 0
+
+            if pump_pct < 20:
+                continue  # not a significant pump
+
+            # Current price should be retesting (below pump high but above midpoint)
+            mid = recent_low + (recent_high - recent_low) * 0.5
+            retrace = (recent_high - current_price) / recent_high * 100
+            if not (10 <= retrace <= 60):
+                continue  # too far or not pulled back enough
+
+            # Check for retest pattern on 1H
+            retest_note = None
+            if klines_1h and len(klines_1h) >= 10:
+                pattern = detect_break_retest_pattern(klines_1h, current_price)
+                if pattern and ("Retest in progress" in pattern or "confirmed" in pattern):
+                    retest_note = pattern
+
+            _postpump_retest_alerted[symbol] = now
+            send_to_topic(TOPIC_TOP_PICKS,
+                f"🎯 <b>POST-PUMP RETEST — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(current_price)} ({change_24h:+.1f}% 24h)\n"
+                f"📈 Recent pump: +{pump_pct:.0f}% "
+                f"({format_price(recent_low)} → {format_price(recent_high)})\n"
+                f"📉 Now retesting: -{retrace:.0f}% from pump high\n"
+                + (f"📐 1H: {retest_note}\n" if retest_note else "") +
+                f"\n💡 <i>Classic retest entry setup — if the breakout level holds, "
+                f"next leg up can be significant.</i>\n\n"
+                f"⚠️ <i>Confirm on the chart before entry.</i>"
+            )
+            print(f"🎯 Post-pump retest: {symbol} pump={pump_pct:.0f}% retrace={retrace:.0f}%")
+        except Exception as e:
+            print(f"Post-pump scan error {symbol}: {e}")
+
+
+def auto_validate_watchlist():
+    """
+    Runs every 24h. Checks every coin in the watchlist against Binance's
+    ticker endpoint — if a coin returns 400/404 (not found, delisted, or
+    never existed on Binance spot), it's automatically removed permanently
+    via the same removed_coins mechanism as /remove, and the admin gets
+    a single DM summary of what was cleaned up.
+    """
+    global _last_watchlist_validate
+    now = time.time()
+    if now - _last_watchlist_validate < 24 * 3600:
+        return
+    _last_watchlist_validate = now
+
+    print("🔍 Auto-validating watchlist against Binance...")
+    invalid = []
+    for symbol in list(watchlist):
+        try:
+            r = http_session.get(
+                f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+                timeout=5
+            )
+            if r.status_code in (400, 404):
+                invalid.append(symbol)
+            elif r.status_code == 200:
+                pass  # valid
+            # 418/429 = rate limited, skip — don't remove on transient errors
+        except Exception:
+            pass  # network error, skip this coin
+
+    if invalid:
+        for symbol in invalid:
+            if symbol in watchlist:
+                watchlist.remove(symbol)
+            removed_coins.add(symbol)
+        save_removed_coins()
+        save_watchlist_file()
+        send_to(ADMIN_CHAT_ID,
+            f"🗑 <b>Auto-removed {len(invalid)} invalid coin(s)</b>\n\n"
+            f"These coins returned an error from Binance (not found / delisted):\n"
+            + "\n".join(f"• {s}" for s in invalid) +
+            f"\n\nWatchlist now: {len(watchlist)} coins.\n"
+            f"Use /add SYMBOL to re-add if this was a mistake."
+        )
+        print(f"🗑 Auto-removed {len(invalid)} invalid coins: {invalid}")
+    else:
+        print(f"✅ Watchlist validation complete — all {len(watchlist)} coins valid")
+
+
 def monitor_momentum():
     while True:
         now = time.time()
@@ -5787,7 +6065,8 @@ def monitor_momentum():
             signal_performance.pop(key, None)
 
         check_retest_watches()
-        check_btc_market_condition()  # admin DM if BTC shows trend shift
+        check_btc_market_condition()
+        auto_validate_watchlist()  # auto-remove delisted/invalid coins every 24h
 
         # Weekly auto-cleanup (cost control) — only runs once every 7 days
         global _last_cleanup_check
@@ -5824,7 +6103,15 @@ def handle_commands():
                 text = raw_text.upper()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 first_name = msg.get("chat", {}).get("first_name", "Friend")
+                thread_id = msg.get("message_thread_id")
                 is_admin = (chat_id == ADMIN_CHAT_ID)
+
+                # Allow commands from My Setups topic — route responses back to
+                # the admin's personal DM (not the topic) so they don't clutter
+                # the topic with bot responses.
+                if thread_id == TOPIC_MY_SETUPS and str(chat_id) != ADMIN_CHAT_ID:
+                    # Only admin can use commands from topic
+                    continue
 
                 if raw_text.startswith("WATCHLIST_SAVE:"):
                     continue
@@ -6090,21 +6377,57 @@ def handle_commands():
                         send_to(chat_id, f"✅ Done. Total watchlist now: {len(watchlist)} coins.")
 
                 elif (text == "/REPORT" or raw_text.upper().startswith("/REPORT ")) and is_admin:
-                    # /report           -> defaults to last 24h
-                    # /report 24h       -> last 24 hours
-                    # /report 7d        -> last 7 days
-                    # /report 12h, 48h, 3d, etc. — any number + h or d
                     arg = raw_text.strip().split(None, 1)
                     window_str = arg[1].strip().lower() if len(arg) > 1 else "24h"
-                    import re as _re
-                    m = _re.match(r"^(\d+)([hd])$", window_str)
-                    if not m:
-                        send_to(chat_id, "⚠️ Format: /report 24h  or  /report 7d")
+
+                    # /report performance -> signal type breakdown
+                    if window_str == "performance":
+                        now_r = time.time()
+                        cutoff = now_r - 30 * 86400  # last 30 days
+                        from collections import defaultdict
+                        type_stats = defaultdict(lambda: {"count": 0, "gains": [], "wins": 0})
+                        for pk, data in signal_performance.items():
+                            if data.get("signal_time", 0) < cutoff:
+                                continue
+                            sig_type = data.get("signal_type", "Unknown")
+                            sig_price = data.get("signal_price", 0)
+                            highest = data.get("highest_after", sig_price)
+                            if sig_price > 0:
+                                pct = (highest - sig_price) / sig_price * 100
+                                type_stats[sig_type]["count"] += 1
+                                type_stats[sig_type]["gains"].append(pct)
+                                if pct >= 10:
+                                    type_stats[sig_type]["wins"] += 1
+                        if not type_stats:
+                            send_to(chat_id, "📊 No signal performance data yet (need at least some results).")
+                        else:
+                            sorted_types = sorted(
+                                type_stats.items(),
+                                key=lambda x: (sum(x[1]["gains"]) / len(x[1]["gains"])) if x[1]["gains"] else 0,
+                                reverse=True
+                            )
+                            lines_p = ["📊 <b>Signal Performance (last 30 days)</b>\n"]
+                            for sig_type, stats in sorted_types:
+                                count = stats["count"]
+                                gains = stats["gains"]
+                                avg_gain = sum(gains) / len(gains) if gains else 0
+                                win_rate = stats["wins"] / count * 100 if count else 0
+                                emoji = "🏆" if avg_gain >= 20 else "✅" if avg_gain >= 10 else "🟡" if avg_gain >= 5 else "⚠️"
+                                lines_p.append(
+                                    f"{emoji} <b>{sig_type}</b>\n"
+                                    f"   Signals: {count} | Avg gain: +{avg_gain:.1f}% | Win rate (>10%): {win_rate:.0f}%"
+                                )
+                            send_to(chat_id, "\n\n".join(lines_p))
                     else:
-                        amount, unit = int(m.group(1)), m.group(2)
-                        window_seconds = amount * 3600 if unit == "h" else amount * 86400
-                        window_label = f"Last {amount}{'hr' if unit == 'h' else ' day(s)'}"
-                        send_to(chat_id, build_report(window_seconds, window_label))
+                        import re as _re
+                        m = _re.match(r"^(\d+)([hd])$", window_str)
+                        if not m:
+                            send_to(chat_id, "⚠️ Format: /report 24h  or  /report 7d  or  /report performance")
+                        else:
+                            amount, unit = int(m.group(1)), m.group(2)
+                            window_seconds = amount * 3600 if unit == "h" else amount * 86400
+                            window_label = f"Last {amount}{'hr' if unit == 'h' else ' day(s)'}"
+                            send_to(chat_id, build_report(window_seconds, window_label))
 
                 elif raw_text.upper().startswith("/BROADCAST ") and is_admin:
                     broadcast_text = raw_text[11:].strip()
@@ -6702,6 +7025,26 @@ def main():
             time.sleep(60)
 
     Thread(target=run_manual_lines, daemon=True).start()
+
+    def run_vol_accum_scanner():
+        while True:
+            try:
+                scan_volume_accumulation()
+            except Exception as e:
+                print(f"Vol accum scan error: {e}")
+            time.sleep(120)  # every 2 minutes, but internal cooldown is 8h per coin
+
+    Thread(target=run_vol_accum_scanner, daemon=True).start()
+
+    def run_postpump_retest_scanner():
+        while True:
+            try:
+                scan_postpump_retest()
+            except Exception as e:
+                print(f"Post-pump scan error: {e}")
+            time.sleep(300)  # every 5 minutes, internal cooldown is 12h per coin
+
+    Thread(target=run_postpump_retest_scanner, daemon=True).start()
 
     def run_active_trades():
         while True:
