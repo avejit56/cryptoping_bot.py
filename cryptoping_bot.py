@@ -578,10 +578,14 @@ def load_from_telegram():
     load_manual_lines()
 
 # ─── TELEGRAM ─────────────────────────────────────────────
-def send_to(chat_id, message):
+def send_to(chat_id, message, thread_id=None):
+    """Send a message. If thread_id is provided, sends to that topic thread."""
     try:
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
         http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
+            json=payload, timeout=10)
     except:
         pass
 
@@ -5993,6 +5997,7 @@ def monitor_momentum():
                 last_high = float(klines_1h[-2][2])
                 if last_high > data.get("highest_close", data["signal_price"]):
                     signal_performance[perf_key]["highest_close"] = last_high
+                    signal_performance[perf_key]["highest_after"] = last_high  # keep in sync for /report
                     signal_performance[perf_key]["peak_time"] = now
 
             highest = data.get("highest_close", data["signal_price"])
@@ -6104,14 +6109,28 @@ def handle_commands():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 first_name = msg.get("chat", {}).get("first_name", "Friend")
                 thread_id = msg.get("message_thread_id")
-                is_admin = (chat_id == ADMIN_CHAT_ID)
+                is_admin = (chat_id == ADMIN_CHAT_ID or
+                            str(msg.get("from", {}).get("id", "")) == ADMIN_CHAT_ID)
 
-                # Allow commands from My Setups topic — route responses back to
-                # the admin's personal DM (not the topic) so they don't clutter
-                # the topic with bot responses.
-                if thread_id == TOPIC_MY_SETUPS and str(chat_id) != ADMIN_CHAT_ID:
-                    # Only admin can use commands from topic
+                # Commands from group topics: only admin can use them.
+                # Reply goes back to the same topic so admin doesn't have to
+                # switch to the main bot chat.
+                if thread_id and not is_admin:
                     continue
+
+                # reply_chat_id / reply_thread_id: where to send the response.
+                # If command came from a group topic, reply there.
+                # If from main bot DM, reply there as usual.
+                if thread_id:
+                    reply_chat_id = chat_id   # group chat id
+                    reply_thread_id = thread_id
+                else:
+                    reply_chat_id = chat_id
+                    reply_thread_id = None
+
+                # Helper: send response back to where command came from
+                def reply(msg_text):
+                    send_to(reply_chat_id, msg_text, thread_id=reply_thread_id)
 
                 if raw_text.startswith("WATCHLIST_SAVE:"):
                     continue
@@ -6155,17 +6174,17 @@ def handle_commands():
                             f"and only take the entry once you've confirmed it.\n\n"
                             f"Good luck! 🚀\n— CryptoPing"
                         )
-                        send_to(chat_id, welcome_msg)
+                        reply( welcome_msg)
                         send_to(ADMIN_CHAT_ID, f"👤 New subscriber: <b>{first_name}</b> (ID: {chat_id})")
                         save_subscribers()
                     else:
-                        send_to(chat_id, "✅ You're already subscribed!")
+                        reply( "✅ You're already subscribed!")
 
                 elif text == "/STOP":
                     if chat_id in subscribers and chat_id != ADMIN_CHAT_ID:
                         subscribers.remove(chat_id)
                         save_subscribers()
-                        send_to(chat_id, "❌ Unsubscribed.")
+                        reply( "❌ Unsubscribed.")
 
                 elif text == "/LIST":
                     coin_lines = [f"• {c}" for c in watchlist]
@@ -6174,12 +6193,12 @@ def handle_commands():
                 elif text.startswith("/ENTRY "):
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
                     if not sym_raw:
-                        send_to(chat_id, "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
+                        reply( "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
                     else:
                         sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                         result = calc_entry_score(sym)
                         if result is None:
-                            send_to(chat_id, f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
+                            reply( f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
                         else:
                             details_str = "\n".join(result["details"])
                             pattern_notes = result.get("pattern_notes", {})
@@ -6236,7 +6255,7 @@ def handle_commands():
                                 result.get("pattern_notes", {}),
                                 chart_patterns,
                             )
-                            send_to(chat_id,
+                            reply(
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
                                 f"📈 Score: {result['score']}/{result['max_score']} ({result['label']})\n\n"
@@ -6251,12 +6270,12 @@ def handle_commands():
                 elif text.startswith("/WATCH "):
                     sym_raw = text.replace("/WATCH ", "").strip().split()[0] if text.replace("/WATCH ", "").strip() else ""
                     if not sym_raw:
-                        send_to(chat_id, "⚠️ Format: /watch BTC  (or /watch BTCUSDT)")
+                        reply( "⚠️ Format: /watch BTC  (or /watch BTCUSDT)")
                     else:
                         sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                         watch_key = f"{sym}_{chat_id}"
                         if watch_key in retest_watch_list:
-                            send_to(chat_id, f"👁 Already watching {sym} for a retest completion.")
+                            reply( f"👁 Already watching {sym} for a retest completion.")
                         else:
                             ticker_check = get_ticker(sym)
                             klines_by_tf = {
@@ -6264,7 +6283,7 @@ def handle_commands():
                                 for tf in ["15m", "30m", "1h", "4h"]
                             }
                             if not any(klines_by_tf.values()) or not ticker_check:
-                                send_to(chat_id, f"⚠️ Couldn't fetch data for {sym}. Check the symbol and try again.")
+                                reply( f"⚠️ Couldn't fetch data for {sym}. Check the symbol and try again.")
                             else:
                                 current_price_check = float(ticker_check["lastPrice"])
                                 tfs_in_progress = []
@@ -6276,7 +6295,7 @@ def handle_commands():
                                         tfs_in_progress.append(tf)
 
                                 if not tfs_in_progress:
-                                    send_to(chat_id,
+                                    reply(
                                         f"⚠️ {sym} doesn't currently show an active retest on 15m/30m/1H/4H.\n\n"
                                         f"If /entry showed \"Retest in progress\" a moment ago, the candle may "
                                         f"have shifted since — try /entry again to get the latest state, then "
@@ -6290,7 +6309,7 @@ def handle_commands():
                                     }
                                     save_retest_watch()
                                     tf_label = " and ".join(t.upper() for t in tfs_in_progress)
-                                    send_to(chat_id,
+                                    reply(
                                         f"👁 <b>Watching {sym}</b> for retest completion ({tf_label}).\n\n"
                                         f"You'll get a personal alert here (and it'll also post to Top Picks) "
                                         f"once a strong green candle closes back above the broken level.\n\n"
@@ -6304,25 +6323,25 @@ def handle_commands():
                     if watch_key in retest_watch_list:
                         retest_watch_list.pop(watch_key, None)
                         save_retest_watch()
-                        send_to(chat_id, f"👁 Stopped watching {sym}.")
+                        reply( f"👁 Stopped watching {sym}.")
                     else:
-                        send_to(chat_id, f"⚠️ You weren't watching {sym}.")
+                        reply( f"⚠️ You weren't watching {sym}.")
 
                 elif text == "/MYWATCHES":
                     mine = [v for v in retest_watch_list.values() if v["chat_id"] == chat_id]
                     if not mine:
-                        send_to(chat_id, "👁 You're not watching any coins right now. Use /watch SYMBOL after /entry shows a retest in progress.")
+                        reply( "👁 You're not watching any coins right now. Use /watch SYMBOL after /entry shows a retest in progress.")
                     else:
                         stage_label = {"watching": "⏳ watching for retest", "followup": "🔎 confirmed, tracking continuation"}
                         lines = [f"• {w['symbol']} ({stage_label.get(w.get('stage', 'watching'), 'watching')})" for w in mine]
-                        send_to(chat_id, "👁 <b>Your watches:</b>\n\n" + "\n".join(lines))
+                        reply( "👁 <b>Your watches:</b>\n\n" + "\n".join(lines))
 
                 elif text.startswith("/ADD ") and is_admin:
                     symbol = text.replace("/ADD ", "").strip()
                     if not symbol.endswith("USDT"):
                         symbol += "USDT"
                     if symbol in watchlist:
-                        send_to(chat_id, f"⚠️ {symbol} is already on the list!")
+                        reply( f"⚠️ {symbol} is already on the list!")
                     else:
                         r = http_session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5)
                         if r.status_code == 200:
@@ -6330,9 +6349,9 @@ def handle_commands():
                             removed_coins.discard(symbol)  # re-adding overrides a past /remove
                             save_removed_coins()
                             save_watchlist()
-                            send_to(chat_id, f"✅ {symbol} added! Total: {len(watchlist)}")
+                            reply( f"✅ {symbol} added! Total: {len(watchlist)}")
                         else:
-                            send_to(chat_id, f"❌ {symbol} not found on Binance.")
+                            reply( f"❌ {symbol} not found on Binance.")
 
                 elif text.startswith("/REMOVE ") and is_admin:
                     symbol = text.replace("/REMOVE ", "").strip()
@@ -6350,12 +6369,12 @@ def handle_commands():
                         removed_coins.add(symbol)
                         save_removed_coins()
                         save_watchlist()
-                        send_to(chat_id, f"🗑 {symbol} removed permanently. Total: {len(watchlist)}")
+                        reply( f"🗑 {symbol} removed permanently. Total: {len(watchlist)}")
                     else:
-                        send_to(chat_id, f"⚠️ {symbol} isn't on the watchlist.")
+                        reply( f"⚠️ {symbol} isn't on the watchlist.")
 
                 elif text == "/STATUS" and is_admin:
-                    send_to(chat_id,
+                    reply(
                         f"✅ <b>CryptoPing is running!</b>\n\n"
                         f"📋 Coins: {len(watchlist)}\n"
                         f"👥 Subscribers: {len(subscribers)}\n"
@@ -6370,11 +6389,11 @@ def handle_commands():
                 elif text == "/CLEANUP" and is_admin:
                     extra_count_before = len([c for c in watchlist if c not in DEFAULT_WATCHLIST])
                     if extra_count_before == 0:
-                        send_to(chat_id, "🧹 No extra coins to evaluate — watchlist is just the defaults.")
+                        reply( "🧹 No extra coins to evaluate — watchlist is just the defaults.")
                     else:
-                        send_to(chat_id, f"🧹 Running cleanup check on {extra_count_before} extra coins...")
+                        reply( f"🧹 Running cleanup check on {extra_count_before} extra coins...")
                         auto_cleanup_poor_performers()
-                        send_to(chat_id, f"✅ Done. Total watchlist now: {len(watchlist)} coins.")
+                        reply( f"✅ Done. Total watchlist now: {len(watchlist)} coins.")
 
                 elif (text == "/REPORT" or raw_text.upper().startswith("/REPORT ")) and is_admin:
                     arg = raw_text.strip().split(None, 1)
@@ -6399,7 +6418,7 @@ def handle_commands():
                                 if pct >= 10:
                                     type_stats[sig_type]["wins"] += 1
                         if not type_stats:
-                            send_to(chat_id, "📊 No signal performance data yet (need at least some results).")
+                            reply( "📊 No signal performance data yet (need at least some results).")
                         else:
                             sorted_types = sorted(
                                 type_stats.items(),
@@ -6417,17 +6436,17 @@ def handle_commands():
                                     f"{emoji} <b>{sig_type}</b>\n"
                                     f"   Signals: {count} | Avg gain: +{avg_gain:.1f}% | Win rate (>10%): {win_rate:.0f}%"
                                 )
-                            send_to(chat_id, "\n\n".join(lines_p))
+                            reply( "\n\n".join(lines_p))
                     else:
                         import re as _re
                         m = _re.match(r"^(\d+)([hd])$", window_str)
                         if not m:
-                            send_to(chat_id, "⚠️ Format: /report 24h  or  /report 7d  or  /report performance")
+                            reply( "⚠️ Format: /report 24h  or  /report 7d  or  /report performance")
                         else:
                             amount, unit = int(m.group(1)), m.group(2)
                             window_seconds = amount * 3600 if unit == "h" else amount * 86400
                             window_label = f"Last {amount}{'hr' if unit == 'h' else ' day(s)'}"
-                            send_to(chat_id, build_report(window_seconds, window_label))
+                            reply( build_report(window_seconds, window_label))
 
                 elif raw_text.upper().startswith("/BROADCAST ") and is_admin:
                     broadcast_text = raw_text[11:].strip()
@@ -6436,11 +6455,11 @@ def handle_commands():
                             send_to(chat_id_sub, f"📢 <b>Message from CryptoPing:</b>\n\n{broadcast_text}")
                         send_to(ADMIN_CHAT_ID, f"✅ Sent to {len(subscribers)} people!")
                     else:
-                        send_to(chat_id, "⚠️ Example: /broadcast stay alert today")
+                        reply( "⚠️ Example: /broadcast stay alert today")
 
                 elif text == "/SUBSCRIBERS" and is_admin:
                     if not subscribers:
-                        send_to(chat_id, "👥 No subscribers yet.")
+                        reply( "👥 No subscribers yet.")
                     else:
                         lines = []
                         for i, sid in enumerate(subscribers, 1):
@@ -6460,12 +6479,12 @@ def handle_commands():
                             name = subscribers_info.get(target_id, {}).get("name", target_id)
                             send_to(ADMIN_CHAT_ID, f"✅ Message sent to <b>{name}</b>")
                         else:
-                            send_to(chat_id, f"⚠️ ID {target_id} isn't on the subscriber list.")
+                            reply( f"⚠️ ID {target_id} isn't on the subscriber list.")
                     else:
-                        send_to(chat_id, "Format: /msg [ID] [message]")
+                        reply( "Format: /msg [ID] [message]")
 
                 elif text == "/HELP" and is_admin:
-                    send_to(chat_id,
+                    reply(
                         "🤖 <b>Commands:</b>\n\n"
                         "/add STRAX — add a coin\n"
                         "/remove STRAX — remove a coin\n"
@@ -6493,7 +6512,7 @@ def handle_commands():
                 elif text == "/EXPORTZONES" and is_admin:
                     import json as _j
                     if not manual_zones:
-                        send_to(chat_id, "📐 No active zones.")
+                        reply( "📐 No active zones.")
                     else:
                         export = {}
                         for zid, z in manual_zones.items():
@@ -6506,12 +6525,12 @@ def handle_commands():
                         # Split into chunks if too long
                         chunk_size = 3000
                         if len(text_out) <= chunk_size:
-                            send_to(chat_id, f"<code>{text_out}</code>")
+                            reply( f"<code>{text_out}</code>")
                         else:
                             parts = [text_out[i:i+chunk_size] for i in range(0, len(text_out), chunk_size)]
                             for i, part in enumerate(parts):
-                                send_to(chat_id, f"Part {i+1}/{len(parts)}:\n<code>{part}</code>")
-                        send_to(chat_id, f"✅ {len(export)} zones. Run /sync on the signal bot.")
+                                reply( f"Part {i+1}/{len(parts)}:\n<code>{part}</code>")
+                        reply( f"✅ {len(export)} zones. Run /sync on the signal bot.")
 
                 elif text == "/EXPORTWATCHLIST" and is_admin:
                     import json as _j
@@ -6525,7 +6544,7 @@ def handle_commands():
                         )
                     except:
                         pass
-                    send_to(chat_id, f"📤 Watchlist exported ({len(watchlist)} coins)!")
+                    reply( f"📤 Watchlist exported ({len(watchlist)} coins)!")
 
 
                     # Parse optional volume threshold
@@ -6537,7 +6556,7 @@ def handle_commands():
                         except:
                             pass
 
-                    send_to(chat_id, f"🔍 Scanning Binance (min ${min_vol:,.0f} volume)...")
+                    reply( f"🔍 Scanning Binance (min ${min_vol:,.0f} volume)...")
 
                     try:
                         r = http_session.get(
@@ -6545,7 +6564,7 @@ def handle_commands():
                             timeout=15
                         )
                         if r.status_code != 200:
-                            send_to(chat_id, "❌ Binance API error")
+                            reply( "❌ Binance API error")
                         else:
                             all_tickers = r.json()
 
@@ -6589,9 +6608,9 @@ def handle_commands():
                                 for sym, chg, vol, price in gainers[:20]:
                                     vol_str = f"${vol/1e6:.1f}M" if vol >= 1e6 else f"${vol/1e3:.0f}K"
                                     lines.append(f"• <b>{sym}</b> +{chg:.1f}% | {vol_str}")
-                                send_to(chat_id, "\n".join(lines))
+                                reply( "\n".join(lines))
                             else:
-                                send_to(chat_id, "🚀 No gainers found.")
+                                reply( "🚀 No gainers found.")
 
                             # Top 20 losers
                             if losers:
@@ -6599,7 +6618,7 @@ def handle_commands():
                                 for sym, chg, vol, price in losers[:20]:
                                     vol_str = f"${vol/1e6:.1f}M" if vol >= 1e6 else f"${vol/1e3:.0f}K"
                                     lines.append(f"• <b>{sym}</b> {chg:.1f}% | {vol_str}")
-                                send_to(chat_id, "\n".join(lines))
+                                reply( "\n".join(lines))
 
                             # Add format
                             all_new = gainers[:20] + losers[:20]
@@ -6615,17 +6634,17 @@ def handle_commands():
                                 for line in add_lines:
                                     chunk.append(line)
                                     if len("\n".join(chunk)) > 3500:
-                                        send_to(chat_id, "\n".join(chunk))
+                                        reply( "\n".join(chunk))
                                         chunk = []
                                 if chunk:
-                                    send_to(chat_id, "\n".join(chunk))
+                                    reply( "\n".join(chunk))
 
                     except Exception as e:
-                        send_to(chat_id, f"❌ Scan error: {e}")
+                        reply( f"❌ Scan error: {e}")
 
                 elif text == "/ADDALL" and is_admin:
                     if not last_scan_results:
-                        send_to(chat_id, "⚠️ Run /scanmarket first, then /addall")
+                        reply( "⚠️ Run /scanmarket first, then /addall")
                     else:
                         added = []
                         skipped = []
@@ -6658,11 +6677,11 @@ def handle_commands():
                             msg += f"\n❌ Not found: {len(failed)}\n"
                             msg += "\n".join(f"  • {s}" for s in failed)
                         msg += f"\n\n📋 Total watchlist: {len(watchlist)}"
-                        send_to(chat_id, msg)
+                        reply( msg)
 
                 elif raw_text.upper().startswith("/ADDZONE "):
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only command.")
+                        reply( "⚠️ Admin only command.")
                     else:
                         parts = raw_text.strip().split()
                         if len(parts) == 5:
@@ -6674,13 +6693,13 @@ def handle_commands():
                                 sym += "USDT"
                             ztf = ztf.lower()
                             if ztf not in ["5m","15m","1h","4h","1d"]:
-                                send_to(chat_id, "⚠️ TF must be: 5m / 15m / 1h / 4h / 1d")
+                                reply( "⚠️ TF must be: 5m / 15m / 1h / 4h / 1d")
                             else:
                                 try:
                                     z_low  = float(low_s)
                                     z_high = float(high_s)
                                     if z_low >= z_high:
-                                        send_to(chat_id, "⚠️ Low must be less than High")
+                                        reply( "⚠️ Low must be less than High")
                                     else:
                                         zone_count = sum(1 for k in manual_zones if k.startswith(f"{sym}_{ztf}"))
                                         zone_id = f"{sym}_{ztf}_{zone_count+1}"
@@ -6702,7 +6721,7 @@ def handle_commands():
                                             extra_lines.append(f"📍 Previous bounce zone (x{bounce_info['bounce_count']}) — higher probability")
                                         extra_str = ("\n".join(extra_lines) + "\n\n") if extra_lines else ""
 
-                                        send_to(chat_id,
+                                        reply(
                                             f"✅ <b>Zone added!</b>\n\n"
                                             f"🪙 {sym} | {ztf.upper()} OB\n"
                                             f"🔲 {format_price(z_low)} — {format_price(z_high)}\n"
@@ -6713,25 +6732,25 @@ def handle_commands():
                                         save_zones()
                                         print(f"📐 Zone added: {zone_id}")
                                 except ValueError:
-                                    send_to(chat_id, "⚠️ Format: /addzone RIF 0.0665 0.0703 4H")
+                                    reply( "⚠️ Format: /addzone RIF 0.0665 0.0703 4H")
                         else:
-                            send_to(chat_id, f"⚠️ Format: /addzone RIF 0.0665 0.0703 4H\nParts received: {len(parts)}")
+                            reply( f"⚠️ Format: /addzone RIF 0.0665 0.0703 4H\nParts received: {len(parts)}")
 
                 elif raw_text.upper().startswith("/REMOVEZONE "):
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     else:
                         zone_id = raw_text.strip().split(None, 1)[1].strip()
                         if zone_id in manual_zones:
                             manual_zones.pop(zone_id)
                             save_zones()
-                            send_to(chat_id, f"🗑 Zone removed: <code>{zone_id}</code>")
+                            reply( f"🗑 Zone removed: <code>{zone_id}</code>")
                         else:
-                            send_to(chat_id, f"⚠️ Zone not found: {zone_id}\nUse /zones to see the list")
+                            reply( f"⚠️ Zone not found: {zone_id}\nUse /zones to see the list")
 
                 elif raw_text.upper().startswith("/RESETZONE "):
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     else:
                         zone_id = raw_text.strip().split(None, 1)[1].strip()
                         if zone_id in manual_zones:
@@ -6742,28 +6761,28 @@ def handle_commands():
                             manual_zones[zone_id]["entered_notified_time"] = 0
                             manual_zones[zone_id]["fast_spike_alerted"] = False
                             save_zones()
-                            send_to(chat_id, f"♻️ Zone reset: <code>{zone_id}</code>\nMonitoring has restarted.")
+                            reply( f"♻️ Zone reset: <code>{zone_id}</code>\nMonitoring has restarted.")
                         else:
-                            send_to(chat_id, f"⚠️ Zone not found: {zone_id}")
+                            reply( f"⚠️ Zone not found: {zone_id}")
 
                 elif raw_text.upper().startswith("/ADDLINE "):
                     parts = raw_text.strip().split()
                     if len(parts) != 4:
-                        send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h\n(timeframe must be 1h, 4h or 1d)")
+                        reply( "⚠️ Format: /addline RIF 0.0703 4h\n(timeframe must be 1h, 4h or 1d)")
                     else:
                         _, sym, price_s, ltf = parts
                         sym = sym.upper()
                         price_s = price_s.replace("$", "").replace(",", "")  # strip $ and commas
                         if not sym.endswith("USDT"):
                             sym += "USDT"
-                        ltf = ltf.lower()
+                        ltf = ltf.lower()  # normalize: 1D→1d, 4H→4h, 1H→1h
                         if ltf not in ["1h", "4h", "1d"]:
-                            send_to(chat_id, "⚠️ Timeframe must be 1h, 4h or 1d for /addline")
+                            reply( "⚠️ Timeframe must be 1h, 4h or 1d for /addline")
                         else:
                             try:
                                 level_price = float(price_s)
                                 if level_price <= 0:
-                                    send_to(chat_id, "⚠️ Price must be greater than 0")
+                                    reply( "⚠️ Price must be greater than 0")
                                 else:
                                     line_count = sum(1 for k in manual_lines if k.startswith(f"{sym}_{ltf}"))
                                     line_id = f"{sym}_{ltf}_{line_count+1}"
@@ -6776,7 +6795,7 @@ def handle_commands():
                                         "name": first_name,
                                     }
                                     save_manual_lines()
-                                    send_to(chat_id,
+                                    reply(
                                         f"📏 <b>Line added!</b>\n\n"
                                         f"🪙 {sym} | {ltf.upper()}\n"
                                         f"📍 Level: {format_price(level_price)}\n"
@@ -6789,33 +6808,33 @@ def handle_commands():
                                     )
                                     print(f"📏 Line added: {line_id}")
                             except ValueError:
-                                send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 1h")
+                                reply( "⚠️ Format: /addline RIF 0.0703 1h")
 
                 elif raw_text.upper().startswith("/REMOVELINE "):
                     line_id = raw_text.strip().split(None, 1)[1].strip()
                     if line_id in manual_lines:
                         manual_lines.pop(line_id)
                         save_manual_lines()
-                        send_to(chat_id, f"🗑 Line removed: <code>{line_id}</code>")
+                        reply( f"🗑 Line removed: <code>{line_id}</code>")
                     else:
-                        send_to(chat_id, f"⚠️ Line not found: {line_id}\nUse /mylines to see your lines")
+                        reply( f"⚠️ Line not found: {line_id}\nUse /mylines to see your lines")
 
                 elif text == "/MYLINES":
                     mine = {k: v for k, v in manual_lines.items() if v.get("chat_id") == chat_id}
                     if not mine:
-                        send_to(chat_id, "📏 You have no active lines. Use /addline SYMBOL PRICE 1h to add one.")
+                        reply( "📏 You have no active lines. Use /addline SYMBOL PRICE 1h to add one.")
                     else:
                         lines_out = []
                         for lid, ln in mine.items():
                             state_label = {"waiting": "⏳ waiting for break", "broken": "📈 broken, watching retest", "followup": "🔎 confirmed, tracking continuation"}.get(ln.get("state"), ln.get("state"))
                             lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
-                        send_to(chat_id, "📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
+                        reply( "📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
 
                 elif text == "/ZONES":
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     elif not manual_zones:
-                        send_to(chat_id, "📐 No active zones.\n/addzone RIF 0.0665 0.0703 4H")
+                        reply( "📐 No active zones.\n/addzone RIF 0.0665 0.0703 4H")
                     else:
                         lines = []
                         for zid, z in manual_zones.items():
@@ -6830,12 +6849,12 @@ def handle_commands():
                 # ─── ACTIVE TRADE MONITOR COMMANDS (v68) ──────────
                 elif raw_text.upper().startswith("/TRADE "):
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     else:
                         # /trade GPS entry=0.00762 sl=0.00700 tp1=0.00850 tp2=0.00925 tp3=0.01000 [tf=1h]
                         parts = raw_text.strip().split()
                         if len(parts) < 4:
-                            send_to(chat_id,
+                            reply(
                                 "⚠️ Format:\n<code>/trade GPS entry=0.00762 sl=0.00700 tp1=0.00850 tp2=0.00925 tp3=0.01000</code>\n\n"
                                 "tf=1h is the default; use tf=4h if you want."
                             )
@@ -6858,9 +6877,9 @@ def handle_commands():
                                 tf = kv.get("tf", TRADE_CHECK_TF_DEFAULT)
 
                                 if sl >= entry:
-                                    send_to(chat_id, "⚠️ SL must be below entry (assuming a long trade)")
+                                    reply( "⚠️ SL must be below entry (assuming a long trade)")
                                 elif not tps:
-                                    send_to(chat_id, "⚠️ At least one tp1 is required")
+                                    reply( "⚠️ At least one tp1 is required")
                                 else:
                                     trade_id = f"{sym}_{int(time.time())}"
                                     active_trades[trade_id] = {
@@ -6871,7 +6890,7 @@ def handle_commands():
                                     }
                                     save_active_trades()
                                     tp_str = " | ".join(f"TP{i+1}: {format_price(t)}" for i, t in enumerate(tps))
-                                    send_to(chat_id,
+                                    reply(
                                         f"✅ <b>Trade added to monitor!</b>\n\n"
                                         f"🪙 {sym} | {tf.upper()}\n"
                                         f"💰 Entry: {format_price(entry)} | SL: {format_price(sl)}\n"
@@ -6882,13 +6901,13 @@ def handle_commands():
                                     )
                                     print(f"💼 Trade added: {trade_id}")
                             except (KeyError, ValueError) as e:
-                                send_to(chat_id, f"⚠️ Format is wrong. Example:\n<code>/trade GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
+                                reply( f"⚠️ Format is wrong. Example:\n<code>/trade GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
 
                 elif text == "/TRADES":
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     elif not active_trades:
-                        send_to(chat_id, "💼 No active trades.\n/trade SYMBOL entry=.. sl=.. tp1=..")
+                        reply( "💼 No active trades.\n/trade SYMBOL entry=.. sl=.. tp1=..")
                     else:
                         lines = [f"💼 <b>Active Trades ({len(active_trades)}):</b>\n"]
                         for tid, t in active_trades.items():
@@ -6899,20 +6918,20 @@ def handle_commands():
                                 f"  {t['symbol']} | Entry: {format_price(t['entry'])} | SL: {format_price(t['sl'])}\n"
                                 f"  TP hit: {tp_done}/{len(t.get('tps', []))} | Score: {t.get('last_score', 0)} | {age_hr:.0f}hr"
                             )
-                        send_to(chat_id, "\n".join(lines))
+                        reply( "\n".join(lines))
 
                 elif raw_text.upper().startswith("/CLOSETRADE "):
                     if not is_admin:
-                        send_to(chat_id, "⚠️ Admin only.")
+                        reply( "⚠️ Admin only.")
                     else:
                         trade_id = raw_text.strip().split(None, 1)[1].strip()
                         if trade_id in active_trades:
                             active_trades.pop(trade_id)
                             trade_alert_cooldown.pop(trade_id, None)
                             save_active_trades()
-                            send_to(chat_id, f"🗑 Trade closed/removed: <code>{trade_id}</code>")
+                            reply( f"🗑 Trade closed/removed: <code>{trade_id}</code>")
                         else:
-                            send_to(chat_id, f"⚠️ Trade not found: {trade_id}\nUse /trades to see the list")
+                            reply( f"⚠️ Trade not found: {trade_id}\nUse /trades to see the list")
 
         except Exception as e:
             print(f"Command error: {e}")
