@@ -227,7 +227,11 @@ spike_pending_confirm = {}   # {symbol: {spike_price, spike_vol_ratio, spike_tim
 
 # ─── FILE PATHS ───────────────────────────────────────────
 import json as _json
-_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BOT_DIR = os.environ.get("BOT_DATA_DIR", "/data")
+# All persistent data (zones, watchlist, cooldowns, etc.) goes to /data which
+# must be a Railway Volume mount — without that, everything resets on redeploy.
+# Set BOT_DATA_DIR env variable to override (e.g. for local testing).
+os.makedirs(_BOT_DIR, exist_ok=True)
 ZONES_FILE     = os.path.join(_BOT_DIR, "zones.json")
 WATCHLIST_FILE = os.path.join(_BOT_DIR, "watchlist.json")
 REMOVED_COINS_FILE = os.path.join(_BOT_DIR, "removed_coins.json")
@@ -1718,9 +1722,9 @@ def check_range_breakout(symbol, tf, klines):
     f_vol  = float(forming[5])
     f_vol_ratio = f_vol / avg_range_vol if avg_range_vol > 0 else 0
     live_crossed = (
-        current_price > range_high * 1.002 and
-        current_price > f_open * 1.005 and
-        f_vol_ratio >= 2.5 and
+        current_price > range_high * 1.001 and
+        current_price > f_open and
+        f_vol_ratio >= 1.5 and
         now - range_breakout_alerted.get(live_key, 0) > 4 * 3600
     )
     if live_crossed:
@@ -2731,8 +2735,13 @@ def check_manual_lines():
             f_buy  = float(forming[9]) if len(forming) > 9 else f_vol * 0.5
             f_vol_ratio = f_vol / avg_vol if avg_vol > 0 else 0
             f_buy_ratio = f_buy / f_vol if f_vol > 0 else 0
-            live_body_above = current_price > level and current_price > f_open * 1.002
-            live_vol_ok = f_vol_ratio >= 1.3 and f_buy_ratio >= 0.50
+            # FIX (AUDIO case): thresholds were too strict — pump starts with
+            # low volume that builds up, so by the time 1.3x vol was reached
+            # price was already far above the level. Now fire as soon as price
+            # is above level with ANY green body momentum, even minimal volume.
+            # Vol threshold: 0.8x (any above-average activity), buy: 0.48 (slight buy bias)
+            live_body_above = current_price > level * 1.001  # just 0.1% above level
+            live_vol_ok = f_vol_ratio >= 0.8 and f_buy_ratio >= 0.48
             if live_body_above and live_vol_ok:
                 manual_lines[line_id]["live_cross_alerted"] = True
                 save_manual_lines()
@@ -2741,10 +2750,10 @@ def check_manual_lines():
                     f"💰 Price: {format_price(current_price)}\n"
                     f"📍 Level: {format_price(level)}\n"
                     f"⚡ Volume: {f_vol_ratio:.1f}x | Buy: {f_buy_ratio*100:.0f}%\n\n"
-                    f"🕐 Candle still forming — this is an early heads-up so you can "
-                    f"start monitoring now. A confirmed break alert will follow "
-                    f"when the candle closes above {format_price(level)}.\n\n"
-                    f"⚠️ <i>Candle not closed yet — treat as a watch signal, not full confirmation.</i>"
+                    f"🕐 Forming candle just crossed {format_price(level)} — "
+                    f"check the chart NOW if you want to enter early. "
+                    f"A confirmed break alert follows when the candle closes.\n\n"
+                    f"⚠️ <i>Candle not closed yet — use this to get ready, not as full confirmation.</i>"
                 )
                 send_to_topic(TOPIC_MY_SETUPS, live_msg)
                 if chat_id:
@@ -7041,7 +7050,7 @@ def main():
                 check_manual_lines()
             except Exception as e:
                 print(f"Manual line error: {e}")
-            time.sleep(60)
+            time.sleep(15)  # check every 15s for faster live cross detection
 
     Thread(target=run_manual_lines, daemon=True).start()
 
@@ -7064,6 +7073,47 @@ def main():
             time.sleep(300)  # every 5 minutes, internal cooldown is 12h per coin
 
     Thread(target=run_postpump_retest_scanner, daemon=True).start()
+
+    # Fast range breakout live detector — checks range_breakout_tracking
+    # candidates every 15s using cached ticker, no extra klines API calls.
+    # Solves THE/OPG case where main scan loop was too slow.
+    def run_fast_range_scanner():
+        while True:
+            try:
+                now_f = time.time()
+                for symbol, tracked in list(range_breakout_tracking.items()):
+                    live_key = f"{symbol}_1h_breakout_live"
+                    if now_f - range_breakout_alerted.get(live_key, 0) < 4 * 3600:
+                        continue
+                    ticker = get_ticker(symbol)
+                    if not ticker:
+                        continue
+                    current_price = float(ticker["lastPrice"])
+                    change_24h    = float(ticker["priceChangePercent"])
+                    range_high    = tracked.get("range_high", 0)
+                    range_low     = tracked.get("range_low", 0)
+                    range_width   = tracked.get("range_width_pct", 0)
+                    touches       = tracked.get("near_top_touches", 0)
+                    if range_high and current_price > range_high * 1.001:
+                        pct = (current_price - range_high) / range_high * 100
+                        range_breakout_alerted[live_key] = now_f
+                        send_to_topic(TOPIC_HIGH,
+                            f"⚡ <b>RANGE BREAKOUT — LIVE [1H]</b>\n\n"
+                            f"🪙 <b>{symbol}</b>\n"
+                            f"💰 Price: {format_price(current_price)} (+{pct:.1f}% above range)\n"
+                            f"📊 24h: {change_24h:+.2f}%\n"
+                            f"📐 Range: {format_price(range_low)} — {format_price(range_high)} "
+                            f"({range_width:.1f}% wide, {touches} touches at top)\n\n"
+                            f"⚡ <i>Fast detection — check the chart NOW.</i>\n\n"
+                            f"⚠️ <i>Check the chart before entry.</i>"
+                        )
+                        track_building_signal(symbol, "Range Breakout LIVE [1H]", current_price)
+                        print(f"⚡ Fast range scanner: {symbol} +{pct:.1f}%")
+            except Exception as e:
+                print(f"Fast range scanner error: {e}")
+            time.sleep(15)
+
+    Thread(target=run_fast_range_scanner, daemon=True).start()
 
     def run_active_trades():
         while True:
