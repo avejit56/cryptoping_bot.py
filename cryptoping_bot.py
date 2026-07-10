@@ -1497,8 +1497,7 @@ def check_volume_buildup(symbol, tf, klines):
                 "signal_time": now, "signal_type": f"Volume Build-up [{cfg['label']}]",
                 "highest_after": price,
             }
-
-# ─── GRADUAL BUILDUP DETECTOR (HMSTR case) ────────────────
+            track_building_signal(symbol, f"Volume Build-up [{cfg['label']}]", price)
 """
 The existing check_volume_buildup() catches 3 consecutive candles each with
 2.5x+ volume — a short burst pattern. But some coins pump after a multi-day
@@ -1700,22 +1699,17 @@ def check_range_breakout(symbol, tf, klines):
     range_low = min(lows)
     range_width_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 100
 
-    if range_width_pct > 15:
+    if range_width_pct > 10:  # tighter range = more coiled = more reliable
         return
 
     near_top_touches = sum(1 for h in highs if h >= range_high * 0.99)
-    if near_top_touches < 2:
+    if near_top_touches < 3:  # raised from 2 to 3 — needs real resistance level
         return
 
     range_vols = [float(k[5]) for k in lookback]
     avg_range_vol = sum(range_vols) / len(range_vols) if range_vols else 1
 
     # ── LIVE detection (forming candle) ──
-    # FIX (OPG/ARPA case): waiting for the candle to close meant the alert arrived
-    # after the pump was already done. Check the FORMING candle via current_price —
-    # if price has already broken above range_high with real volume forming, fire
-    # an immediate early alert. Uses a separate live_key cooldown so it doesn't
-    # interfere with the closed-candle tracking path.
     live_key = f"{symbol}_{tf}_breakout_live"
     forming = klines[-1]
     f_open = float(forming[1])
@@ -1748,15 +1742,15 @@ def check_range_breakout(symbol, tf, klines):
     l_open, l_close = float(last[1]), float(last[4])
     if l_close <= l_open:
         return
-    if l_close <= range_high * 1.002:
+    if l_close <= range_high * 1.003:  # must close at least 0.3% above range
         return
 
     breakout_vol = float(last[5])
     vol_ratio = breakout_vol / avg_range_vol if avg_range_vol > 0 else 0
-    if vol_ratio < 3.0:
+    if vol_ratio < 4.0:  # raised from 3x to 4x — stronger confirmation needed
         return
 
-    if current_price < l_close * 0.92:
+    if current_price < l_close * 0.93:  # allow slightly more pullback
         return
 
     if tf == "1h":
@@ -1868,8 +1862,7 @@ def check_higher_lows(symbol, tf, klines):
                 "signal_time": now, "signal_type": f"Accumulation [{cfg['label']}]",
                 "highest_after": price,
             }
-
-# ─── BUY PRESSURE ─────────────────────────────────────────
+            track_building_signal(symbol, f"Accumulation [{cfg['label']}]", price)
 def check_buy_pressure(symbol):
     now = time.time()
     key = f"{symbol}_buypressure"
@@ -2021,8 +2014,7 @@ def check_volume_surge(symbol):
             "signal_time": now, "signal_type": "Volume Surge [1H]",
             "highest_after": current_price,
         }
-
-# ─── MANUAL ZONE MONITOR ──────────────────────────────────
+        track_building_signal(symbol, "Volume Surge [1H]", current_price)
 def zone_history_key(symbol, z_low, z_high):
     """Stable key for a price zone, rounded so near-identical zones match"""
     return f"{symbol}_{z_low:.8f}_{z_high:.8f}"
@@ -3077,7 +3069,100 @@ def check_active_trades():
     if to_close:
         save_active_trades()
 
-# ─── EXPLOSIVE PUMP DETECTOR (RIF type) ──────────────────
+
+def check_active_trades_fast():
+    """
+    Fast trade monitor — runs every 60s on 5M/15M/1H.
+    Checks for:
+    1. Trend shift (lower highs forming on 5M/15M)
+    2. Volume spike (unexpected selling volume)
+    3. Downtrend/retracement warning
+    4. Strong continuation (positive update)
+    """
+    now = time.time()
+    for trade_id, trade in list(active_trades.items()):
+        symbol  = trade["symbol"]
+        entry   = trade["entry"]
+        sl      = trade["sl"]
+
+        cooldown_fast = now - trade.get("last_fast_alert", 0) > 1 * 3600
+        if not cooldown_fast:
+            continue
+
+        ticker = get_ticker(symbol)
+        if not ticker:
+            continue
+        current_price = float(ticker["lastPrice"])
+        pnl_pct = (current_price - entry) / entry * 100
+
+        alerts = []
+
+        # ── 5M trend shift ──
+        klines_5m = get_klines(symbol, interval="5m", limit=20)
+        if klines_5m and len(klines_5m) >= 10:
+            closed_5m = klines_5m[:-1]
+            highs_5m = [float(k[2]) for k in closed_5m[-6:]]
+            lows_5m  = [float(k[3]) for k in closed_5m[-6:]]
+            lower_highs = all(highs_5m[i] < highs_5m[i-1] for i in range(1, len(highs_5m)))
+            lower_lows  = all(lows_5m[i] < lows_5m[i-1] for i in range(1, len(lows_5m)))
+            vols_5m = [float(k[5]) for k in closed_5m[-6:]]
+            avg_vol_5m = sum(vols_5m[:3]) / 3 if len(vols_5m) >= 3 else 1
+            last_vol_5m = vols_5m[-1]
+            sell_spike_5m = last_vol_5m > avg_vol_5m * 3 and float(closed_5m[-1][4]) < float(closed_5m[-1][1])
+
+            if lower_highs and lower_lows:
+                alerts.append("📉 5M lower highs + lower lows — short-term downtrend forming")
+            if sell_spike_5m:
+                alerts.append(f"⚡ 5M sell volume spike ({last_vol_5m/avg_vol_5m:.1f}x) — watch closely")
+
+        # ── 15M retracement check ──
+        klines_15m = get_klines(symbol, interval="15m", limit=12)
+        if klines_15m and len(klines_15m) >= 6:
+            closed_15m = klines_15m[:-1]
+            recent_high_15m = max(float(k[2]) for k in closed_15m[-8:])
+            retrace_15m = (recent_high_15m - current_price) / recent_high_15m * 100 if recent_high_15m > 0 else 0
+            red_count = sum(1 for k in closed_15m[-4:] if float(k[4]) < float(k[1]))
+            if retrace_15m >= 5 and red_count >= 3:
+                alerts.append(f"⚠️ 15M retracement: -{retrace_15m:.1f}% from recent high, {red_count}/4 red candles")
+
+        # ── 1H trend check ──
+        klines_1h = get_klines(symbol, interval="1h", limit=10)
+        if klines_1h and len(klines_1h) >= 5:
+            closed_1h = klines_1h[:-1]
+            closes_1h = [float(k[4]) for k in closed_1h]
+            ema20_1h = calculate_ema(closes_1h, min(20, len(closes_1h)))
+            below_ema = ema20_1h and current_price < ema20_1h
+            vols_1h = [float(k[5]) for k in closed_1h[-5:]]
+            avg_vol_1h = sum(vols_1h[:3]) / 3 if len(vols_1h) >= 3 else 1
+            sell_spike_1h = vols_1h[-1] > avg_vol_1h * 2.5 and float(closed_1h[-1][4]) < float(closed_1h[-1][1])
+
+            if below_ema:
+                alerts.append(f"🔴 1H price below 20EMA ({format_price(ema20_1h)}) — trend weakening")
+            if sell_spike_1h:
+                alerts.append(f"⚡ 1H sell spike ({vols_1h[-1]/avg_vol_1h:.1f}x) — distribution risk")
+
+        # ── Positive: strong continuation ──
+        if not alerts and pnl_pct >= 5:
+            klines_5m_pos = get_klines(symbol, interval="5m", limit=10)
+            if klines_5m_pos and len(klines_5m_pos) >= 5:
+                closed_pos = klines_5m_pos[:-1]
+                green_count = sum(1 for k in closed_pos[-4:] if float(k[4]) > float(k[1]))
+                if green_count >= 3:
+                    alerts.append(f"✅ 5M strong continuation — {green_count}/4 green candles, up +{pnl_pct:.1f}%")
+
+        if alerts:
+            active_trades[trade_id]["last_fast_alert"] = now
+            save_active_trades()
+            alert_str = "\n".join(f"  {a}" for a in alerts)
+            emoji = "⚠️" if any("📉" in a or "🔴" in a or "retracement" in a for a in alerts) else "ℹ️"
+            send_to_topic(TOPIC_TRADES,
+                f"{emoji} <b>Trade Update — {symbol}</b>\n\n"
+                f"💰 Entry: {format_price(entry)} | Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+                f"🛑 SL: {format_price(sl)}\n\n"
+                f"{alert_str}\n\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+            )
+            print(f"{emoji} Trade fast monitor: {symbol} — {len(alerts)} alert(s)")
 def check_explosive_pump(symbol):
     """
     Detect a sudden explosive move across 1-3 candles.
@@ -7124,6 +7209,16 @@ def main():
             time.sleep(60)
 
     Thread(target=run_active_trades, daemon=True).start()
+
+    def run_active_trades_fast():
+        while True:
+            try:
+                check_active_trades_fast()
+            except Exception as e:
+                print(f"Fast trade monitor error: {e}")
+            time.sleep(60)
+
+    Thread(target=run_active_trades_fast, daemon=True).start()
 
     # Pre-warm the ticker cache once before the first scan pass — without this,
     # the first parallel pass after a cold start would have many threads each
