@@ -4656,6 +4656,217 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def get_order_book_clusters(symbol, depth=100):
+    """
+    Fetches Binance order book and finds significant bid/ask clusters —
+    price levels where large orders are stacked. These are liquidation
+    targets: price sweeping a big bid cluster = stop losses triggered =
+    fuel for a pump.
+    Returns dict with buy_walls, sell_walls, and the nearest liquidation zone.
+    """
+    try:
+        r = http_session.get(
+            f"https://api.binance.com/api/v3/depth",
+            params={"symbol": symbol, "limit": depth},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+        if not bids or not asks:
+            return None
+
+        current_price = bids[0][0]  # best bid ≈ current
+
+        # Find significant walls (clusters with large USDT value)
+        def find_walls(orders, min_usdt=50000):
+            walls = []
+            for price, qty in orders:
+                usdt_val = price * qty
+                if usdt_val >= min_usdt:
+                    walls.append({"price": price, "usdt": usdt_val})
+            return sorted(walls, key=lambda x: x["usdt"], reverse=True)[:3]
+
+        buy_walls  = find_walls(bids)   # support / liquidation targets below
+        sell_walls = find_walls(asks)   # resistance / stop clusters above
+
+        # Nearest liquidation zone = biggest buy wall just below current price
+        liq_zone = None
+        for w in buy_walls:
+            if w["price"] < current_price:
+                liq_zone = w
+                break
+
+        return {
+            "buy_walls": buy_walls,
+            "sell_walls": sell_walls,
+            "liq_zone": liq_zone,
+            "current_price": current_price,
+        }
+    except Exception as e:
+        print(f"Order book error {symbol}: {e}")
+        return None
+
+
+def format_order_flow_block(ob_data, current_price):
+    """Formats order flow data for embedding in messages."""
+    if not ob_data:
+        return ""
+
+    lines = ["💧 <b>Order Flow (Live Order Book):</b>"]
+
+    if ob_data["sell_walls"]:
+        for w in ob_data["sell_walls"][:2]:
+            lines.append(f"  🔴 Sell wall: {format_price(w['price'])} "
+                        f"({w['usdt']/1000:.0f}K USDT)")
+
+    if ob_data["buy_walls"]:
+        for w in ob_data["buy_walls"][:2]:
+            lines.append(f"  🟢 Buy wall: {format_price(w['price'])} "
+                        f"({w['usdt']/1000:.0f}K USDT)")
+
+    if ob_data["liq_zone"]:
+        lz = ob_data["liq_zone"]
+        pct_away = (current_price - lz["price"]) / current_price * 100
+        lines.append(
+            f"\n⚡ <b>Liquidation zone: {format_price(lz['price'])} "
+            f"({pct_away:.1f}% below)</b>\n"
+            f"   {lz['usdt']/1000:.0f}K USDT stacked — stop losses clustered here.\n"
+            f"   If price sweeps this level with volume then reclaims → "
+            f"strong pump likely."
+        )
+    else:
+        lines.append("\n⚡ No significant liquidation zone detected nearby.")
+
+    return "\n".join(lines)
+
+
+# ── Liquidation sweep tracker ─────────────────────────────
+# Tracks symbols being monitored after /entry for liquidation sweeps.
+# {symbol: {liq_price, liq_usdt, entry_price, chat_id, started, swept, sweep_time}}
+_liq_watch = {}
+
+def start_liq_watch(symbol, ob_data, entry_price, chat_id):
+    """Called after /entry — starts background liquidation monitoring."""
+    if not ob_data or not ob_data.get("liq_zone"):
+        return
+    lz = ob_data["liq_zone"]
+    _liq_watch[symbol] = {
+        "liq_price":  lz["price"],
+        "liq_usdt":   lz["usdt"],
+        "entry_price": entry_price,
+        "chat_id":    chat_id,
+        "started":    time.time(),
+        "swept":      False,
+        "sweep_time": None,
+        "alerted":    False,
+    }
+    print(f"💧 Liq watch started: {symbol} @ {format_price(lz['price'])}")
+
+
+def check_liq_watches():
+    """
+    Runs every 30s. For each symbol in _liq_watch:
+    - If price swept below liq_price with volume → mark as swept
+    - If price reclaimed above liq_price after sweep → PUMP ALERT
+    - Expire after 24h
+    """
+    now = time.time()
+    to_remove = []
+
+    for symbol, watch in list(_liq_watch.items()):
+        if now - watch["started"] > 24 * 3600:
+            to_remove.append(symbol)
+            continue
+
+        ticker = get_ticker(symbol)
+        if not ticker:
+            continue
+
+        current_price = float(ticker["lastPrice"])
+        liq_price     = watch["liq_price"]
+
+        # Stage 1: detect sweep below liq zone
+        if not watch["swept"]:
+            klines_5m = get_klines(symbol, interval="5m", limit=8)
+            if klines_5m and len(klines_5m) >= 4:
+                last = klines_5m[-2]
+                l_low   = float(last[3])
+                l_close = float(last[4])
+                l_vol   = float(last[5])
+                avg_vol = sum(float(k[5]) for k in klines_5m[-6:-2]) / 4
+                vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+                swept = l_low < liq_price * 0.999 and vol_ratio >= 2.0
+
+                if swept:
+                    _liq_watch[symbol]["swept"]      = True
+                    _liq_watch[symbol]["sweep_time"] = now
+                    _liq_watch[symbol]["sweep_low"]  = l_low
+                    _liq_watch[symbol]["sweep_vol"]  = vol_ratio
+                    send_to(watch["chat_id"],
+                        f"⚡ <b>Liquidation zone swept — {symbol}</b>\n\n"
+                        f"Price wicked to {format_price(l_low)} "
+                        f"(below cluster at {format_price(liq_price)}) "
+                        f"on {vol_ratio:.1f}x volume.\n\n"
+                        f"⏳ Watching for reclaim — if price closes back above "
+                        f"{format_price(liq_price)}, pump likely incoming."
+                    )
+                    print(f"⚡ Liq swept: {symbol} low={format_price(l_low)}")
+
+        # Stage 2: after sweep, detect reclaim → pump alert
+        elif not watch["alerted"]:
+            time_since_sweep = now - watch["sweep_time"]
+            if time_since_sweep > 4 * 3600:  # too long, no reclaim
+                to_remove.append(symbol)
+                continue
+
+            klines_5m = get_klines(symbol, interval="5m", limit=6)
+            if klines_5m and len(klines_5m) >= 3:
+                last = klines_5m[-2]
+                l_close = float(last[4])
+                l_open  = float(last[1])
+                l_vol   = float(last[5])
+                avg_vol = sum(float(k[5]) for k in klines_5m[-6:-2]) / 4
+                vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+                reclaimed = (
+                    l_close > liq_price and
+                    l_close > l_open and
+                    vol_ratio >= 1.5
+                )
+
+                if reclaimed:
+                    _liq_watch[symbol]["alerted"] = True
+                    ob_new = get_order_book_clusters(symbol)
+                    of_block = format_order_flow_block(ob_new, current_price) if ob_new else ""
+                    pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
+
+                    msg = (
+                        f"🔥 <b>LIQUIDATION SWEEP COMPLETE — {symbol}</b>\n\n"
+                        f"💰 Current: {format_price(current_price)}\n"
+                        f"📍 Swept {format_price(watch['sweep_low'])} "
+                        f"on {watch['sweep_vol']:.1f}x volume\n"
+                        f"✅ Reclaimed {format_price(liq_price)} — "
+                        f"buyers absorbed the sell stops\n"
+                        f"📊 From your /entry price: {pct_from_entry:+.1f}%\n\n"
+                        f"{of_block}\n\n"
+                        f"💡 <i>Stop losses triggered = fuel consumed. "
+                        f"Market now free to move up with less resistance. "
+                        f"This is a high-probability entry window.</i>\n\n"
+                        f"⚠️ <i>Confirm on chart and use a stop-loss.</i>"
+                    )
+                    send_to_topic(TOPIC_MY_SETUPS, msg)
+                    send_to(watch["chat_id"], msg)
+                    to_remove.append(symbol)
+                    print(f"🔥 Liq reclaim alert: {symbol}")
+
+    for s in to_remove:
+        _liq_watch.pop(s, None)
+
+
 def build_entry_decision_block(symbol, current_price, tf="4h"):
     """
     Generates a complete entry decision block for retest completion messages
@@ -5459,18 +5670,22 @@ def check_retest_watches():
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
             full_confluence_watch = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+            # Order flow — add live order book data to retest message
+            ob_watch = get_order_book_clusters(symbol)
+            of_watch = format_order_flow_block(ob_watch, current_price) if ob_watch else ""
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
                 + (f"{full_confluence_watch}\n\n" if full_confluence_watch else "") +
+                (f"{of_watch}\n\n" if of_watch else "") +
                 f"{suggestion}\n\n"
                 f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
                 f"you'll get a follow-up.</i>"
             )
             send_to(watch["chat_id"], msg)
             send_to_topic(TOPIC_MY_SETUPS, msg)
-            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}{' [TL SWEEP]' if tl_sweep else ''}")
+            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
 
             # Extract the level that was confirmed, from the pattern note text,
             # so follow-up can check against it without re-running detection.
@@ -6439,6 +6654,10 @@ def handle_commands():
                                 result.get("pattern_notes", {}),
                                 chart_patterns,
                             )
+                            # Order flow — live order book analysis
+                            ob_data = get_order_book_clusters(sym)
+                            of_block = format_order_flow_block(ob_data, result["price"]) if ob_data else ""
+
                             reply(
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
@@ -6446,10 +6665,19 @@ def handle_commands():
                                 f"{details_str}\n"
                                 f"{pattern_section}"
                                 f"{patterns_section}\n"
+                                f"{of_block}\n\n"
                                 f"{entry_suggestion}\n\n"
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
+                            # Auto-start liquidation watch if there's a liq zone
+                            if ob_data and ob_data.get("liq_zone"):
+                                start_liq_watch(sym, ob_data, result["price"], reply_chat_id)
+                                reply(
+                                    f"💧 <b>Liquidation watch started — {sym}</b>\n"
+                                    f"Monitoring for sweep of {format_price(ob_data['liq_zone']['price'])} "
+                                    f"— you'll get an alert here when it sweeps + reclaims."
+                                )
 
                 elif text.startswith("/WATCH "):
                     sym_raw = text.replace("/WATCH ", "").strip().split()[0] if text.replace("/WATCH ", "").strip() else ""
@@ -7290,6 +7518,16 @@ def main():
             time.sleep(15)
 
     Thread(target=run_fast_range_scanner, daemon=True).start()
+
+    def run_liq_watches():
+        while True:
+            try:
+                check_liq_watches()
+            except Exception as e:
+                print(f"Liq watch error: {e}")
+            time.sleep(30)
+
+    Thread(target=run_liq_watches, daemon=True).start()
 
     def run_active_trades():
         while True:
