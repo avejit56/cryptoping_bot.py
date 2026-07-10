@@ -3273,7 +3273,29 @@ def is_daily_downtrend(symbol, current_price):
     """
     Returns True if the symbol is in a daily downtrend.
     True = skip the signal.
+
+    EXCEPTION (SKL case): if volume is extreme (8x+ normal) and price is
+    moving up strongly on the latest candle, this is likely a reversal pump —
+    return False so detectors can fire even in a downtrend. These are some
+    of the biggest moves precisely because sellers are exhausted.
     """
+    # Check for extreme volume reversal before applying downtrend filter
+    ticker = get_ticker(symbol)
+    if ticker:
+        klines_1h = get_klines(symbol, interval="1h", limit=12)
+        if klines_1h and len(klines_1h) >= 8:
+            closed_1h = klines_1h[:-1]
+            last_1h = closed_1h[-1]
+            l_open  = float(last_1h[1])
+            l_close = float(last_1h[4])
+            l_vol   = float(last_1h[5])
+            avg_vol = sum(float(k[5]) for k in closed_1h[-8:-1]) / 7
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+            # Extreme reversal: 8x+ volume + strong green candle + price up 3%+
+            if (vol_ratio >= 8.0 and l_close > l_open and
+                    (l_close - l_open) / l_open >= 0.03):
+                return False  # bypass downtrend filter — reversal pump
+
     klines_daily = get_klines(symbol, interval="1d", limit=15)
     if not klines_daily or len(klines_daily) < 7:
         return False  # no data, don't skip
@@ -5639,6 +5661,74 @@ _last_watchlist_validate = 0
 _vol_accum_alerted  = {}  # {symbol: last_alert_time}
 _postpump_retest_alerted = {}  # {symbol: last_alert_time}
 
+_reversal_pump_alerted = {}  # {symbol: last_alert_time}
+
+def scan_reversal_pumps():
+    """
+    Scans coins in daily downtrend for extreme volume reversal —
+    the SKL pattern: long downtrend → sudden 8x+ volume vertical spike.
+    These are often the biggest pumps precisely because sellers are exhausted
+    and any buying pressure creates a vacuum move up.
+    Fires to High Priority (not filtered by downtrend check).
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        if now - _reversal_pump_alerted.get(symbol, 0) < 6 * 3600:
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            change_24h = float(ticker["priceChangePercent"])
+
+            # Must be in downtrend (that's the whole point)
+            if not is_daily_downtrend(symbol, current_price):
+                continue
+
+            klines_1h = get_klines(symbol, interval="1h", limit=15)
+            if not klines_1h or len(klines_1h) < 10:
+                continue
+
+            closed = klines_1h[:-1]
+            last = closed[-1]
+            l_open  = float(last[1])
+            l_close = float(last[4])
+            l_vol   = float(last[5])
+            l_buy   = float(last[9]) if len(last) > 9 else l_vol * 0.5
+
+            # Baseline from candles before the spike
+            avg_vol = sum(float(k[5]) for k in closed[-10:-2]) / 8
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+            buy_ratio = l_buy / l_vol if l_vol > 0 else 0
+
+            # Strong reversal: extreme volume + strong green + significant price move
+            price_move = (l_close - l_open) / l_open * 100 if l_open > 0 else 0
+            is_reversal = (
+                vol_ratio >= 8.0 and
+                l_close > l_open and
+                price_move >= 3.0 and
+                buy_ratio >= 0.55 and
+                change_24h >= 0
+            )
+
+            if is_reversal:
+                _reversal_pump_alerted[symbol] = now
+                send_to_topic(TOPIC_HIGH,
+                    f"🔄 <b>REVERSAL PUMP — {symbol}</b>\n\n"
+                    f"💰 Price: {format_price(current_price)} (+{change_24h:.1f}% 24h)\n"
+                    f"📈 1H candle: +{price_move:.1f}%\n"
+                    f"💥 Volume: {vol_ratio:.1f}x normal | Buy: {buy_ratio*100:.0f}%\n\n"
+                    f"⚠️ <i>Was in daily downtrend — this extreme volume may signal "
+                    f"a trend reversal. These moves can be fast and large. "
+                    f"Check the chart before entry.</i>"
+                )
+                track_building_signal(symbol, f"Reversal Pump [1H]", current_price)
+                print(f"🔄 Reversal pump: {symbol} vol={vol_ratio:.1f}x move={price_move:.1f}%")
+        except Exception as e:
+            print(f"Reversal scan error {symbol}: {e}")
+
+
 def scan_volume_accumulation():
     """
     Scans all watchlist coins for quiet volume accumulation — price barely
@@ -7143,6 +7233,7 @@ def main():
         while True:
             try:
                 scan_volume_accumulation()
+                scan_reversal_pumps()  # downtrend coins with extreme volume
             except Exception as e:
                 print(f"Vol accum scan error: {e}")
             time.sleep(120)  # every 2 minutes, but internal cooldown is 8h per coin
