@@ -4908,6 +4908,48 @@ def analyze_ifvg_framework(symbol, current_price, tf="4h"):
     if not parts:
         return ""
 
+    # Plain language summary — "What this means for you"
+    summary_lines = ["💡 <b>What this means for you:</b>"]
+    nearest_sup = None
+    nearest_res = None
+
+    # Find nearest iFVG support/resistance
+    for iv in ifvgs:
+        if "bullish" in iv["type"] and iv["mid"] < current_price:
+            if not nearest_sup or abs(iv["mid"] - current_price) < abs(nearest_sup["mid"] - current_price):
+                nearest_sup = iv
+        elif "bearish" in iv["type"] and iv["mid"] > current_price:
+            if not nearest_res or abs(iv["mid"] - current_price) < abs(nearest_res["mid"] - current_price):
+                nearest_res = iv
+
+    if nearest_sup:
+        pct = (current_price - nearest_sup["mid"]) / current_price * 100
+        summary_lines.append(f"   → Strong support zone at {format_price(nearest_sup['bottom'])}–{format_price(nearest_sup['top'])} ({pct:.1f}% below) — price has bounced here before")
+    if nearest_res:
+        pct = (nearest_res["mid"] - current_price) / current_price * 100
+        summary_lines.append(f"   → Resistance at {format_price(nearest_res['top'])} ({pct:.1f}% above) — sellers likely waiting there")
+
+    # EQH/EQL targets
+    if eql["eq_highs"]:
+        best_h = eql["eq_highs"][0]
+        pct = (best_h["price"] - current_price) / current_price * 100
+        summary_lines.append(f"   → TP target: {format_price(best_h['price'])} (+{pct:.1f}%) — {best_h['touches']}x tested, big liquidity there")
+    if eql["eq_lows"]:
+        best_l = eql["eq_lows"][0]
+        pct = (current_price - best_l["price"]) / current_price * 100
+        summary_lines.append(f"   → SL zone: below {format_price(best_l['price'])} (-{pct:.1f}%) — if this breaks, trend changes")
+
+    # Verdict
+    if ifvgs and nearest_sup and current_price <= nearest_sup["top"] * 1.02:
+        verdict = "✅ Price is at/near a high-probability bounce zone — wait for a green candle confirmation then enter"
+    elif nearest_res and (nearest_res["mid"] - current_price) / current_price < 0.03:
+        verdict = "⚠️ Price is near resistance — wait for a clear break above before entering"
+    else:
+        verdict = "⏳ No immediate high-probability setup — monitor these levels and wait for price to reach them"
+
+    summary_lines.append(f"   → Verdict: {verdict}")
+    parts.append("\n".join(summary_lines))
+
     return "🔬 <b>iFVG Framework Analysis:</b>\n\n" + "\n\n".join(parts)
 
 
@@ -4949,15 +4991,18 @@ def get_order_book_clusters(symbol, depth=100):
 
         # Nearest liquidation zone = biggest buy wall just below current price
         liq_zone = None
-        for w in buy_walls:
-            if w["price"] < current_price:
-                liq_zone = w
-                break
+        all_liq_zones = sorted(
+            [w for w in buy_walls if w["price"] < current_price],
+            key=lambda x: (-(x["price"] < current_price), -x["usdt"])
+        )
+        if all_liq_zones:
+            liq_zone = all_liq_zones[0]
 
         return {
             "buy_walls": buy_walls,
             "sell_walls": sell_walls,
             "liq_zone": liq_zone,
+            "all_liq_zones": all_liq_zones,
             "current_price": current_price,
         }
     except Exception as e:
@@ -4966,36 +5011,41 @@ def get_order_book_clusters(symbol, depth=100):
 
 
 def format_order_flow_block(ob_data, current_price):
-    """Formats order flow data for embedding in messages.
-    Returns empty string if nothing meaningful to show."""
+    """Formats order flow data. Returns empty string if nothing meaningful."""
     if not ob_data:
         return ""
 
     lines = []
 
-    # Only show walls with meaningful size
     if ob_data.get("sell_walls"):
         for w in ob_data["sell_walls"][:2]:
-            lines.append(f"  🔴 Sell wall: {format_price(w['price'])} "
-                        f"({w['usdt']/1000:.0f}K USDT)")
+            lines.append(f"  🔴 Sell wall: {format_price(w['price'])} ({w['usdt']/1000:.0f}K USDT)")
 
     if ob_data.get("buy_walls"):
         for w in ob_data["buy_walls"][:2]:
-            lines.append(f"  🟢 Buy wall: {format_price(w['price'])} "
-                        f"({w['usdt']/1000:.0f}K USDT)")
+            lines.append(f"  🟢 Buy wall: {format_price(w['price'])} ({w['usdt']/1000:.0f}K USDT)")
 
-    if ob_data.get("liq_zone"):
-        lz = ob_data["liq_zone"]
-        pct_away = (current_price - lz["price"]) / current_price * 100
-        lines.append(
-            f"\n⚡ <b>Liquidation zone: {format_price(lz['price'])} "
-            f"({pct_away:.1f}% below)</b>\n"
-            f"   {lz['usdt']/1000:.0f}K USDT stacked — stop losses clustered here.\n"
-            f"   If price sweeps this level with volume then reclaims → "
-            f"strong pump likely."
-        )
+    # Show all significant liquidation zones, not just nearest
+    liq_zones = ob_data.get("all_liq_zones", [])
+    if not liq_zones and ob_data.get("liq_zone"):
+        liq_zones = [ob_data["liq_zone"]]
 
-    # Only return block if we have something useful to show
+    if liq_zones:
+        for i, lz in enumerate(liq_zones[:3]):
+            pct_away = (current_price - lz["price"]) / current_price * 100
+            size_label = "🔥 Large" if lz["usdt"] >= 50000 else "⚡"
+            lines.append(
+                f"\n{size_label} Liquidation zone {i+1}: {format_price(lz['price'])} "
+                f"({pct_away:.1f}% below) — {lz['usdt']/1000:.0f}K USDT\n"
+                f"   💡 Watch for: price dipping briefly below this level (triggering stops), "
+                f"then quickly reclaiming it with a green candle — that's your entry signal. "
+                f"Don't enter on the dip — wait for the reclaim."
+            )
+        if len(liq_zones) > 1:
+            biggest = max(liq_zones, key=lambda x: x["usdt"])
+            if biggest != liq_zones[0]:
+                lines.append(f"   ℹ️ Bigger pool at {format_price(biggest['price'])} ({biggest['usdt']/1000:.0f}K) — stronger pump potential if swept")
+
     if not lines:
         return ""
 
@@ -5008,13 +5058,12 @@ def format_order_flow_block(ob_data, current_price):
 _liq_watch = {}
 
 def start_liq_watch(symbol, ob_data, entry_price, chat_id):
-    """Called after /entry — starts background liquidation monitoring."""
-    if not ob_data or not ob_data.get("liq_zone"):
-        return
-    lz = ob_data["liq_zone"]
+    """Called after /entry — starts background liquidation monitoring.
+    Works even if no liq zone exists yet — will detect one as it develops."""
+    lz = ob_data.get("liq_zone") if ob_data else None
     _liq_watch[symbol] = {
-        "liq_price":  lz["price"],
-        "liq_usdt":   lz["usdt"],
+        "liq_price":  lz["price"] if lz else None,
+        "liq_usdt":   lz["usdt"] if lz else 0,
         "entry_price": entry_price,
         "chat_id":    chat_id,
         "started":    time.time(),
@@ -5022,7 +5071,7 @@ def start_liq_watch(symbol, ob_data, entry_price, chat_id):
         "sweep_time": None,
         "alerted":    False,
     }
-    print(f"💧 Liq watch started: {symbol} @ {format_price(lz['price'])}")
+    print(f"💧 Liq watch started: {symbol} @ {format_price(lz['price']) if lz else 'no zone yet'}")
 
 
 def check_liq_watches():
@@ -5045,7 +5094,21 @@ def check_liq_watches():
             continue
 
         current_price = float(ticker["lastPrice"])
-        liq_price     = watch["liq_price"]
+        liq_price = watch.get("liq_price")
+
+        # If no liq zone yet, check if one has developed
+        if not liq_price:
+            ob_refresh = get_order_book_clusters(symbol)
+            if ob_refresh and ob_refresh.get("liq_zone"):
+                liq_price = ob_refresh["liq_zone"]["price"]
+                _liq_watch[symbol]["liq_price"] = liq_price
+                _liq_watch[symbol]["liq_usdt"]  = ob_refresh["liq_zone"]["usdt"]
+                send_to(watch["chat_id"],
+                    f"💧 <b>Liquidation zone found — {symbol}</b>\n"
+                    f"New zone at {format_price(liq_price)} — now actively monitoring."
+                )
+            else:
+                continue  # still no zone, keep waiting
 
         # Stage 1: detect sweep below liq zone
         if not watch["swept"]:
@@ -5103,24 +5166,62 @@ def check_liq_watches():
                     of_block = format_order_flow_block(ob_new, current_price) if ob_new else ""
                     pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
 
-                    msg = (
-                        f"🔥 <b>LIQUIDATION SWEEP COMPLETE — {symbol}</b>\n\n"
-                        f"💰 Current: {format_price(current_price)}\n"
-                        f"📍 Swept {format_price(watch['sweep_low'])} "
-                        f"on {watch['sweep_vol']:.1f}x volume\n"
-                        f"✅ Reclaimed {format_price(liq_price)} — "
-                        f"buyers absorbed the sell stops\n"
-                        f"📊 From your /entry price: {pct_from_entry:+.1f}%\n\n"
-                        f"{of_block}\n\n"
-                        f"💡 <i>Stop losses triggered = fuel consumed. "
-                        f"Market now free to move up with less resistance. "
-                        f"This is a high-probability entry window.</i>\n\n"
-                        f"⚠️ <i>Confirm on chart and use a stop-loss.</i>"
-                    )
+                    # Check if price is also inside a manual zone or near a manual line
+                    combined_setup = None
+                    for zone_id, zone in manual_zones.items():
+                        if (zone["symbol"] == symbol and
+                                zone["low"] <= current_price <= zone["high"] * 1.02):
+                            combined_setup = f"📐 Zone: {format_price(zone['low'])}–{format_price(zone['high'])} [{zone['tf'].upper()} OB]"
+                            break
+                    if not combined_setup:
+                        for line_id, line in manual_lines.items():
+                            if (line["symbol"] == symbol and
+                                    abs(current_price - line["price"]) / line["price"] <= 0.02):
+                                combined_setup = f"📏 Line: {format_price(line['price'])} [{line['tf'].upper()}]"
+                                break
+
+                    # Build SL/TP for combined alert
+                    klines_tp = get_klines(symbol, interval="4h", limit=50)
+                    sl_price = watch.get("sweep_low", liq_price) * 0.98
+                    tp1 = current_price * 1.05
+                    tp2 = current_price * 1.10
+                    rr = (tp1 - current_price) / (current_price - sl_price) if current_price > sl_price else 0
+
+                    if combined_setup:
+                        msg = (
+                            f"🔥 <b>COMBINED SETUP — {symbol}</b>\n\n"
+                            f"{combined_setup}\n"
+                            f"💧 Liquidation swept: {format_price(watch.get('sweep_low', liq_price))} "
+                            f"on {watch.get('sweep_vol', 0):.1f}x volume → reclaimed ✅\n\n"
+                            f"📐 <b>Trade Plan:</b>\n"
+                            f"   💰 Entry: {format_price(current_price)}\n"
+                            f"   🔴 SL: {format_price(sl_price)} ({(current_price-sl_price)/current_price*100:.1f}%)\n"
+                            f"   🟢 TP1: {format_price(tp1)} (+5%)\n"
+                            f"   🟢 TP2: {format_price(tp2)} (+10%)\n"
+                            f"   ⚖️ R/R: {rr:.1f}x\n\n"
+                            f"💡 <i>Zone + Liquidation confluence = strongest setup. "
+                            f"Confirm on chart and use stop-loss.</i>"
+                        )
+                    else:
+                        msg = (
+                            f"🔥 <b>LIQUIDATION SWEEP COMPLETE — {symbol}</b>\n\n"
+                            f"💰 Current: {format_price(current_price)}\n"
+                            f"📍 Swept {format_price(watch.get('sweep_low', liq_price))} "
+                            f"on {watch.get('sweep_vol', 0):.1f}x volume\n"
+                            f"✅ Reclaimed {format_price(liq_price)} — buyers absorbed sell stops\n"
+                            f"📊 From your /entry price: {pct_from_entry:+.1f}%\n\n"
+                            f"📐 <b>Quick plan:</b>\n"
+                            f"   🔴 SL: {format_price(sl_price)}\n"
+                            f"   🟢 TP1: {format_price(tp1)} (+5%) | TP2: {format_price(tp2)} (+10%)\n\n"
+                            + (f"{of_block}\n\n" if of_block else "") +
+                            f"💡 <i>Stop losses triggered = fuel consumed. "
+                            f"High-probability entry window.</i>\n\n"
+                            f"⚠️ <i>Confirm on chart and use a stop-loss.</i>"
+                        )
                     send_to_topic(TOPIC_MY_SETUPS, msg)
                     send_to(watch["chat_id"], msg)
                     to_remove.append(symbol)
-                    print(f"🔥 Liq reclaim alert: {symbol}")
+                    print(f"🔥 Liq reclaim alert: {symbol}{' [COMBINED]' if combined_setup else ''}")
 
     for s in to_remove:
         _liq_watch.pop(s, None)
@@ -5948,6 +6049,8 @@ def check_retest_watches():
             send_to(watch["chat_id"], msg)
             send_to_topic(TOPIC_MY_SETUPS, msg)
             print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+            # Auto-start liq watch from retest complete too
+            start_liq_watch(symbol, ob_watch, current_price, watch["chat_id"])
 
             # Extract the level that was confirmed, from the pattern note text,
             # so follow-up can check against it without re-running detection.
@@ -6851,7 +6954,32 @@ def handle_commands():
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
 
-                elif text.startswith("/ENTRY "):
+                elif text == "/LIST":
+                    coin_lines = [f"• {c}" for c in watchlist]
+                    send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
+
+                # ── Command shortcuts ──────────────────────────────
+                # /e → /entry, /w → /watch, /s → /suggest,
+                # /u → /unwatch, /z → /zones, /ml → /mylines
+                elif text.startswith("/E ") or text == "/E":
+                    raw_text = raw_text.replace("/e ", "/entry ", 1).replace("/E ", "/entry ", 1)
+                    text = raw_text.upper()
+                    # fall through handled below by re-checking
+                elif text.startswith("/W ") or text == "/W":
+                    raw_text = raw_text.replace("/w ", "/watch ", 1).replace("/W ", "/watch ", 1)
+                    text = raw_text.upper()
+                elif text.startswith("/S ") or text == "/S":
+                    raw_text = raw_text.replace("/s ", "/suggest ", 1).replace("/S ", "/suggest ", 1)
+                    text = raw_text.upper()
+                elif text.startswith("/U ") or text == "/U":
+                    raw_text = raw_text.replace("/u ", "/unwatch ", 1).replace("/U ", "/unwatch ", 1)
+                    text = raw_text.upper()
+                elif text == "/Z":
+                    text = "/ZONES"
+                elif text == "/ML":
+                    text = "/MYLINES"
+
+                if text.startswith("/ENTRY "):
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
                     if not sym_raw:
                         reply( "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
@@ -6936,13 +7064,15 @@ def handle_commands():
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
-                            # Auto-start liquidation watch if there's a liq zone
+                            # Auto-start liquidation watch for ALL /entry calls
+                            # Even if no zone now, monitoring starts and triggers
+                            # when order book develops a significant pool
+                            start_liq_watch(sym, ob_data, result["price"], reply_chat_id)
                             if ob_data and ob_data.get("liq_zone"):
-                                start_liq_watch(sym, ob_data, result["price"], reply_chat_id)
                                 reply(
                                     f"💧 <b>Liquidation watch started — {sym}</b>\n"
                                     f"Monitoring for sweep of {format_price(ob_data['liq_zone']['price'])} "
-                                    f"— you'll get an alert here when it sweeps + reclaims."
+                                    f"— alert in My Setups when swept + reclaimed."
                                 )
 
                 elif text.startswith("/WATCH "):
@@ -7507,6 +7637,98 @@ def handle_commands():
                             state_label = {"waiting": "⏳ waiting for break", "broken": "📈 broken, watching retest", "followup": "🔎 confirmed, tracking continuation"}.get(ln.get("state"), ln.get("state"))
                             lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
                         reply( "📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
+
+                elif text.startswith("/SUGGEST ") or text == "/SUGGEST":
+                    sym_raw = text.replace("/SUGGEST ", "").strip().split()[0] if " " in text else ""
+                    if not sym_raw:
+                        reply("⚠️ Format: /suggest BTC  (or /s BTC)")
+                    else:
+                        sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                        ticker = get_ticker(sym)
+                        klines_4h = get_klines(sym, interval="4h", limit=100)
+                        klines_1d = get_klines(sym, interval="1d", limit=30)
+                        if not ticker or not klines_4h:
+                            reply(f"⚠️ Couldn't fetch data for {sym}")
+                        else:
+                            current_price = float(ticker["lastPrice"])
+                            closed_4h = klines_4h[:-1]
+                            highs = [float(k[2]) for k in closed_4h[-50:]]
+                            lows  = [float(k[3]) for k in closed_4h[-50:]]
+                            vols  = [float(k[5]) for k in closed_4h[-50:]]
+                            avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else 1
+
+                            # Find swing highs/lows for zone suggestions
+                            swing_highs, swing_lows = [], []
+                            for i in range(3, len(closed_4h) - 3):
+                                h = float(closed_4h[i][2])
+                                l = float(closed_4h[i][3])
+                                v = float(closed_4h[i][5])
+                                if all(h >= float(closed_4h[i+j][2]) for j in [-3,-2,-1,1,2,3]):
+                                    swing_highs.append((h, v/avg_vol))
+                                if all(l <= float(closed_4h[i+j][3]) for j in [-3,-2,-1,1,2,3]):
+                                    swing_lows.append((l, v/avg_vol))
+
+                            # Cluster nearby levels
+                            def cluster(levels, tol=0.02):
+                                result, used = [], set()
+                                for i, (p, v) in enumerate(levels):
+                                    if i in used: continue
+                                    group = [(p, v)]
+                                    for j, (p2, v2) in enumerate(levels):
+                                        if j != i and j not in used and abs(p-p2)/p <= tol:
+                                            group.append((p2, v2))
+                                            used.add(j)
+                                    used.add(i)
+                                    avg_p = sum(x[0] for x in group)/len(group)
+                                    avg_v = sum(x[1] for x in group)/len(group)
+                                    result.append((avg_p, len(group), avg_v))
+                                return sorted(result, key=lambda x: -x[1])
+
+                            c_highs = cluster(swing_highs)
+                            c_lows  = cluster(swing_lows)
+
+                            # Support zones below price
+                            supports = [(p, t, v) for p, t, v in c_lows  if p < current_price * 0.99][:3]
+                            # Resistance lines above price
+                            resistances = [(p, t, v) for p, t, v in c_highs if p > current_price * 1.01][:3]
+
+                            lines_out = [f"📊 <b>Zone/Line Suggestions — {sym}</b>\n"]
+                            lines_out.append(f"💰 Current price: {format_price(current_price)}\n")
+
+                            if supports:
+                                lines_out.append("🟢 <b>Support Zones (addzone):</b>")
+                                for p, touches, vol_r in supports:
+                                    margin = p * 0.01
+                                    pct = (current_price - p) / current_price * 100
+                                    strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
+                                    lines_out.append(
+                                        f"{strength} ({touches}x tested, {vol_r:.1f}x vol)\n"
+                                        f"<code>/addzone {sym.replace('USDT','')} "
+                                        f"{format_price(p-margin)} {format_price(p+margin)} 4h</code>\n"
+                                        f"   → {pct:.1f}% below current price"
+                                    )
+
+                            if resistances:
+                                lines_out.append("\n📏 <b>Resistance Lines (addline):</b>")
+                                for p, touches, vol_r in resistances:
+                                    pct = (p - current_price) / current_price * 100
+                                    strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
+                                    lines_out.append(
+                                        f"{strength} ({touches}x tested)\n"
+                                        f"<code>/addline {sym.replace('USDT','')} {format_price(p)} 4h</code>\n"
+                                        f"   → {pct:.1f}% above, breakout target"
+                                    )
+
+                            # Situation summary
+                            change_24h = float(ticker["priceChangePercent"])
+                            trend = "📈 uptrend" if change_24h > 3 else "📉 downtrend" if change_24h < -3 else "↔️ ranging"
+                            lines_out.append(
+                                f"\n💡 <b>Current situation:</b>\n"
+                                f"   24h: {change_24h:+.1f}% — {trend}\n"
+                                f"   Nearest support: {format_price(supports[0][0]) if supports else 'N/A'}\n"
+                                f"   Nearest resistance: {format_price(resistances[0][0]) if resistances else 'N/A'}"
+                            )
+                            reply("\n\n".join(lines_out))
 
                 elif text == "/ZONES":
                     if not is_admin:
