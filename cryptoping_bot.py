@@ -4656,6 +4656,261 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def detect_fvg(klines, min_gap_pct=0.3):
+    """
+    Detects Fair Value Gaps (FVG) — a 3-candle pattern where candle 1's high
+    and candle 3's low don't overlap, leaving an unfilled gap. These act as
+    magnets for price to return and fill.
+
+    Bullish FVG: candle3 low > candle1 high (gap above)
+    Bearish FVG: candle3 high < candle1 low (gap below)
+
+    min_gap_pct: minimum gap size as % of price (filters out tiny gaps)
+    Returns list of FVGs, most recent first.
+    """
+    fvgs = []
+    closed = klines[:-1]
+    if len(closed) < 3:
+        return fvgs
+
+    for i in range(len(closed) - 2):
+        c1 = closed[i]
+        c3 = closed[i + 2]
+        c1_high = float(c1[2])
+        c1_low  = float(c1[3])
+        c3_high = float(c3[2])
+        c3_low  = float(c3[3])
+        mid_price = (c1_high + c3_low) / 2
+
+        # Bullish FVG
+        if c3_low > c1_high:
+            gap_pct = (c3_low - c1_high) / mid_price * 100
+            if gap_pct >= min_gap_pct:
+                fvgs.append({
+                    "type": "bullish", "top": c3_low, "bottom": c1_high,
+                    "mid": (c1_high + c3_low) / 2,
+                    "gap_pct": gap_pct, "candle_idx": i,
+                    "age": len(closed) - i - 2,
+                })
+        # Bearish FVG
+        elif c3_high < c1_low:
+            gap_pct = (c1_low - c3_high) / mid_price * 100
+            if gap_pct >= min_gap_pct:
+                fvgs.append({
+                    "type": "bearish", "top": c1_low, "bottom": c3_high,
+                    "mid": (c1_low + c3_high) / 2,
+                    "gap_pct": gap_pct, "candle_idx": i,
+                    "age": len(closed) - i - 2,
+                })
+
+    return list(reversed(fvgs))  # most recent first
+
+
+def detect_ifvg(klines, current_price):
+    """
+    iFVG (Inverse FVG) — when price enters a bearish FVG and bounces back up
+    (or enters a bullish FVG and drops), the FVG flips into a support/resistance
+    level. This is a high-probability setup from the iFVG framework.
+
+    Returns list of active iFVGs near current price.
+    """
+    fvgs = detect_fvg(klines)
+    closed = klines[:-1]
+    ifvgs = []
+
+    for fvg in fvgs[:10]:  # check last 10 FVGs
+        gap_top    = fvg["top"]
+        gap_bottom = fvg["bottom"]
+        gap_mid    = fvg["mid"]
+        fvg_type   = fvg["type"]
+        candle_idx = fvg["candle_idx"]
+
+        # Check if price has entered and exited the FVG (making it an iFVG)
+        entered = False
+        exited_bullishly = False
+        exited_bearishly = False
+
+        subsequent = closed[candle_idx + 2:]
+        for k in subsequent:
+            low  = float(k[3])
+            high = float(k[2])
+            close = float(k[4])
+            open_ = float(k[1])
+
+            if not entered:
+                if fvg_type == "bearish" and high >= gap_bottom:
+                    entered = True
+                elif fvg_type == "bullish" and low <= gap_top:
+                    entered = True
+            else:
+                if fvg_type == "bearish" and close > gap_top and close > open_:
+                    exited_bullishly = True
+                    break
+                elif fvg_type == "bullish" and close < gap_bottom and close < open_:
+                    exited_bearishly = True
+                    break
+
+        if entered and (exited_bullishly or exited_bearishly):
+            near = abs(current_price - gap_mid) / gap_mid <= 0.08  # within 8%
+            if near:
+                ifvgs.append({
+                    "type": "bullish_ifvg" if exited_bullishly else "bearish_ifvg",
+                    "top": gap_top, "bottom": gap_bottom, "mid": gap_mid,
+                    "gap_pct": fvg["gap_pct"],
+                    "original_fvg": fvg_type,
+                })
+
+    return ifvgs
+
+
+def detect_equal_highs_lows(klines, current_price, tolerance=0.015):
+    """
+    Equal Highs (EQH) and Equal Lows (EQL) — price levels that have been tested
+    multiple times at nearly the same price. These are liquidity pools:
+    - EQH above price: sell-side stops clustered there (sweep → drop or pump)
+    - EQL below price: buy-side stops clustered there (sweep → pump)
+
+    Returns dict with eq_highs and eq_lows lists.
+    """
+    closed = klines[:-1]
+    if len(closed) < 5:
+        return {"eq_highs": [], "eq_lows": []}
+
+    highs  = [float(k[2]) for k in closed[-30:]]
+    lows   = [float(k[3]) for k in closed[-30:]]
+
+    def find_equal_levels(prices, min_touches=2):
+        levels = []
+        used = set()
+        for i, p1 in enumerate(prices):
+            if i in used:
+                continue
+            group = [p1]
+            indices = [i]
+            for j, p2 in enumerate(prices):
+                if j != i and j not in used:
+                    if abs(p1 - p2) / p1 <= tolerance:
+                        group.append(p2)
+                        indices.append(j)
+            if len(group) >= min_touches:
+                for idx in indices:
+                    used.add(idx)
+                avg_price = sum(group) / len(group)
+                levels.append({
+                    "price": avg_price,
+                    "touches": len(group),
+                })
+        return sorted(levels, key=lambda x: x["touches"], reverse=True)
+
+    eq_highs_raw = find_equal_levels(highs)
+    eq_lows_raw  = find_equal_levels(lows)
+
+    # Filter: EQH above current price, EQL below
+    eq_highs = [l for l in eq_highs_raw if l["price"] > current_price * 1.005][:3]
+    eq_lows  = [l for l in eq_lows_raw  if l["price"] < current_price * 0.995][:3]
+
+    return {"eq_highs": eq_highs, "eq_lows": eq_lows}
+
+
+def analyze_ifvg_framework(symbol, current_price, tf="4h"):
+    """
+    Full iFVG framework analysis for /entry output:
+    1. FVG — nearby unfilled gaps (price magnets)
+    2. iFVG — flipped FVGs acting as S/R
+    3. Equal Highs/Lows — liquidity pools (sweep targets)
+    4. Delivery — is price delivering from an FVG or iFVG right now?
+
+    Returns formatted string to embed in /entry message.
+    """
+    klines = get_klines(symbol, interval=tf, limit=50)
+    klines_1h = get_klines(symbol, interval="1h", limit=50)
+    if not klines or len(klines) < 10:
+        return ""
+
+    parts = []
+
+    # ── FVGs ──
+    fvgs = detect_fvg(klines, min_gap_pct=0.3)
+    nearby_fvgs = [f for f in fvgs[:8]
+                   if abs(f["mid"] - current_price) / current_price <= 0.10]
+
+    if nearby_fvgs:
+        fvg_lines = ["📊 <b>Fair Value Gaps (FVG):</b>"]
+        for f in nearby_fvgs[:3]:
+            direction = "above" if f["mid"] > current_price else "below"
+            emoji = "🟢" if f["type"] == "bullish" else "🔴"
+            fvg_lines.append(
+                f"  {emoji} {f['type'].capitalize()} FVG {direction}: "
+                f"{format_price(f['bottom'])} — {format_price(f['top'])} "
+                f"({f['gap_pct']:.1f}% gap, {f['age']} candles ago)"
+            )
+        parts.append("\n".join(fvg_lines))
+
+    # ── iFVGs ──
+    ifvgs = detect_ifvg(klines, current_price)
+    if not ifvgs and klines_1h:
+        ifvgs = detect_ifvg(klines_1h, current_price)
+
+    if ifvgs:
+        ifvg_lines = ["🔄 <b>Inverse FVG (iFVG) — High Probability Setup:</b>"]
+        for iv in ifvgs[:2]:
+            direction = "support" if "bullish" in iv["type"] else "resistance"
+            ifvg_lines.append(
+                f"  ⭐ iFVG {direction}: {format_price(iv['bottom'])} — "
+                f"{format_price(iv['top'])} ({iv['gap_pct']:.1f}% zone)\n"
+                f"     Price previously swept this FVG and flipped it — "
+                f"high-confidence bounce zone."
+            )
+        parts.append("\n".join(ifvg_lines))
+
+    # ── Equal Highs/Lows ──
+    eql = detect_equal_highs_lows(klines, current_price)
+    eql_lines = []
+    if eql["eq_highs"]:
+        for h in eql["eq_highs"][:2]:
+            pct = (h["price"] - current_price) / current_price * 100
+            eql_lines.append(
+                f"  🎯 EQH: {format_price(h['price'])} "
+                f"(+{pct:.1f}%, {h['touches']}x touched) — "
+                f"sell-side liquidity, sweep target / TP level"
+            )
+    if eql["eq_lows"]:
+        for l in eql["eq_lows"][:2]:
+            pct = (current_price - l["price"]) / current_price * 100
+            eql_lines.append(
+                f"  🎯 EQL: {format_price(l['price'])} "
+                f"(-{pct:.1f}%, {l['touches']}x touched) — "
+                f"buy-side liquidity, sweep target / SL zone"
+            )
+    if eql_lines:
+        parts.append("📍 <b>Equal Highs/Lows (Liquidity Pools):</b>\n" + "\n".join(eql_lines))
+
+    # ── Delivery check ──
+    # Is price currently delivering from a nearby FVG/iFVG?
+    delivery_note = ""
+    if ifvgs:
+        iv = ifvgs[0]
+        if iv["bottom"] <= current_price <= iv["top"] * 1.02:
+            delivery_note = (
+                f"🚀 <b>Delivery Active</b> — price is currently inside/near "
+                f"the iFVG zone ({format_price(iv['bottom'])}–{format_price(iv['top'])}). "
+                f"This is a high-conviction entry zone per the iFVG framework."
+            )
+        elif current_price > iv["top"] and "bullish" in iv["type"]:
+            delivery_note = (
+                f"📦 <b>Post-delivery</b> — price has delivered out of the iFVG "
+                f"({format_price(iv['bottom'])}–{format_price(iv['top'])}). "
+                f"Wait for a pullback to the iFVG zone for re-entry."
+            )
+    if delivery_note:
+        parts.append(delivery_note)
+
+    if not parts:
+        return ""
+
+    return "🔬 <b>iFVG Framework Analysis:</b>\n\n" + "\n\n".join(parts)
+
+
 def get_order_book_clusters(symbol, depth=100):
     """
     Fetches Binance order book and finds significant bid/ask clusters —
@@ -4681,7 +4936,7 @@ def get_order_book_clusters(symbol, depth=100):
         current_price = bids[0][0]  # best bid ≈ current
 
         # Find significant walls (clusters with large USDT value)
-        def find_walls(orders, min_usdt=50000):
+        def find_walls(orders, min_usdt=10000):  # lowered from 50K — catches small/mid cap walls
             walls = []
             for price, qty in orders:
                 usdt_val = price * qty
@@ -4711,23 +4966,25 @@ def get_order_book_clusters(symbol, depth=100):
 
 
 def format_order_flow_block(ob_data, current_price):
-    """Formats order flow data for embedding in messages."""
+    """Formats order flow data for embedding in messages.
+    Returns empty string if nothing meaningful to show."""
     if not ob_data:
         return ""
 
-    lines = ["💧 <b>Order Flow (Live Order Book):</b>"]
+    lines = []
 
-    if ob_data["sell_walls"]:
+    # Only show walls with meaningful size
+    if ob_data.get("sell_walls"):
         for w in ob_data["sell_walls"][:2]:
             lines.append(f"  🔴 Sell wall: {format_price(w['price'])} "
                         f"({w['usdt']/1000:.0f}K USDT)")
 
-    if ob_data["buy_walls"]:
+    if ob_data.get("buy_walls"):
         for w in ob_data["buy_walls"][:2]:
             lines.append(f"  🟢 Buy wall: {format_price(w['price'])} "
                         f"({w['usdt']/1000:.0f}K USDT)")
 
-    if ob_data["liq_zone"]:
+    if ob_data.get("liq_zone"):
         lz = ob_data["liq_zone"]
         pct_away = (current_price - lz["price"]) / current_price * 100
         lines.append(
@@ -4737,10 +4994,12 @@ def format_order_flow_block(ob_data, current_price):
             f"   If price sweeps this level with volume then reclaims → "
             f"strong pump likely."
         )
-    else:
-        lines.append("\n⚡ No significant liquidation zone detected nearby.")
 
-    return "\n".join(lines)
+    # Only return block if we have something useful to show
+    if not lines:
+        return ""
+
+    return "💧 <b>Order Flow (Live Order Book):</b>\n" + "\n".join(lines)
 
 
 # ── Liquidation sweep tracker ─────────────────────────────
@@ -5673,11 +5932,14 @@ def check_retest_watches():
             # Order flow — add live order book data to retest message
             ob_watch = get_order_book_clusters(symbol)
             of_watch = format_order_flow_block(ob_watch, current_price) if ob_watch else ""
+            # iFVG framework
+            ifvg_watch = analyze_ifvg_framework(symbol, current_price, tf=tf if tf in ("4h","1d") else "4h")
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
                 f"{pattern_note}\n\n"
                 + (f"{full_confluence_watch}\n\n" if full_confluence_watch else "") +
+                (f"{ifvg_watch}\n\n" if ifvg_watch else "") +
                 (f"{of_watch}\n\n" if of_watch else "") +
                 f"{suggestion}\n\n"
                 f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
@@ -6658,6 +6920,9 @@ def handle_commands():
                             ob_data = get_order_book_clusters(sym)
                             of_block = format_order_flow_block(ob_data, result["price"]) if ob_data else ""
 
+                            # iFVG framework — FVG, iFVG, Equal Highs/Lows, Delivery
+                            ifvg_block = analyze_ifvg_framework(sym, result["price"], tf="4h")
+
                             reply(
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
@@ -6665,7 +6930,8 @@ def handle_commands():
                                 f"{details_str}\n"
                                 f"{pattern_section}"
                                 f"{patterns_section}\n"
-                                f"{of_block}\n\n"
+                                + (f"{ifvg_block}\n\n" if ifvg_block else "") +
+                                (f"{of_block}\n\n" if of_block else "") +
                                 f"{entry_suggestion}\n\n"
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
