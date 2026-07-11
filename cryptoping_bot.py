@@ -1581,7 +1581,7 @@ def check_gradual_buildup(symbol, tf, klines):
     live_moving = price > f_open * 1.01 and f_vol > baseline_avg * 2.0
     live_tag = "⚡ <b>LIVE — forming candle already moving!</b>\n" if live_moving else ""
 
-    send_to_topic(TOPIC_HIGH,
+    send_to_topic(TOPIC_BUILDUPS,
         f"🌊 <b>GRADUAL BUILDUP DETECTED [{tf.upper()}]</b>\n\n"
         f"🪙 <b>{symbol}</b>\n"
         f"💰 Price: {format_price(price)}\n"
@@ -1660,7 +1660,7 @@ def check_range_breakout(symbol, tf, klines):
             range_breakout_alerted[alerted_key] = now
             range_breakout_tracking.pop(symbol, None)
             breakout_pct = (current_price - range_high) / range_high * 100
-            send_to_topic(TOPIC_HIGH,
+            send_to_topic(TOPIC_BUILDUPS,
                 f"🚀 <b>RANGE BREAKOUT CONFIRMED [1H→4H]</b>\n\n"
                 f"🪙 <b>{symbol}</b>\n"
                 f"💰 Price: {format_price(current_price)}\n"
@@ -1724,7 +1724,7 @@ def check_range_breakout(symbol, tf, klines):
     if live_crossed:
         range_breakout_alerted[live_key] = now
         breakout_pct_live = (current_price - range_high) / range_high * 100
-        send_to_topic(TOPIC_HIGH,
+        send_to_topic(TOPIC_BUILDUPS,
             f"⚡ <b>RANGE BREAKOUT — LIVE [{tf.upper()}]</b>\n\n"
             f"🪙 <b>{symbol}</b>\n"
             f"💰 Price: {format_price(current_price)} (+{breakout_pct_live:.1f}% above range)\n"
@@ -1772,7 +1772,7 @@ def check_range_breakout(symbol, tf, klines):
             return
         range_breakout_alerted[alerted_key] = now
         breakout_pct = (l_close - range_high) / range_high * 100
-        send_to_topic(TOPIC_HIGH,
+        send_to_topic(TOPIC_BUILDUPS,
             f"🚀 <b>RANGE BREAKOUT [4H]</b>\n\n"
             f"🪙 <b>{symbol}</b>\n"
             f"💰 Price: {format_price(current_price)}\n"
@@ -3258,7 +3258,7 @@ def check_explosive_pump(symbol):
     )
     sent = send_all(msg, symbol=symbol)
     if sent and high_potential:
-        send_to_topic(TOPIC_HIGH, msg)
+        send_to_topic(TOPIC_BUILDUPS, msg)
     if sent:
         print(f"💥 Explosive pump: {symbol} (+{gain_pct:.1f}% in 3 candles) | FT score: {ft_score}")
         signal_performance[f"{symbol}_explosive_{int(now)}"] = {
@@ -3416,7 +3416,7 @@ def send_entry_exit(symbol, entry_price, klines_4h):
         f"🎯 TP3: {format_price(tp3)} (+{tp3_pct:.1f}%) [4R]\n\n"
         f"📐 ATR(14): {format_price(atr)}"
     )
-    send_to_topic(TOPIC_HIGH, msg)
+    send_to_topic(TOPIC_BUILDUPS, msg)
     send_to(ADMIN_CHAT_ID, msg)
 
 # Pre-pump phase tracking
@@ -3705,6 +3705,8 @@ def auto_update_watchlist():
             if vol_usd < 500_000:
                 continue
             if sym in watchlist:
+                continue
+            if sym in removed_coins:  # never re-add manually removed coins
                 continue
             new_coins.append((sym, chg, vol_usd))
 
@@ -4083,7 +4085,7 @@ def check_timeframe(symbol, tf):
     )
     sent = send_all(msg, symbol=symbol)
     if sent and high_potential:
-        send_to_topic(TOPIC_HIGH, msg)  # escalate — separate from normal Spikes topic
+        send_to_topic(TOPIC_BUILDUPS, msg)  # escalate to Building Momentum
     if sent:
         print(f"✅ [{cfg['label']}] Spike: {symbol} ({ratio:.1f}x) | FT score: {ft_score}{' [DISTRIBUTION WARNING]' if is_distribution_warning else ''}")
         signal_performance[f"{symbol}_spike_{tf}_{int(now)}"] = {
@@ -4632,7 +4634,7 @@ def calc_entry_score(symbol):
     )
     sent = send_all(msg, symbol=symbol)
     if sent and high_potential:
-        send_to_topic(TOPIC_HIGH, msg)  # escalate — separate from normal Spikes topic
+        send_to_topic(TOPIC_BUILDUPS, msg)  # escalate to Building Momentum
     if sent:
         print(f"✅ [{cfg['label']}] Spike: {symbol} ({ratio:.1f}x) | FT score: {ft_score}{' [DISTRIBUTION WARNING]' if is_distribution_warning else ''}")
         signal_performance[f"{symbol}_spike_{tf}_{int(now)}"] = {
@@ -6078,28 +6080,26 @@ def check_retest_watches():
 
 def auto_cleanup_poor_performers():
     """
-    Weekly cost-control feature: removes "extra" (non-default) watchlist coins
-    that HAD a signal in the last 7 days but never reached +20% gain on any of
-    them. This is intentionally conservative:
-      - DEFAULT_WATCHLIST coins are NEVER touched — only coins added later
-        (manually or via auto-watchlist-update) are eligible for removal.
-      - A coin with ZERO signals in the last 7 days is left alone — no signal
-        doesn't mean "bad coin", it might just mean no setup has formed yet.
-        Only coins that DID get a signal but underperformed get removed.
-    This directly reduces ongoing API call volume (fewer coins to scan every
-    cycle), which is the main lever for keeping Railway costs down.
+    Bi-weekly cleanup: removes extra watchlist coins that haven't performed.
+    - Window: 15 days (was 7)
+    - Threshold: 10% gain (was 20%)
+    - Fundamental filter: if coin has good market cap (high 24h volume proxy),
+      extends window to 30 days before removing
+    - DEFAULT_WATCHLIST coins never touched
+    - Coins with zero signals left alone
     """
     now = time.time()
-    cutoff = now - 7 * 86400
+    cutoff_15d = now - 15 * 86400
+    cutoff_30d = now - 30 * 86400
     extra_coins = [c for c in watchlist if c not in DEFAULT_WATCHLIST]
     if not extra_coins:
         return
 
-    # Build a per-symbol best-gain-in-window map from signal_performance
+    # Build per-symbol best-gain map
     best_gain = {}
     has_recent_signal = set()
     for data in signal_performance.values():
-        if data.get("signal_time", 0) < cutoff:
+        if data.get("signal_time", 0) < cutoff_30d:
             continue
         symbol = data.get("symbol")
         if not symbol:
@@ -6111,26 +6111,56 @@ def auto_cleanup_poor_performers():
             gain_pct = (highest - signal_price) / signal_price * 100
             best_gain[symbol] = max(best_gain.get(symbol, 0), gain_pct)
 
+    # Get volume data for fundamental filter
+    high_vol_coins = set()
+    try:
+        ticker = get_ticker("BTCUSDT")  # just to warm up cache
+        for sym in extra_coins:
+            t = get_ticker(sym)
+            if t and float(t.get("quoteVolume", 0)) >= 5_000_000:
+                high_vol_coins.add(sym)
+    except:
+        pass
+
     to_remove = []
     for symbol in extra_coins:
-        if symbol in has_recent_signal and best_gain.get(symbol, 0) < 20.0:
-            to_remove.append((symbol, best_gain.get(symbol, 0)))
+        if symbol not in has_recent_signal:
+            continue  # no signal = leave alone
+
+        gain = best_gain.get(symbol, 0)
+        if gain >= 10.0:
+            continue  # performed well, keep
+
+        # Fundamental filter: high volume coins get 30 days
+        has_recent_15d = any(
+            d.get("symbol") == symbol and d.get("signal_time", 0) >= cutoff_15d
+            for d in signal_performance.values()
+        )
+        if symbol in high_vol_coins and not has_recent_15d:
+            continue  # high volume coin, give it 30 days
+
+        # Remove if: had signal in 15d window + under 10% gain
+        if has_recent_15d and gain < 10.0:
+            to_remove.append((symbol, gain))
 
     if not to_remove:
         return
 
     for symbol, gain in to_remove:
-        watchlist.remove(symbol)
+        if symbol in watchlist:
+            watchlist.remove(symbol)
+        removed_coins.add(symbol)
     save_watchlist_file()
+    save_removed_coins()
 
     lines = [f"• {sym} (best: {gain:+.1f}%)" for sym, gain in to_remove]
     send_to(ADMIN_CHAT_ID,
-        f"🧹 <b>Weekly Cleanup</b>\n\n"
-        f"Removed {len(to_remove)} coin(s) that had signals in the last 7 days "
-        f"but never reached +20%:\n\n" + "\n".join(lines) +
+        f"🧹 <b>15-Day Cleanup</b>\n\n"
+        f"Removed {len(to_remove)} coin(s) — had signals but didn't reach 10% in 15 days:\n\n"
+        + "\n".join(lines) +
         f"\n\nTotal watchlist: {len(watchlist)} coins"
     )
-    print(f"🧹 Auto-cleanup removed {len(to_remove)} coins: {[s for s, _ in to_remove]}")
+    print(f"🧹 Auto-cleanup removed {len(to_remove)} coins")
 
 _btc_condition = {
     "state": "neutral",        # "neutral" | "warning" | "bearish"
@@ -6241,6 +6271,210 @@ _last_watchlist_validate = 0
 _vol_accum_alerted  = {}  # {symbol: last_alert_time}
 _postpump_retest_alerted = {}  # {symbol: last_alert_time}
 
+_global_liq_alerted = {}  # {symbol: last_alert_time}
+
+def scan_global_liq_reclaim():
+    """
+    Scans all watchlist coins every 2 minutes for liquidity sweep + reclaim.
+    Uses 5M klines (fast detection) + ticker for volume confirmation.
+    When sweep + reclaim detected → fires to High Priority with full SMC
+    confluence analysis, TP scaled to volume size, and zone/line suggestions.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        if now - _global_liq_alerted.get(symbol, 0) < 6 * 3600:
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            change_24h = float(ticker["priceChangePercent"])
+
+            klines_5m = get_klines(symbol, interval="5m", limit=20)
+            klines_1h = get_klines(symbol, interval="1h", limit=30)
+            if not klines_5m or len(klines_5m) < 10:
+                continue
+
+            closed_5m = klines_5m[:-1]
+            vols_5m = [float(k[5]) for k in closed_5m]
+            avg_vol_5m = sum(vols_5m[-10:-3]) / 7 if len(vols_5m) >= 10 else 1
+
+            # Find a recent sweep candle (wicked below then recovered)
+            sweep_candle = None
+            sweep_low = None
+            sweep_vol_ratio = 0
+
+            for k in reversed(closed_5m[-8:]):
+                k_low   = float(k[3])
+                k_close = float(k[4])
+                k_open  = float(k[1])
+                k_vol   = float(k[5])
+                k_high  = float(k[2])
+                candle_range = k_high - k_low
+                lower_wick = min(k_close, k_open) - k_low
+                if candle_range <= 0:
+                    continue
+                wick_ratio = lower_wick / candle_range
+                vol_r = k_vol / avg_vol_5m if avg_vol_5m > 0 else 0
+
+                # Sweep: long lower wick + reclaim above open + volume
+                if wick_ratio >= 0.45 and k_close > k_open and vol_r >= 2.0:
+                    sweep_candle = k
+                    sweep_low = k_low
+                    sweep_vol_ratio = vol_r
+                    break
+
+            if not sweep_candle:
+                continue
+
+            # Confirm: current price still above sweep low + positive momentum
+            if current_price < sweep_low * 1.001:
+                continue
+            if change_24h < -3:
+                continue
+
+            # ── SMC Confluence ──
+            confluence = []
+            daily_down = is_daily_downtrend(symbol, current_price)
+            if not daily_down:
+                confluence.append("✅ Daily trend bullish/neutral")
+            else:
+                confluence.append("⚠️ Daily trend bearish — lower confidence")
+
+            # Higher lows on 1H
+            if klines_1h and len(klines_1h) >= 10:
+                lows_1h = [float(k[3]) for k in klines_1h[-8:-1]]
+                hl_count = sum(1 for i in range(1, len(lows_1h)) if lows_1h[i] > lows_1h[i-1] * 1.002)
+                if hl_count >= 3:
+                    confluence.append("✅ Higher lows forming (1H)")
+
+            # OB zone nearby
+            klines_4h = get_klines(symbol, interval="4h", limit=20)
+            ob_zone = None
+            if klines_4h and len(klines_4h) >= 5:
+                closed_4h = klines_4h[:-1]
+                for k in reversed(closed_4h[-10:]):
+                    k_open  = float(k[1])
+                    k_close = float(k[4])
+                    k_low   = float(k[3])
+                    k_high  = float(k[2])
+                    k_vol   = float(k[5])
+                    avg_v4h = sum(float(x[5]) for x in closed_4h[-8:]) / 8
+                    if (k_close > k_open and k_vol >= avg_v4h * 1.5 and
+                            k_low <= current_price <= k_high * 1.05):
+                        ob_zone = (k_low, k_high)
+                        confluence.append(f"✅ 4H OB zone: {format_price(k_low)}–{format_price(k_high)}")
+                        break
+
+            # FVG support
+            if klines_1h and len(klines_1h) >= 5:
+                fvgs = detect_fvg(klines_1h, min_gap_pct=0.2)
+                nearby_bull = [f for f in fvgs if f["type"] == "bullish"
+                               and f["bottom"] < current_price
+                               and f["top"] > current_price * 0.97]
+                if nearby_bull:
+                    confluence.append(f"✅ FVG support: {format_price(nearby_bull[0]['bottom'])}–{format_price(nearby_bull[0]['top'])}")
+
+            # Equal lows (liquidity pool that got swept)
+            if klines_1h and len(klines_1h) >= 5:
+                eql_data = detect_equal_highs_lows(klines_1h, current_price)
+                swept_eql = [l for l in eql_data["eq_lows"]
+                             if sweep_low and abs(l["price"] - sweep_low) / sweep_low <= 0.02]
+                if swept_eql:
+                    confluence.append(f"✅ EQL swept: {format_price(swept_eql[0]['price'])} ({swept_eql[0]['touches']}x tested) — stops cleared")
+
+            # Skip if too weak (daily downtrend + no positive confluence)
+            pos_confluence = sum(1 for c in confluence if c.startswith("✅"))
+            if daily_down and pos_confluence < 2:
+                continue
+            if pos_confluence < 1:
+                continue
+
+            # ── TP scaling based on volume ──
+            if sweep_vol_ratio >= 15:
+                tp1_pct, tp2_pct = 0.07, 0.25
+                vol_label = "🔥 Extreme (institutional)"
+                pump_est = "25-40%+ potential"
+            elif sweep_vol_ratio >= 8:
+                tp1_pct, tp2_pct = 0.05, 0.18
+                vol_label = "⚡ Strong"
+                pump_est = "15-25% potential"
+            elif sweep_vol_ratio >= 4:
+                tp1_pct, tp2_pct = 0.05, 0.12
+                vol_label = "📊 Moderate"
+                pump_est = "8-15% potential"
+            else:
+                tp1_pct, tp2_pct = 0.05, 0.08
+                vol_label = "⚠️ Weak"
+                pump_est = "5-10% potential — watch closely"
+
+            # Trendline sweep confluence
+            tl_note = check_trendline_sweep_confluence(symbol, current_price, tf="1h")
+            if tl_note:
+                confluence.append("✅ Trendline liquidity sweep (additional confluence)")
+
+            entry = current_price
+            sl = sweep_low * 0.985
+            tp1 = entry * (1 + tp1_pct)
+            tp2 = entry * (1 + tp2_pct)
+            risk = (entry - sl) / entry * 100
+            rr = tp1_pct * 100 / risk if risk > 0 else 0
+
+            # ── Zone/Line suggestions ──
+            suggest_lines = []
+            # Resistance above (future entry/breakout lines)
+            if klines_4h:
+                closed_4h_s = klines_4h[:-1]
+                highs_4h = sorted(set(
+                    float(k[2]) for k in closed_4h_s
+                    if float(k[2]) > current_price * 1.01
+                ), key=lambda x: abs(x - current_price))[:3]
+                for h in highs_4h[:2]:
+                    suggest_lines.append(f"<code>/addline {symbol.replace('USDT','')} {format_price(h)} 4h</code> — resistance target")
+
+            # Support zones below
+            if klines_4h:
+                lows_4h = []
+                for i in range(3, len(closed_4h_s) - 2):
+                    l = float(closed_4h_s[i][3])
+                    if all(l <= float(closed_4h_s[i+j][3]) for j in [-2,-1,1,2]) and l < current_price * 0.97:
+                        lows_4h.append(l)
+                if lows_4h:
+                    best_low = min(lows_4h, key=lambda x: abs(x - current_price * 0.95))
+                    margin = best_low * 0.01
+                    suggest_lines.append(
+                        f"<code>/addzone {symbol.replace('USDT','')} {format_price(best_low-margin)} {format_price(best_low+margin)} 4h</code> — next support"
+                    )
+
+            confluence_str = "\n   ".join(confluence)
+            suggest_str = ("\n📏 <b>Monitor these levels:</b>\n" + "\n".join(f"  {s}" for s in suggest_lines)) if suggest_lines else ""
+
+            _global_liq_alerted[symbol] = now
+            send_to_topic(TOPIC_HIGH,
+                f"🔥 <b>LIQUIDITY RECLAIM — {symbol}</b>\n\n"
+                f"💧 Swept: {format_price(sweep_low)} on {sweep_vol_ratio:.1f}x volume → reclaimed ✅\n"
+                f"💰 Price: {format_price(current_price)} | 24h: {change_24h:+.1f}%\n"
+                f"🔊 Volume: {vol_label}\n"
+                f"📈 Pump estimate: {pump_est}\n\n"
+                f"📊 <b>SMC Confluence ({pos_confluence}/{len(confluence)} signals):</b>\n   "
+                + "\n   ".join(confluence) +
+                f"\n\n📐 <b>Trade Plan:</b>\n"
+                f"   💰 Entry: {format_price(entry)}\n"
+                f"   🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
+                f"   🟢 TP1: {format_price(tp1)} (+{tp1_pct*100:.0f}%)\n"
+                f"   🟢 TP2: {format_price(tp2)} (+{tp2_pct*100:.0f}%)\n"
+                f"   ⚖️ R/R: {rr:.1f}x\n"
+                + suggest_str +
+                f"\n\n⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
+            )
+            track_building_signal(symbol, "Liquidity Reclaim", current_price)
+            print(f"🔥 Global liq reclaim: {symbol} vol={sweep_vol_ratio:.1f}x")
+
+        except Exception as e:
+            print(f"Global liq scan error {symbol}: {e}")
+
+
 _reversal_pump_alerted = {}  # {symbol: last_alert_time}
 
 def scan_reversal_pumps():
@@ -6294,7 +6528,7 @@ def scan_reversal_pumps():
 
             if is_reversal:
                 _reversal_pump_alerted[symbol] = now
-                send_to_topic(TOPIC_HIGH,
+                send_to_topic(TOPIC_BUILDUPS,
                     f"🔄 <b>REVERSAL PUMP — {symbol}</b>\n\n"
                     f"💰 Price: {format_price(current_price)} (+{change_24h:.1f}% 24h)\n"
                     f"📈 1H candle: +{price_move:.1f}%\n"
@@ -6347,7 +6581,7 @@ def scan_volume_accumulation():
 
             current_price = float(ticker["lastPrice"])
             _vol_accum_alerted[symbol] = now
-            send_to_topic(TOPIC_HIGH,
+            send_to_topic(TOPIC_BUILDUPS,
                 f"🔍 <b>VOLUME ACCUMULATION — {symbol}</b>\n\n"
                 f"💰 Price: {format_price(current_price)} ({float(ticker['priceChangePercent']):+.1f}% 24h)\n"
                 f"📈 Volume {vol_ratio:.1f}x above baseline — rising steadily\n"
@@ -6419,19 +6653,28 @@ def scan_postpump_retest():
             print(f"Post-pump scan error {symbol}: {e}")
 
 
+_last_watchlist_validate = 0  # 0 = run immediately on first check
+
 def auto_validate_watchlist():
     """
-    Runs every 24h. Checks every coin in the watchlist against Binance's
-    ticker endpoint — if a coin returns 400/404 (not found, delisted, or
-    never existed on Binance spot), it's automatically removed permanently
-    via the same removed_coins mechanism as /remove, and the admin gets
-    a single DM summary of what was cleaned up.
+    Runs at startup and then every 12h (reduced from 24h).
+    Checks every coin against Binance API — removes invalid/delisted ones permanently.
+    Also ensures removed_coins are filtered from watchlist on every run.
     """
     global _last_watchlist_validate
     now = time.time()
-    if now - _last_watchlist_validate < 24 * 3600:
+    if now - _last_watchlist_validate < 12 * 3600:
         return
     _last_watchlist_validate = now
+
+    # First: re-apply removed_coins filter to watchlist in case any slipped back
+    before = len(watchlist)
+    for coin in list(removed_coins):
+        if coin in watchlist:
+            watchlist.remove(coin)
+    if len(watchlist) < before:
+        save_watchlist_file()
+        print(f"🗑 Re-applied removed_coins filter: removed {before - len(watchlist)} coins")
 
     print("🔍 Auto-validating watchlist against Binance...")
     invalid = []
@@ -6954,32 +7197,33 @@ def handle_commands():
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
 
-                elif text == "/LIST":
-                    coin_lines = [f"• {c}" for c in watchlist]
-                    send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
-
-                # ── Command shortcuts ──────────────────────────────
-                # /e → /entry, /w → /watch, /s → /suggest,
-                # /u → /unwatch, /z → /zones, /ml → /mylines
-                elif text.startswith("/E ") or text == "/E":
-                    raw_text = raw_text.replace("/e ", "/entry ", 1).replace("/E ", "/entry ", 1)
+                # ── Command shortcuts — normalize before command handling ──
+                if text.startswith("/E ") and not text.startswith("/ENTRY"):
+                    raw_text = "/entry " + raw_text[3:]
                     text = raw_text.upper()
-                    # fall through handled below by re-checking
-                elif text.startswith("/W ") or text == "/W":
-                    raw_text = raw_text.replace("/w ", "/watch ", 1).replace("/W ", "/watch ", 1)
+                elif text == "/E":
+                    text = "/ENTRY"
+                elif text.startswith("/W ") and not text.startswith("/WATCH"):
+                    raw_text = "/watch " + raw_text[3:]
                     text = raw_text.upper()
-                elif text.startswith("/S ") or text == "/S":
-                    raw_text = raw_text.replace("/s ", "/suggest ", 1).replace("/S ", "/suggest ", 1)
+                elif text == "/W":
+                    text = "/WATCH"
+                elif text.startswith("/S ") and not text.startswith("/SUGGEST") and not text.startswith("/STATUS") and not text.startswith("/SUBSCRIBE"):
+                    raw_text = "/suggest " + raw_text[3:]
                     text = raw_text.upper()
-                elif text.startswith("/U ") or text == "/U":
-                    raw_text = raw_text.replace("/u ", "/unwatch ", 1).replace("/U ", "/unwatch ", 1)
+                elif text.startswith("/U ") and not text.startswith("/UNWATCH"):
+                    raw_text = "/unwatch " + raw_text[3:]
                     text = raw_text.upper()
                 elif text == "/Z":
                     text = "/ZONES"
                 elif text == "/ML":
                     text = "/MYLINES"
 
-                if text.startswith("/ENTRY "):
+                if text == "/LIST":
+                    coin_lines = [f"• {c}" for c in watchlist]
+                    send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
+
+                elif text.startswith("/ENTRY "):
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
                     if not sym_raw:
                         reply( "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
@@ -7696,8 +7940,8 @@ def handle_commands():
                             lines_out.append(f"💰 Current price: {format_price(current_price)}\n")
 
                             if supports:
-                                lines_out.append("🟢 <b>Support Zones (addzone):</b>")
-                                for p, touches, vol_r in supports:
+                                lines_out.append("🟢 <b>Support Zones below (addzone):</b>")
+                                for p, touches, vol_r in supports[:2]:
                                     margin = p * 0.01
                                     pct = (current_price - p) / current_price * 100
                                     strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
@@ -7705,18 +7949,20 @@ def handle_commands():
                                         f"{strength} ({touches}x tested, {vol_r:.1f}x vol)\n"
                                         f"<code>/addzone {sym.replace('USDT','')} "
                                         f"{format_price(p-margin)} {format_price(p+margin)} 4h</code>\n"
-                                        f"   → {pct:.1f}% below current price"
+                                        f"   → {pct:.1f}% below — bounce/entry zone"
                                     )
 
-                            if resistances:
-                                lines_out.append("\n📏 <b>Resistance Lines (addline):</b>")
-                                for p, touches, vol_r in resistances:
+                            # Resistance ZONES above (for future breakout entries)
+                            res_zones = [(p, t, v) for p, t, v in c_highs if p > current_price * 1.005][:3]
+                            if res_zones:
+                                lines_out.append("\n🔴 <b>Resistance Zones above (addline for breakout):</b>")
+                                for p, touches, vol_r in res_zones[:2]:
                                     pct = (p - current_price) / current_price * 100
                                     strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
                                     lines_out.append(
                                         f"{strength} ({touches}x tested)\n"
                                         f"<code>/addline {sym.replace('USDT','')} {format_price(p)} 4h</code>\n"
-                                        f"   → {pct:.1f}% above, breakout target"
+                                        f"   → {pct:.1f}% above — breakout entry / TP target"
                                     )
 
                             # Situation summary
@@ -7949,7 +8195,8 @@ def main():
         while True:
             try:
                 scan_volume_accumulation()
-                scan_reversal_pumps()  # downtrend coins with extreme volume
+                scan_reversal_pumps()
+                scan_global_liq_reclaim()  # all-coin liq sweep → High Priority
             except Exception as e:
                 print(f"Vol accum scan error: {e}")
             time.sleep(120)  # every 2 minutes, but internal cooldown is 8h per coin
@@ -7989,7 +8236,7 @@ def main():
                     if range_high and current_price > range_high * 1.001:
                         pct = (current_price - range_high) / range_high * 100
                         range_breakout_alerted[live_key] = now_f
-                        send_to_topic(TOPIC_HIGH,
+                        send_to_topic(TOPIC_BUILDUPS,
                             f"⚡ <b>RANGE BREAKOUT — LIVE [1H]</b>\n\n"
                             f"🪙 <b>{symbol}</b>\n"
                             f"💰 Price: {format_price(current_price)} (+{pct:.1f}% above range)\n"
