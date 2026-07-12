@@ -7697,7 +7697,7 @@ def handle_commands():
                     text = raw_text.upper()
                 elif text == "/Z":
                     text = "/ZONES"
-                elif text == "/ML":
+                elif text == "/ML" or text == "/MYLINE":
                     text = "/MYLINES"
 
                 if text == "/LIST":
@@ -8272,6 +8272,54 @@ def handle_commands():
                                         )
                                         save_zones()
                                         print(f"📐 Zone added: {zone_id}")
+
+                                        # Suggest nearby zones above and below
+                                        try:
+                                            ticker_s = get_ticker(sym)
+                                            klines_s = get_klines(sym, interval="4h", limit=80)
+                                            klines_1d_s = get_klines(sym, interval="1d", limit=30)
+                                            if ticker_s and klines_s:
+                                                cp = float(ticker_s["lastPrice"])
+                                                closed_s = klines_s[:-1]
+                                                all_highs, all_lows = [], []
+                                                for k in closed_s[-50:]:
+                                                    all_highs.append(float(k[2]))
+                                                    all_lows.append(float(k[3]))
+                                                if klines_1d_s:
+                                                    for k in klines_1d_s[-20:]:
+                                                        all_highs.append(float(k[2]))
+                                                        all_lows.append(float(k[3]))
+
+                                                # Zones above current price
+                                                above = sorted(set(
+                                                    round(h, 8) for h in all_highs
+                                                    if h > z_high * 1.01
+                                                ))[:3]
+                                                # Zones below current price
+                                                below = sorted(set(
+                                                    round(l, 8) for l in all_lows
+                                                    if l < z_low * 0.99
+                                                ), reverse=True)[:2]
+
+                                                suggest_parts = []
+                                                if above:
+                                                    suggest_parts.append("📏 <b>Next zones to add:</b>")
+                                                for h in above:
+                                                    m = h * 0.012
+                                                    pct = (h - cp) / cp * 100
+                                                    suggest_parts.append(
+                                                        f"🔴 <code>/addzone {sym.replace('USDT','')} {format_price(h-m)} {format_price(h+m)} 4h</code> (+{pct:.1f}% — resistance/TP)"
+                                                    )
+                                                for l in below:
+                                                    m = l * 0.012
+                                                    pct = (cp - l) / cp * 100
+                                                    suggest_parts.append(
+                                                        f"🟢 <code>/addzone {sym.replace('USDT','')} {format_price(l-m)} {format_price(l+m)} 4h</code> (-{pct:.1f}% — support/SL area)"
+                                                    )
+                                                if suggest_parts:
+                                                    reply("\n".join(suggest_parts))
+                                        except Exception as se:
+                                            print(f"Zone suggest error: {se}")
                                 except ValueError:
                                     reply( "⚠️ Format: /addzone RIF 0.0665 0.0703 4H")
                         else:
@@ -8465,13 +8513,13 @@ def handle_commands():
                             if res_zones:
                                 lines_out.append("\n🔴 <b>Resistance Zones above:</b>")
                                 for p, touches, vol_r in res_zones[:3]:
-                                    margin = p * 0.012  # 1.2% zone margin
+                                    margin = p * 0.012
                                     pct = (p - current_price) / current_price * 100
                                     strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
+                                    sym_short = sym.replace('USDT','')
                                     lines_out.append(
                                         f"{strength} ({touches}x tested, {vol_r:.1f}x vol)\n"
-                                        f"<code>/addzone {sym.replace('USDT','')} "
-                                        f"{format_price(p-margin)} {format_price(p+margin)} 4h</code>\n"
+                                        f"<code>/addzone {sym_short} {format_price(p-margin)} {format_price(p+margin)} 4h</code>\n"
                                         f"   → {pct:.1f}% above — resistance / TP target"
                                     )
 
