@@ -5060,6 +5060,136 @@ def format_order_flow_block(ob_data, current_price):
 # {symbol: {liq_price, liq_usdt, entry_price, chat_id, started, swept, sweep_time}}
 _liq_watch = {}
 
+# Entry watch — tracks weak setups after /entry, monitors for improvement
+# {symbol: {chat_id, entry_price, started, weak_reasons, entry_analysis,
+#           vol_alerted, retest_alerted, trend_alerted, expires}}
+_entry_watch = {}
+
+def start_entry_watch(symbol, chat_id, entry_price, weak_reasons, entry_analysis):
+    """
+    Starts background monitoring after /entry when setup is weak.
+    Monitors for: volume spike, retest confirm, daily trend shift, liq sweep.
+    Fires to My Setups + personal DM when setup improves.
+    """
+    _entry_watch[symbol] = {
+        "chat_id":        chat_id,
+        "entry_price":    entry_price,
+        "started":        time.time(),
+        "weak_reasons":   weak_reasons,
+        "entry_analysis": entry_analysis,
+        "vol_alerted":    False,
+        "retest_alerted": False,
+        "trend_alerted":  False,
+        "expires":        time.time() + 48 * 3600,  # watch for 48h
+    }
+    print(f"👁 Entry watch started: {symbol} weak={weak_reasons}")
+
+
+def check_entry_watches():
+    """
+    Runs every 5 minutes. For each symbol in _entry_watch:
+    - Volume spike: if volume jumps to 3x+ → alert
+    - Retest confirm: if any TF shows confirmed retest → alert
+    - Daily trend shift: if was bearish, now bullish → alert
+    - Expire after 48h
+    """
+    now = time.time()
+    to_remove = []
+
+    for symbol, watch in list(_entry_watch.items()):
+        if now > watch["expires"]:
+            to_remove.append(symbol)
+            continue
+
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            change_24h    = float(ticker["priceChangePercent"])
+
+            improvements = []
+
+            # ── Volume spike check ──
+            if not watch["vol_alerted"]:
+                klines_1h = get_klines(symbol, interval="1h", limit=15)
+                if klines_1h and len(klines_1h) >= 8:
+                    closed = klines_1h[:-1]
+                    vols = [float(k[5]) for k in closed]
+                    baseline = sum(vols[:6]) / 6 if len(vols) >= 6 else 1
+                    recent   = vols[-1] if vols else 0
+                    vol_ratio = recent / baseline if baseline > 0 else 0
+                    if vol_ratio >= 3.0:
+                        improvements.append(f"⚡ Volume spike: {vol_ratio:.1f}x (was low before)")
+                        _entry_watch[symbol]["vol_alerted"] = True
+
+            # ── Retest confirm check ──
+            if not watch["retest_alerted"]:
+                klines_4h = get_klines(symbol, interval="4h", limit=10)
+                klines_1h = get_klines(symbol, interval="1h", limit=10)
+                for tf, klines_tf in [("4h", klines_4h), ("1h", klines_1h)]:
+                    if not klines_tf or len(klines_tf) < 5:
+                        continue
+                    closed = klines_tf[:-1]
+                    last = closed[-1]
+                    prev = closed[-2]
+                    l_close = float(last[4])
+                    l_open  = float(last[1])
+                    l_vol   = float(last[5])
+                    p_high  = float(prev[2])
+                    avg_vol = sum(float(k[5]) for k in closed[-6:]) / 6 or 1
+                    vol_r   = l_vol / avg_vol
+
+                    # Green candle breaking above previous high with volume
+                    if l_close > l_open and l_close > p_high and vol_r >= 1.5:
+                        improvements.append(f"✅ Retest confirmed [{tf.upper()}] — green candle + volume ({vol_r:.1f}x)")
+                        _entry_watch[symbol]["retest_alerted"] = True
+                        break
+
+            # ── Daily trend shift ──
+            if not watch["trend_alerted"] and "daily_down" in watch["weak_reasons"]:
+                if not is_daily_downtrend(symbol, current_price):
+                    improvements.append("✅ Daily trend shifted bullish — bearish filter cleared")
+                    _entry_watch[symbol]["trend_alerted"] = True
+
+            # ── Fire alert if improvements found ──
+            if improvements:
+                # Re-run full entry analysis
+                result = calc_entry_score(symbol)
+                if result:
+                    ob_data = get_order_book_clusters(symbol)
+                    entry_msg = build_powerful_entry(symbol, result, ob_data)
+
+                    improvement_str = "\n".join(f"  {i}" for i in improvements)
+                    alert = (
+                        f"🔔 <b>SETUP IMPROVING — {symbol}</b>\n\n"
+                        f"📈 Changes detected:\n{improvement_str}\n\n"
+                        f"💰 Now: {format_price(current_price)} "
+                        f"({(current_price - watch['entry_price']) / watch['entry_price'] * 100:+.1f}% "
+                        f"from /entry price)\n\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        f"{entry_msg}"
+                    )
+                    send_to_topic(TOPIC_MY_SETUPS, alert)
+                    send_to(watch["chat_id"], alert)
+                    print(f"🔔 Entry watch alert: {symbol} — {improvements}")
+
+                # If all improvements found or 24h passed, remove from watch
+                all_done = (
+                    watch["vol_alerted"] and
+                    watch["retest_alerted"] and
+                    watch["trend_alerted"]
+                )
+                if all_done or now > watch["started"] + 24 * 3600:
+                    to_remove.append(symbol)
+
+        except Exception as e:
+            print(f"Entry watch error {symbol}: {e}")
+
+    for s in to_remove:
+        _entry_watch.pop(s, None)
+
+
 def start_liq_watch(symbol, ob_data, entry_price, chat_id):
     """Called after /entry — starts background liquidation monitoring.
     Works even if no liq zone exists yet — will detect one as it develops."""
@@ -7632,6 +7762,11 @@ def handle_commands():
                             # Build powerful entry message
                             entry_msg = build_powerful_entry(sym, result, ob_data)
 
+                            # Extract confirmed TFs from pattern_notes for watch logic
+                            pattern_notes = result.get("pattern_notes", {})
+                            confirmed_tfs = [tf for tf in ["15m","30m","1h","4h"]
+                                           if tf in pattern_notes and "confirmed" in pattern_notes[tf]]
+
                             try:
                                 reply(entry_msg)
                                 entry_sent = True
@@ -7652,6 +7787,25 @@ def handle_commands():
                                         f"💧 <b>Liquidation watch started — {sym}</b>\n"
                                         f"Monitoring for sweep of {format_price(ob_data['liq_zone']['price'])} "
                                         f"— alert in My Setups when swept + reclaimed."
+                                    )
+
+                                # Auto-start entry watch for weak setups
+                                details_str_lower = details_str.lower()
+                                weak_reasons = []
+                                if "daily downtrend" in details_str_lower or "daily trend bearish" in details_str_lower:
+                                    weak_reasons.append("daily_down")
+                                if "low volume" in details_str_lower or "normal/low" in details_str_lower:
+                                    weak_reasons.append("low_volume")
+                                if not confirmed_tfs:
+                                    weak_reasons.append("no_retest")
+
+                                if weak_reasons:
+                                    start_entry_watch(sym, reply_chat_id, result["price"], weak_reasons, entry_msg)
+                                    reply(
+                                        f"👁 <b>Setup watch started — {sym}</b>\n"
+                                        f"Monitoring for: volume spike, retest confirm"
+                                        + (", daily trend shift" if "daily_down" in weak_reasons else "") +
+                                        f"\n— You'll get an alert in My Setups when setup improves."
                                     )
 
                 elif text.startswith("/WATCH "):
@@ -8619,6 +8773,16 @@ def main():
             time.sleep(30)
 
     Thread(target=run_liq_watches, daemon=True).start()
+
+    def run_entry_watches():
+        while True:
+            try:
+                check_entry_watches()
+            except Exception as e:
+                print(f"Entry watch error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_entry_watches, daemon=True).start()
 
     def run_active_trades():
         while True:
