@@ -5500,6 +5500,7 @@ def build_powerful_entry(sym, result, ob_data):
             )
 
     # ── Long Base / Coil After Pump detection ──
+    tp_levels = []  # initialized here so coil can add pump high as TP
     base_note = ""
     coil_note = ""
     if klines_1d and len(klines_1d) >= 10:
@@ -5535,50 +5536,58 @@ def build_powerful_entry(sym, result, ob_data):
             retrace   = (past_high - current_price) / past_high * 100 if past_high > 0 else 0
 
             if pump_pct >= 40 and 20 <= retrace <= 70 and not base_note:
+                # 2nd pump estimate: historically 50-100% of first pump
+                est_low  = pump_pct * 0.5
+                est_high = pump_pct * 1.0
+                prev_high_pct = (past_high - current_price) / current_price * 100
                 coil_note = (
-                    f"🌀 Coil After Pump: +{pump_pct:.0f}% pump, now -{retrace:.0f}% retracement\n"
-                    f"   Consolidating energy — 2nd pump setups historically strong"
+                    f"🌀 Coil After Pump: +{pump_pct:.0f}% | Retracement: -{retrace:.0f}%\n"
+                    f"   📈 2nd pump potential: +{est_low:.0f}–{est_high:.0f}% (historical)\n"
+                    f"   🎯 Target: previous high {format_price(past_high)} (+{prev_high_pct:.0f}%)"
                 )
+                # Add previous pump high as TP level
+                if past_high > current_price * 1.01:
+                    tp_levels.append((past_high, prev_high_pct))
 
     # ── Historical TP from actual resistance levels ──
-    tp_levels = []
     if klines_4h and len(klines_4h) >= 10:
         closed_4h = klines_4h[:-1]
-        # Find swing highs above current price
-        highs = [float(k[2]) for k in closed_4h]
-        vols_4h = [float(k[5]) for k in closed_4h]
-        avg_v = sum(vols_4h[-20:]) / 20 if len(vols_4h) >= 20 else 1
-
         seen = set()
         for i in range(2, len(closed_4h) - 2):
             h = float(closed_4h[i][2])
             if h <= current_price * 1.01:
                 continue
             if all(h >= float(closed_4h[i+j][2]) for j in [-2,-1,1,2]):
-                # Cluster nearby levels
-                rounded = round(h / (current_price * 0.02)) * (current_price * 0.02)
-                if rounded not in seen:
-                    seen.add(rounded)
+                # Cluster: bucket by 2% of current price
+                bucket = int(h / (current_price * 0.02))
+                if bucket not in seen:
+                    seen.add(bucket)
                     pct = (h - current_price) / current_price * 100
                     tp_levels.append((h, pct))
 
-        # Also add EQH levels
+        # EQH levels
         for eqh in all_eqh[:3]:
             pct = (eqh["price"] - current_price) / current_price * 100
-            if pct > 1:
+            if pct > 2:
                 tp_levels.append((eqh["price"], pct))
 
-        # Also add 1D swing highs
+        # 1D swing highs
         if klines_1d:
             for k in klines_1d[-30:]:
                 h = float(k[2])
-                if h > current_price * 1.01:
+                if h > current_price * 1.02:
                     pct = (h - current_price) / current_price * 100
                     tp_levels.append((h, pct))
 
-        # Sort and deduplicate
-        tp_levels = sorted(set((round(p, 8), round(pct, 1)) for p, pct in tp_levels), key=lambda x: x[0])
-        tp_levels = tp_levels[:4]  # max 4 TPs
+    # Deduplicate — cluster levels within 2% of each other, keep highest
+    tp_levels_clean = []
+    tp_levels_sorted = sorted(set(tp_levels), key=lambda x: x[0])
+    prev_p = 0
+    for p, pct in tp_levels_sorted:
+        if prev_p == 0 or (p - prev_p) / prev_p > 0.02:  # at least 2% apart
+            tp_levels_clean.append((p, pct))
+            prev_p = p
+    tp_levels = tp_levels_clean[:4]
 
     # ── SL — below EQL or OB or recent swing low ──
     sl_price = None
@@ -7595,25 +7604,26 @@ def handle_commands():
                 raw_text = msg.get("text", "").strip()
                 text = raw_text.upper()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
+                from_id = str(msg.get("from", {}).get("id", ""))
                 first_name = msg.get("chat", {}).get("first_name", "Friend")
                 thread_id = msg.get("message_thread_id")
-                is_admin = (chat_id == ADMIN_CHAT_ID or
-                            str(msg.get("from", {}).get("id", "")) == ADMIN_CHAT_ID)
+                is_admin = (
+                    chat_id == ADMIN_CHAT_ID or
+                    from_id == ADMIN_CHAT_ID
+                )
 
                 # Commands from group topics: only admin can use them.
-                # Reply goes back to the same topic so admin doesn't have to
-                # switch to the main bot chat.
                 if thread_id and not is_admin:
                     continue
 
                 # reply_chat_id / reply_thread_id: where to send the response.
-                # If command came from a group topic, reply there.
-                # If from main bot DM, reply there as usual.
+                # If from group topic → reply to ADMIN personal DM (simpler, avoids group clutter)
+                # If from personal DM → reply there
                 if thread_id:
-                    reply_chat_id = chat_id   # group chat id
-                    reply_thread_id = thread_id
+                    reply_chat_id   = ADMIN_CHAT_ID
+                    reply_thread_id = None
                 else:
-                    reply_chat_id = chat_id
+                    reply_chat_id   = chat_id
                     reply_thread_id = None
 
                 # Helper: send response back to where command came from
@@ -7704,6 +7714,26 @@ def handle_commands():
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
 
+                elif text == "/MYLINES":
+                    mine = {k: v for k, v in manual_lines.items() if v.get("chat_id") == chat_id or v.get("chat_id") == ADMIN_CHAT_ID}
+                    if not mine:
+                        reply("📏 You have no active lines. Use /addline SYMBOL PRICE 1h to add one.")
+                    else:
+                        lines_out = []
+                        for lid, ln in mine.items():
+                            state_label = {"waiting": "⏳ waiting", "broken": "📈 broken/retest", "followup": "🔎 tracking"}.get(ln.get("state"), ln.get("state",""))
+                            lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
+                        reply("📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
+
+                elif text == "/ZONES":
+                    if not manual_zones:
+                        reply("📐 No active zones. Use /addzone SYMBOL LOW HIGH 4h to add one.")
+                    else:
+                        lines_out = []
+                        for zid, z in manual_zones.items():
+                            lines_out.append(f"• <code>{zid}</code> — {z['symbol']} {z['tf'].upper()} {format_price(z['low'])}–{format_price(z['high'])} ({z.get('state','waiting')})")
+                        reply("📐 <b>Active zones:</b>\n\n" + "\n".join(lines_out))
+
                 elif text.startswith("/ENTRY "):
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
                     if not sym_raw:
@@ -7782,12 +7812,8 @@ def handle_commands():
                             # Auto-start liquidation watch only if entry message sent
                             if entry_sent:
                                 start_liq_watch(sym, ob_data, result["price"], reply_chat_id)
-                                if ob_data and ob_data.get("liq_zone"):
-                                    reply(
-                                        f"💧 <b>Liquidation watch started — {sym}</b>\n"
-                                        f"Monitoring for sweep of {format_price(ob_data['liq_zone']['price'])} "
-                                        f"— alert in My Setups when swept + reclaimed."
-                                    )
+                                # Note: liq sweep alerts go via entry watch (My Setups)
+                                # No separate "Liquidation watch started" message needed
 
                                 # Auto-start entry watch for weak setups
                                 details_str_lower = details_str.lower()
@@ -8301,22 +8327,27 @@ def handle_commands():
                                                     if l < z_low * 0.99
                                                 ), reverse=True)[:2]
 
-                                                suggest_parts = []
-                                                if above:
-                                                    suggest_parts.append("📏 <b>Next zones to add:</b>")
+                                                suggest_parts = ["📏 <b>Next zones to add:</b>"]
+                                                seen_p = set()
                                                 for h in above:
-                                                    m = h * 0.012
-                                                    pct = (h - cp) / cp * 100
-                                                    suggest_parts.append(
-                                                        f"🔴 <code>/addzone {sym.replace('USDT','')} {format_price(h-m)} {format_price(h+m)} 4h</code> (+{pct:.1f}% — resistance/TP)"
-                                                    )
+                                                    bucket = round(h / (cp * 0.025))
+                                                    if bucket not in seen_p:
+                                                        seen_p.add(bucket)
+                                                        m = h * 0.012
+                                                        pct = (h - cp) / cp * 100
+                                                        suggest_parts.append(
+                                                            f"🔴 <code>/addzone {sym.replace('USDT','')} {format_price(h-m)} {format_price(h+m)} 4h</code> (+{pct:.1f}% — resistance/TP)"
+                                                        )
                                                 for l in below:
-                                                    m = l * 0.012
-                                                    pct = (cp - l) / cp * 100
-                                                    suggest_parts.append(
-                                                        f"🟢 <code>/addzone {sym.replace('USDT','')} {format_price(l-m)} {format_price(l+m)} 4h</code> (-{pct:.1f}% — support/SL area)"
-                                                    )
-                                                if suggest_parts:
+                                                    bucket = round(l / (cp * 0.025))
+                                                    if bucket not in seen_p:
+                                                        seen_p.add(bucket)
+                                                        m = l * 0.012
+                                                        pct = (cp - l) / cp * 100
+                                                        suggest_parts.append(
+                                                            f"🟢 <code>/addzone {sym.replace('USDT','')} {format_price(l-m)} {format_price(l+m)} 4h</code> (-{pct:.1f}% — support/SL area)"
+                                                        )
+                                                if len(suggest_parts) > 1:
                                                     reply("\n".join(suggest_parts))
                                         except Exception as se:
                                             print(f"Zone suggest error: {se}")
