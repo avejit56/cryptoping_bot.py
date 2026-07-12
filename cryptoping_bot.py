@@ -2825,19 +2825,32 @@ def check_manual_lines():
                     f"back above it with a strong green candle. Continuation looks favorable."
                 )
 
-                msg = (
-                    f"🔥 <b>Line Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
-                    f"💰 Price: {format_price(current_price)}\n"
-                    f"📍 Level: {format_price(level)}\n\n"
-                    f"{intro_line}\n\n"
-                    + (f"{full_confluence_line}\n\n" if full_confluence_line else "") +
-                    f"{suggestion}\n\n"
-                    f"⏳ <i>Tracking the next 3 candles to confirm this holds — you'll get a follow-up.</i>"
-                )
-                send_to_topic(TOPIC_MY_SETUPS, msg)
-                if chat_id:
-                    send_to(chat_id, msg)
-                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+                if is_distribution_flagged:
+                    # Distribution risk — send to admin DM only, not My Setups
+                    # Bot will continue monitoring — if volume confirms pump, alert will follow
+                    send_to(chat_id if chat_id else ADMIN_CHAT_ID,
+                        f"⚠️ <b>Distribution Risk — {symbol} [{tf.upper()}]</b>\n\n"
+                        f"💰 Price: {format_price(current_price)} | Level: {format_price(level)}\n\n"
+                        f"🚨 Possible fake breakout — price broke level but volume pattern suggests distribution.\n"
+                        f"Monitoring for volume confirmation before alerting.\n\n"
+                        f"💡 Wait for strong green candle with 3x+ volume before entry."
+                    )
+                    print(f"📏 Line retest DISTRIBUTION RISK (admin only): {line_id}")
+                else:
+                    msg = (
+                        f"🔥 <b>Line Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
+                        f"💰 Price: {format_price(current_price)}\n"
+                        f"📍 Level: {format_price(level)}\n\n"
+                        f"✅ Price broke {format_price(level)}, retested, and just closed "
+                        f"back above it with a strong green candle. Continuation looks favorable.\n\n"
+                        + (f"{full_confluence_line}\n\n" if full_confluence_line else "") +
+                        f"{suggestion}\n\n"
+                        f"⏳ <i>Tracking the next 3 candles to confirm this holds — you'll get a follow-up.</i>"
+                    )
+                    send_to_topic(TOPIC_MY_SETUPS, msg)
+                    if chat_id:
+                        send_to(chat_id, msg)
+                    print(f"📏 Line retest confirmed: {line_id}")
             continue
 
         # ── followup: confirm already fired, check whether it actually holds ──
@@ -3073,96 +3086,106 @@ def check_active_trades():
 def check_active_trades_fast():
     """
     Fast trade monitor — runs every 60s on 5M/15M/1H.
-    Checks for:
-    1. Trend shift (lower highs forming on 5M/15M)
-    2. Volume spike (unexpected selling volume)
-    3. Downtrend/retracement warning
-    4. Strong continuation (positive update)
+    - 4h cooldown for routine warnings (no more spam)
+    - Urgent alert if price near SL (within 2%)
+    - TP1 hit → suggest moving SL to breakeven
+    - Clear HOLD / EXIT verdict
     """
     now = time.time()
     for trade_id, trade in list(active_trades.items()):
         symbol  = trade["symbol"]
         entry   = trade["entry"]
         sl      = trade["sl"]
-
-        cooldown_fast = now - trade.get("last_fast_alert", 0) > 1 * 3600
-        if not cooldown_fast:
-            continue
+        tp1     = trade.get("tp1", entry * 1.05)
 
         ticker = get_ticker(symbol)
         if not ticker:
             continue
         current_price = float(ticker["lastPrice"])
         pnl_pct = (current_price - entry) / entry * 100
+        sl_dist = (current_price - sl) / current_price * 100
 
         alerts = []
+        is_urgent = False
 
-        # ── 5M trend shift ──
-        klines_5m = get_klines(symbol, interval="5m", limit=20)
-        if klines_5m and len(klines_5m) >= 10:
-            closed_5m = klines_5m[:-1]
-            highs_5m = [float(k[2]) for k in closed_5m[-6:]]
-            lows_5m  = [float(k[3]) for k in closed_5m[-6:]]
-            lower_highs = all(highs_5m[i] < highs_5m[i-1] for i in range(1, len(highs_5m)))
-            lower_lows  = all(lows_5m[i] < lows_5m[i-1] for i in range(1, len(lows_5m)))
-            vols_5m = [float(k[5]) for k in closed_5m[-6:]]
-            avg_vol_5m = sum(vols_5m[:3]) / 3 if len(vols_5m) >= 3 else 1
-            last_vol_5m = vols_5m[-1]
-            sell_spike_5m = last_vol_5m > avg_vol_5m * 3 and float(closed_5m[-1][4]) < float(closed_5m[-1][1])
+        # ── URGENT: price near SL (within 2%) ──
+        if sl_dist <= 2.0 and sl_dist > 0:
+            if now - trade.get("last_sl_alert", 0) > 30 * 60:  # 30min cooldown for SL alerts
+                active_trades[trade_id]["last_sl_alert"] = now
+                alerts.append(f"🚨 URGENT: Price {format_price(current_price)} only {sl_dist:.1f}% above SL {format_price(sl)}")
+                alerts.append(f"   → Consider exiting now to protect capital")
+                is_urgent = True
 
-            if lower_highs and lower_lows:
-                alerts.append("📉 5M lower highs + lower lows — short-term downtrend forming")
-            if sell_spike_5m:
-                alerts.append(f"⚡ 5M sell volume spike ({last_vol_5m/avg_vol_5m:.1f}x) — watch closely")
-
-        # ── 15M retracement check ──
-        klines_15m = get_klines(symbol, interval="15m", limit=12)
-        if klines_15m and len(klines_15m) >= 6:
-            closed_15m = klines_15m[:-1]
-            recent_high_15m = max(float(k[2]) for k in closed_15m[-8:])
-            retrace_15m = (recent_high_15m - current_price) / recent_high_15m * 100 if recent_high_15m > 0 else 0
-            red_count = sum(1 for k in closed_15m[-4:] if float(k[4]) < float(k[1]))
-            if retrace_15m >= 5 and red_count >= 3:
-                alerts.append(f"⚠️ 15M retracement: -{retrace_15m:.1f}% from recent high, {red_count}/4 red candles")
-
-        # ── 1H trend check ──
-        klines_1h = get_klines(symbol, interval="1h", limit=10)
-        if klines_1h and len(klines_1h) >= 5:
-            closed_1h = klines_1h[:-1]
-            closes_1h = [float(k[4]) for k in closed_1h]
-            ema20_1h = calculate_ema(closes_1h, min(20, len(closes_1h)))
-            below_ema = ema20_1h and current_price < ema20_1h
-            vols_1h = [float(k[5]) for k in closed_1h[-5:]]
-            avg_vol_1h = sum(vols_1h[:3]) / 3 if len(vols_1h) >= 3 else 1
-            sell_spike_1h = vols_1h[-1] > avg_vol_1h * 2.5 and float(closed_1h[-1][4]) < float(closed_1h[-1][1])
-
-            if below_ema:
-                alerts.append(f"🔴 1H price below 20EMA ({format_price(ema20_1h)}) — trend weakening")
-            if sell_spike_1h:
-                alerts.append(f"⚡ 1H sell spike ({vols_1h[-1]/avg_vol_1h:.1f}x) — distribution risk")
-
-        # ── Positive: strong continuation ──
-        if not alerts and pnl_pct >= 5:
-            klines_5m_pos = get_klines(symbol, interval="5m", limit=10)
-            if klines_5m_pos and len(klines_5m_pos) >= 5:
-                closed_pos = klines_5m_pos[:-1]
-                green_count = sum(1 for k in closed_pos[-4:] if float(k[4]) > float(k[1]))
-                if green_count >= 3:
-                    alerts.append(f"✅ 5M strong continuation — {green_count}/4 green candles, up +{pnl_pct:.1f}%")
-
-        if alerts:
-            active_trades[trade_id]["last_fast_alert"] = now
+        # ── TP1 hit → suggest SL to breakeven ──
+        elif current_price >= tp1 and not trade.get("tp1_hit_alerted"):
+            active_trades[trade_id]["tp1_hit_alerted"] = True
             save_active_trades()
-            alert_str = "\n".join(f"  {a}" for a in alerts)
-            emoji = "⚠️" if any("📉" in a or "🔴" in a or "retracement" in a for a in alerts) else "ℹ️"
-            send_to_topic(TOPIC_TRADES,
-                f"{emoji} <b>Trade Update — {symbol}</b>\n\n"
-                f"💰 Entry: {format_price(entry)} | Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
-                f"🛑 SL: {format_price(sl)}\n\n"
-                f"{alert_str}\n\n"
-                f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-            )
-            print(f"{emoji} Trade fast monitor: {symbol} — {len(alerts)} alert(s)")
+            alerts.append(f"🎯 TP1 hit! (+{pnl_pct:.1f}%)")
+            alerts.append(f"   → Consider moving SL to breakeven ({format_price(entry)}) to lock in profit")
+            alerts.append(f"   → Or take partial profit and let rest run to TP2")
+
+        # ── Routine checks (4h cooldown) ──
+        elif now - trade.get("last_fast_alert", 0) > 4 * 3600:
+            klines_5m = get_klines(symbol, interval="5m", limit=20)
+            if klines_5m and len(klines_5m) >= 10:
+                closed_5m = klines_5m[:-1]
+                highs_5m = [float(k[2]) for k in closed_5m[-6:]]
+                lows_5m  = [float(k[3]) for k in closed_5m[-6:]]
+                lower_highs = all(highs_5m[i] < highs_5m[i-1] for i in range(1, len(highs_5m)))
+                lower_lows  = all(lows_5m[i] < lows_5m[i-1] for i in range(1, len(lows_5m)))
+                vols_5m = [float(k[5]) for k in closed_5m[-6:]]
+                avg_vol_5m = sum(vols_5m[:3]) / 3 if vols_5m else 1
+                sell_spike_5m = vols_5m[-1] > avg_vol_5m * 3 and float(closed_5m[-1][4]) < float(closed_5m[-1][1])
+                if lower_highs and lower_lows:
+                    alerts.append("📉 5M lower highs + lower lows — short-term momentum shifting")
+                if sell_spike_5m:
+                    alerts.append(f"⚡ 5M sell spike ({vols_5m[-1]/avg_vol_5m:.1f}x) — watch closely")
+
+            klines_1h = get_klines(symbol, interval="1h", limit=10)
+            if klines_1h and len(klines_1h) >= 5:
+                closed_1h = klines_1h[:-1]
+                closes_1h = [float(k[4]) for k in closed_1h]
+                ema20_1h = calculate_ema(closes_1h, min(20, len(closes_1h)))
+                below_ema = ema20_1h and current_price < ema20_1h
+                vols_1h = [float(k[5]) for k in closed_1h[-5:]]
+                avg_vol_1h = sum(vols_1h[:3]) / 3 if vols_1h else 1
+                sell_spike_1h = vols_1h[-1] > avg_vol_1h * 2.5 and float(closed_1h[-1][4]) < float(closed_1h[-1][1])
+                if below_ema:
+                    alerts.append(f"🔴 1H below 20EMA ({format_price(ema20_1h)}) — trend weakening")
+                if sell_spike_1h:
+                    alerts.append(f"⚡ 1H sell spike ({vols_1h[-1]/avg_vol_1h:.1f}x) — distribution risk")
+
+        if not alerts:
+            continue
+
+        # Build verdict
+        negative = any(x in " ".join(alerts) for x in ["📉","🔴","⚡ 5M sell","⚡ 1H sell","URGENT"])
+        if is_urgent:
+            verdict = "🚨 EXIT or tighten SL immediately"
+        elif negative and pnl_pct < 0:
+            verdict = "⚠️ Consider exiting — negative PnL + weakening structure"
+        elif negative and pnl_pct > 3:
+            verdict = "💡 Still in profit — consider partial exit or tighten SL"
+        elif negative:
+            verdict = "⚠️ Monitor closely — structure weakening"
+        else:
+            verdict = "✅ Hold — structure intact"
+
+        if not is_urgent:
+            active_trades[trade_id]["last_fast_alert"] = now
+        save_active_trades()
+
+        alert_str = "\n".join(f"  {a}" for a in alerts)
+        emoji = "🚨" if is_urgent else "⚠️" if negative else "ℹ️"
+        send_to_topic(TOPIC_TRADES,
+            f"{emoji} <b>Trade Update — {symbol}</b>\n\n"
+            f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+            f"🛑 SL: {format_price(sl)} ({sl_dist:.1f}% away)\n\n"
+            f"{alert_str}\n\n"
+            f"📊 Verdict: {verdict}\n"
+            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        )
+        print(f"{emoji} Trade monitor: {symbol} — {verdict}")
 def check_explosive_pump(symbol):
     """
     Detect a sudden explosive move across 1-3 candles.
@@ -5161,12 +5184,11 @@ def check_entry_watches():
                     entry_msg = build_powerful_entry(symbol, result, ob_data)
 
                     improvement_str = "\n".join(f"  {i}" for i in improvements)
+                    pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
                     alert = (
                         f"🔔 <b>SETUP IMPROVING — {symbol}</b>\n\n"
-                        f"📈 Changes detected:\n{improvement_str}\n\n"
-                        f"💰 Now: {format_price(current_price)} "
-                        f"({(current_price - watch['entry_price']) / watch['entry_price'] * 100:+.1f}% "
-                        f"from /entry price)\n\n"
+                        f"📈 <b>Changes detected:</b>\n{improvement_str}\n\n"
+                        f"💰 Now: {format_price(current_price)} ({pct_from_entry:+.1f}% from /entry price)\n\n"
                         f"━━━━━━━━━━━━━━\n"
                         f"{entry_msg}"
                     )
@@ -5580,14 +5602,24 @@ def build_powerful_entry(sym, result, ob_data):
                     tp_levels.append((h, pct))
 
     # Deduplicate — cluster levels within 2% of each other, keep highest
+    # Also enforce minimum distances: TP1 >= 3%, TP2 >= 8% from current
     tp_levels_clean = []
     tp_levels_sorted = sorted(set(tp_levels), key=lambda x: x[0])
     prev_p = 0
     for p, pct in tp_levels_sorted:
-        if prev_p == 0 or (p - prev_p) / prev_p > 0.02:  # at least 2% apart
+        if pct < 3.0:  # skip levels too close to current price
+            continue
+        if prev_p == 0 or (p - prev_p) / prev_p > 0.05:  # at least 5% apart
             tp_levels_clean.append((p, pct))
             prev_p = p
-    tp_levels = tp_levels_clean[:4]
+    # If we have < 2 TPs, add percentage-based fallbacks
+    if len(tp_levels_clean) == 0:
+        tp_levels_clean.append((current_price * 1.05, 5.0))
+        tp_levels_clean.append((current_price * 1.15, 15.0))
+    elif len(tp_levels_clean) == 1:
+        tp2_p = tp_levels_clean[0][0] * 1.10
+        tp_levels_clean.append((tp2_p, (tp2_p - current_price) / current_price * 100))
+    tp_levels = tp_levels_clean[:3]
 
     # ── SL — below EQL or OB or recent swing low ──
     sl_price = None
@@ -6490,28 +6522,36 @@ def check_retest_watches():
             tf, pattern_note, klines_tf = confirmed_note
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
-            full_confluence_watch = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
-            # Order flow — add live order book data to retest message
-            ob_watch = get_order_book_clusters(symbol)
-            of_watch = format_order_flow_block(ob_watch, current_price) if ob_watch else ""
-            # iFVG framework
-            ifvg_watch = analyze_ifvg_framework(symbol, current_price, tf=tf if tf in ("4h","1d") else "4h")
-            msg = (
-                f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
-                f"💰 Price: {format_price(current_price)}\n\n"
-                f"{pattern_note}\n\n"
-                + (f"{full_confluence_watch}\n\n" if full_confluence_watch else "") +
-                (f"{ifvg_watch}\n\n" if ifvg_watch else "") +
-                (f"{of_watch}\n\n" if of_watch else "") +
-                f"{suggestion}\n\n"
-                f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
-                f"you'll get a follow-up.</i>"
-            )
-            send_to(watch["chat_id"], msg)
-            send_to_topic(TOPIC_MY_SETUPS, msg)
-            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
-            # Auto-start liq watch from retest complete too
-            start_liq_watch(symbol, ob_watch, current_price, watch["chat_id"])
+
+            if is_distribution_flagged:
+                # Admin DM only — distribution risk
+                send_to(watch["chat_id"],
+                    f"⚠️ <b>Distribution Risk — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"💰 Price: {format_price(current_price)}\n\n"
+                    f"🚨 Retest pattern formed but volume suggests distribution.\n"
+                    f"Monitoring for volume confirmation. Wait for 3x+ volume green candle."
+                )
+                print(f"🔥 Watch retest DISTRIBUTION (admin only): {symbol}")
+            else:
+                full_confluence_watch = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
+                ob_watch = get_order_book_clusters(symbol)
+                of_watch = format_order_flow_block(ob_watch, current_price) if ob_watch else ""
+                ifvg_watch = analyze_ifvg_framework(symbol, current_price, tf=tf if tf in ("4h","1d") else "4h")
+                msg = (
+                    f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"💰 Price: {format_price(current_price)}\n\n"
+                    f"{pattern_note}\n\n"
+                    + (f"{full_confluence_watch}\n\n" if full_confluence_watch else "") +
+                    (f"{ifvg_watch}\n\n" if ifvg_watch else "") +
+                    (f"{of_watch}\n\n" if of_watch else "") +
+                    f"{suggestion}\n\n"
+                    f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
+                    f"you'll get a follow-up.</i>"
+                )
+                send_to(watch["chat_id"], msg)
+                send_to_topic(TOPIC_MY_SETUPS, msg)
+                print(f"🔥 Retest complete: {symbol}")
+                start_liq_watch(symbol, ob_watch, current_price, watch["chat_id"])
 
             # Extract the level that was confirmed, from the pattern note text,
             # so follow-up can check against it without re-running detection.
