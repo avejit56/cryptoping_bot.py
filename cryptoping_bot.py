@@ -3573,6 +3573,7 @@ def check_prepump(symbol):
             f"⚠️ <i>Strong setup! Take the entry.</i>"
         )
         send_all(msg, symbol=symbol)
+        send_to_topic(TOPIC_BUILDUPS, msg)  # Phase 3 → Building Momentum, not High Priority
 
         signal_performance[f"{symbol}_prepump_{int(now)}"] = {
             "symbol": symbol, "signal_price": current_price,
@@ -5229,6 +5230,325 @@ def check_liq_watches():
         _liq_watch.pop(s, None)
 
 
+def build_powerful_entry(sym, result, ob_data):
+    """
+    Builds the new comprehensive /entry message with:
+    - Daily trend + volume + SMC all-in-one
+    - Long base / coil after pump detection
+    - Liquidity hunt probability from EQL touches
+    - Historical TP from actual resistance levels (not fixed %)
+    - Smart bot opinion
+    """
+    current_price = result["price"]
+    details_str   = "\n".join(result["details"])
+    pattern_notes = result.get("pattern_notes", {})
+    chart_patterns = result.get("chart_patterns", [])
+
+    # ── Timeframe retest row ──
+    tf_map = {"15m": "15M", "30m": "30M", "1h": "1H", "4h": "4H"}
+    retest_parts = []
+    confirmed_tfs   = []
+    inprogress_tfs  = []
+    for tf_key, tf_label in tf_map.items():
+        note = pattern_notes.get(tf_key, "")
+        if "confirmed" in note:
+            retest_parts.append(f"{tf_label} ✅")
+            confirmed_tfs.append(tf_key)
+        elif "in progress" in note:
+            retest_parts.append(f"{tf_label} ⏳")
+            inprogress_tfs.append(tf_key)
+        elif "extended" in note:
+            retest_parts.append(f"{tf_label} 📈")
+        else:
+            retest_parts.append(f"{tf_label} ❌")
+    retest_row = " | ".join(retest_parts)
+
+    # ── Chart pattern one-line ──
+    import re as _re
+    pattern_line = ""
+    if chart_patterns:
+        m = _re.search(r'\[.+?\] <b>(.+?)</b>', chart_patterns[0])
+        if m:
+            pattern_line = m.group(1)
+
+    # ── Fetch klines ──
+    klines_4h = get_klines(sym, interval="4h", limit=100)
+    klines_1h = get_klines(sym, interval="1h", limit=50)
+    klines_1d = get_klines(sym, interval="1d", limit=60)
+    ticker    = get_ticker(sym)
+
+    change_24h = float(ticker["priceChangePercent"]) if ticker else 0
+    vol_24h    = float(ticker.get("quoteVolume", 0)) if ticker else 0
+
+    analysis_lines = []
+
+    # ── Daily trend ──
+    daily_down = is_daily_downtrend(sym, current_price)
+    if not daily_down:
+        analysis_lines.append("✅ Daily trend bullish/neutral")
+    else:
+        analysis_lines.append("❌ Daily trend bearish")
+
+    # ── Volume analysis ──
+    vol_label = ""
+    avg_vol_ratio = 0
+    if klines_4h and len(klines_4h) >= 10:
+        closed_4h = klines_4h[:-1]
+        vols = [float(k[5]) for k in closed_4h[-20:]]
+        baseline = sum(vols[:10]) / 10 if len(vols) >= 10 else 1
+        recent   = vols[-1] if vols else 0
+        avg_vol_ratio = recent / baseline if baseline > 0 else 0
+        if avg_vol_ratio >= 5:
+            vol_label = f"⚡ Volume: {avg_vol_ratio:.1f}x — strong accumulation"
+            analysis_lines.append(vol_label)
+        elif avg_vol_ratio >= 2:
+            vol_label = f"📊 Volume: {avg_vol_ratio:.1f}x — elevated"
+            analysis_lines.append(vol_label)
+        else:
+            vol_label = f"⚠️ Volume: {avg_vol_ratio:.1f}x — low"
+            analysis_lines.append(vol_label)
+
+    # ── Higher lows ──
+    if klines_1h and len(klines_1h) >= 8:
+        lows_1h = [float(k[3]) for k in klines_1h[-8:-1]]
+        hl_count = sum(1 for i in range(1, len(lows_1h)) if lows_1h[i] > lows_1h[i-1])
+        if hl_count >= 4:
+            analysis_lines.append("✅ Strong higher lows (1H)")
+        elif hl_count >= 2:
+            analysis_lines.append("✅ Higher lows forming (1H)")
+
+    # ── OB zone ──
+    ob_zone = None
+    if klines_4h and len(klines_4h) >= 5:
+        closed_4h = klines_4h[:-1]
+        avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+        for k in reversed(closed_4h[-15:]):
+            ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+            if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+                ob_zone = (kl, kh)
+                analysis_lines.append(f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}")
+                break
+
+    # ── iFVG ──
+    ifvg_support = None
+    if klines_4h:
+        ifvgs = detect_ifvg(klines_4h, current_price)
+        if ifvgs:
+            iv = ifvgs[0]
+            ifvg_support = iv
+            analysis_lines.append(f"🔄 iFVG support: {format_price(iv['bottom'])}–{format_price(iv['top'])}")
+
+    # ── Equal Highs/Lows (liquidity pools) ──
+    eql_data = None
+    nearest_eql = None
+    nearest_eqh = None
+    all_eqh = []
+    if klines_4h:
+        eql_data = detect_equal_highs_lows(klines_4h, current_price)
+        if eql_data["eq_lows"]:
+            nearest_eql = eql_data["eq_lows"][0]
+        if eql_data["eq_highs"]:
+            all_eqh = eql_data["eq_highs"]
+            nearest_eqh = eql_data["eq_highs"][0]
+
+    # ── Liquidity hunt probability ──
+    liq_hunt_warning = ""
+    if nearest_eql:
+        eql_pct = (current_price - nearest_eql["price"]) / current_price * 100
+        touches = nearest_eql["touches"]
+        if touches >= 8 and eql_pct <= 15:
+            liq_hunt_warning = (
+                f"⚠️ Liquidity Hunt Risk: EQL {format_price(nearest_eql['price'])} "
+                f"({touches}x tested, {eql_pct:.1f}% below)\n"
+                f"   → Smart money may sweep this before pump\n"
+                f"   → If sweep + reclaim → strongest entry signal"
+            )
+        elif touches >= 5 and eql_pct <= 10:
+            liq_hunt_warning = (
+                f"💧 Liq zone: {format_price(nearest_eql['price'])} "
+                f"({touches}x tested, {eql_pct:.1f}% below)"
+            )
+
+    # ── Long Base / Coil After Pump detection ──
+    base_note = ""
+    coil_note = ""
+    if klines_1d and len(klines_1d) >= 10:
+        closed_1d = klines_1d[:-1]
+
+        # Long base: tight range for 14+ days
+        recent_30d = closed_1d[-30:]
+        if len(recent_30d) >= 14:
+            highs_30d = [float(k[2]) for k in recent_30d]
+            lows_30d  = [float(k[3]) for k in recent_30d]
+            range_high = max(highs_30d)
+            range_low  = min(lows_30d)
+            range_pct  = (range_high - range_low) / range_low * 100 if range_low > 0 else 100
+
+            # Count days in tight range (within 15% of current)
+            days_in_range = sum(
+                1 for k in recent_30d
+                if abs(float(k[4]) - current_price) / current_price <= 0.15
+            )
+
+            if range_pct <= 20 and days_in_range >= 14:
+                base_note = (
+                    f"📦 Long Base: {days_in_range} days in "
+                    f"{range_pct:.0f}% range ({format_price(range_low)}–{format_price(range_high)})\n"
+                    f"   Volume declining during base → breakout energy building"
+                )
+
+        # Coil after pump: pumped 30%+ in last 60d then retraced
+        if len(closed_1d) >= 20:
+            past_high = max(float(k[2]) for k in closed_1d[-60:])
+            past_low  = min(float(k[3]) for k in closed_1d[-60:])
+            pump_pct  = (past_high - past_low) / past_low * 100 if past_low > 0 else 0
+            retrace   = (past_high - current_price) / past_high * 100 if past_high > 0 else 0
+
+            if pump_pct >= 40 and 20 <= retrace <= 70 and not base_note:
+                coil_note = (
+                    f"🌀 Coil After Pump: +{pump_pct:.0f}% pump, now -{retrace:.0f}% retracement\n"
+                    f"   Consolidating energy — 2nd pump setups historically strong"
+                )
+
+    # ── Historical TP from actual resistance levels ──
+    tp_levels = []
+    if klines_4h and len(klines_4h) >= 10:
+        closed_4h = klines_4h[:-1]
+        # Find swing highs above current price
+        highs = [float(k[2]) for k in closed_4h]
+        vols_4h = [float(k[5]) for k in closed_4h]
+        avg_v = sum(vols_4h[-20:]) / 20 if len(vols_4h) >= 20 else 1
+
+        seen = set()
+        for i in range(2, len(closed_4h) - 2):
+            h = float(closed_4h[i][2])
+            if h <= current_price * 1.01:
+                continue
+            if all(h >= float(closed_4h[i+j][2]) for j in [-2,-1,1,2]):
+                # Cluster nearby levels
+                rounded = round(h / (current_price * 0.02)) * (current_price * 0.02)
+                if rounded not in seen:
+                    seen.add(rounded)
+                    pct = (h - current_price) / current_price * 100
+                    tp_levels.append((h, pct))
+
+        # Also add EQH levels
+        for eqh in all_eqh[:3]:
+            pct = (eqh["price"] - current_price) / current_price * 100
+            if pct > 1:
+                tp_levels.append((eqh["price"], pct))
+
+        # Also add 1D swing highs
+        if klines_1d:
+            for k in klines_1d[-30:]:
+                h = float(k[2])
+                if h > current_price * 1.01:
+                    pct = (h - current_price) / current_price * 100
+                    tp_levels.append((h, pct))
+
+        # Sort and deduplicate
+        tp_levels = sorted(set((round(p, 8), round(pct, 1)) for p, pct in tp_levels), key=lambda x: x[0])
+        tp_levels = tp_levels[:4]  # max 4 TPs
+
+    # ── SL — below EQL or OB or recent swing low ──
+    sl_price = None
+    sl_reason = ""
+    if nearest_eql and (current_price - nearest_eql["price"]) / current_price <= 0.20:
+        sl_price  = nearest_eql["price"] * 0.985
+        sl_reason = f"below EQL {format_price(nearest_eql['price'])} ({nearest_eql['touches']}x)"
+    elif ob_zone:
+        sl_price  = ob_zone[0] * 0.985
+        sl_reason = f"below OB zone"
+    elif klines_4h:
+        recent_lows = [float(k[3]) for k in klines_4h[-10:-1]]
+        if recent_lows:
+            sl_price  = min(recent_lows) * 0.985
+            sl_reason = "below recent swing low"
+
+    if not sl_price:
+        sl_price = current_price * 0.92
+
+    risk_pct = (current_price - sl_price) / current_price * 100
+
+    # ── R/R calculation ──
+    tp_rr = []
+    for tp_p, tp_pct in tp_levels[:2]:
+        rr = tp_pct / risk_pct if risk_pct > 0 else 0
+        tp_rr.append((tp_p, tp_pct, rr))
+
+    # ── Smart Bot Opinion ──
+    opinion_lines = []
+
+    # Entry timing
+    if confirmed_tfs and not daily_down:
+        opinion_lines.append(f"✅ {'/'.join(t.upper() for t in confirmed_tfs)} confirmed — entry valid now")
+    elif inprogress_tfs:
+        opinion_lines.append(f"⏳ Wait for {'/'.join(t.upper() for t in inprogress_tfs).upper()} green candle to confirm")
+    elif base_note or coil_note:
+        opinion_lines.append("📦 No immediate retest but base/coil structure present — consider small position")
+    else:
+        opinion_lines.append("⏳ No clear setup yet — wait for price to reach key levels")
+
+    # Liq hunt advice
+    if liq_hunt_warning and nearest_eql:
+        eql_pct = (current_price - nearest_eql["price"]) / current_price * 100
+        opinion_lines.append(
+            f"💡 Best entry: wait for sweep of {format_price(nearest_eql['price'])} "
+            f"({eql_pct:.1f}% below) then reclaim = high conviction entry"
+        )
+
+    # Volume pump probability
+    if avg_vol_ratio >= 5:
+        opinion_lines.append("🔥 High volume = strong pump probability if breakout holds")
+    elif avg_vol_ratio >= 2 and (base_note or coil_note):
+        opinion_lines.append("📈 Volume + base = good risk/reward for patient hold")
+    elif avg_vol_ratio < 1.5 and not confirmed_tfs:
+        opinion_lines.append("⚠️ Low volume — entry premature, wait for volume confirmation")
+
+    # Daily downtrend warning
+    if daily_down:
+        opinion_lines.append("⚠️ Daily bearish — use smaller position, tighter SL")
+
+    opinion = "\n   ".join(opinion_lines)
+
+    # ── Build final message ──
+    lines = [
+        f"📊 <b>{sym}</b> | {format_price(current_price)} | {result['label']} ({result['score']}/{result['max_score']})\n",
+        f"📐 Retest: {retest_row}",
+    ]
+    if pattern_line:
+        lines.append(f"📐 {pattern_line}")
+    if base_note:
+        lines.append(f"\n{base_note}")
+    if coil_note:
+        lines.append(f"\n{coil_note}")
+
+    lines.append(f"\n📊 <b>Analysis:</b>")
+    for al in analysis_lines:
+        lines.append(f"   {al}")
+    if liq_hunt_warning:
+        lines.append(f"   {liq_hunt_warning}")
+
+    # Trade plan
+    tp_str = ""
+    for i, (tp_p, tp_pct, rr) in enumerate(tp_rr, 1):
+        tp_str += f"\n   🟢 TP{i}: {format_price(tp_p)} (+{tp_pct:.1f}%) | R/R: {rr:.1f}x"
+    if not tp_rr and tp_levels:
+        tp_p, tp_pct = tp_levels[0]
+        tp_str = f"\n   🟢 TP1: {format_price(tp_p)} (+{tp_pct:.1f}%)"
+
+    lines.append(
+        f"\n📐 <b>Trade Plan:</b>\n"
+        f"   💰 Entry: {format_price(current_price)}\n"
+        f"   🔴 SL: {format_price(sl_price)} (-{risk_pct:.1f}%) ← {sl_reason}"
+        + tp_str
+    )
+
+    lines.append(f"\n🤖 <b>Opinion:</b>\n   {opinion}")
+
+    return "\n".join(lines)
+
+
 def build_entry_decision_block(symbol, current_price, tf="4h"):
     """
     Generates a complete entry decision block for retest completion messages
@@ -6407,10 +6727,10 @@ def scan_global_liq_reclaim():
             if pos_confluence < 1:
                 continue
 
-            target_topic = TOPIC_HIGH if (is_retest_reclaim or pos_confluence >= 3) else TOPIC_BUILDUPS
+            # All liq reclaim signals → High Priority
+            # (weak ones already filtered by pos_confluence < 1 check above)
+            target_topic = TOPIC_HIGH
             signal_prefix = "🎯 RETEST RECLAIM" if is_retest_reclaim else "🔥 LIQUIDITY RECLAIM"
-
-            # ── POWER SIGNAL ──
             is_power_signal = (
                 is_retest_reclaim and
                 pos_confluence >= 4 and
@@ -7309,122 +7629,19 @@ def handle_commands():
                             chart_patterns = result.get("chart_patterns", [])
                             ob_data = get_order_book_clusters(sym)
 
-                            # ── Build compact entry message ──
-                            # Retest status per timeframe (compact row)
-                            tf_icons = {"15m": "15M", "30m": "30M", "1h": "1H", "4h": "4H"}
-                            pattern_notes = result.get("pattern_notes", {})
-                            retest_row_parts = []
-                            for tf_key, tf_label in tf_icons.items():
-                                if tf_key in pattern_notes:
-                                    note = pattern_notes[tf_key]
-                                    if "confirmed" in note:
-                                        retest_row_parts.append(f"{tf_label} ✅")
-                                    elif "in progress" in note:
-                                        retest_row_parts.append(f"{tf_label} ⏳")
-                                    elif "extended" in note:
-                                        retest_row_parts.append(f"{tf_label} 📈")
-                                    else:
-                                        retest_row_parts.append(f"{tf_label} ❌")
-                                else:
-                                    retest_row_parts.append(f"{tf_label} ❌")
-                            retest_row = " | ".join(retest_row_parts)
-
-                            # Chart pattern — one line
-                            pattern_line = ""
-                            if chart_patterns:
-                                first = chart_patterns[0]
-                                # Extract just the pattern name and key price
-                                import re as _re
-                                match = _re.search(r'\[.+?\] <b>(.+?)</b>', first)
-                                if match:
-                                    pattern_line = f"📐 {match.group(1)}"
-
-                            # iFVG compact — key support/resistance only
-                            klines_4h_e = get_klines(sym, interval="4h", limit=30)
-                            ifvg_compact = ""
-                            if klines_4h_e:
-                                ifvgs = detect_ifvg(klines_4h_e, result["price"])
-                                eql_data = detect_equal_highs_lows(klines_4h_e, result["price"])
-                                nearest_tp = eql_data["eq_highs"][0] if eql_data["eq_highs"] else None
-                                nearest_sl_eql = eql_data["eq_lows"][0] if eql_data["eq_lows"] else None
-
-                                ifvg_lines = []
-                                for iv in ifvgs[:1]:
-                                    direction = "support" if "bullish" in iv["type"] else "resistance"
-                                    ifvg_lines.append(f"iFVG {direction}: {format_price(iv['bottom'])}–{format_price(iv['top'])}")
-                                if nearest_tp:
-                                    pct = (nearest_tp["price"] - result["price"]) / result["price"] * 100
-                                    ifvg_lines.append(f"TP target: {format_price(nearest_tp['price'])} (+{pct:.1f}%, {nearest_tp['touches']}x)")
-                                if nearest_sl_eql:
-                                    pct = (result["price"] - nearest_sl_eql["price"]) / result["price"] * 100
-                                    ifvg_lines.append(f"SL zone: below {format_price(nearest_sl_eql['price'])} (-{pct:.1f}%, {nearest_sl_eql['touches']}x)")
-                                if ifvg_lines:
-                                    ifvg_compact = "🔬 " + " | ".join(ifvg_lines)
-
-                            # Liq zone compact
-                            liq_line = ""
-                            if ob_data and ob_data.get("liq_zone"):
-                                lz = ob_data["liq_zone"]
-                                pct = (result["price"] - lz["price"]) / result["price"] * 100
-                                liq_line = f"💧 Liq zone: {format_price(lz['price'])} (-{pct:.1f}%)"
-
-                            # SL/TP from EQL/EQH
-                            sl_price = nearest_sl_eql["price"] * 0.985 if nearest_sl_eql else result["price"] * 0.95
-                            tp1_price = nearest_tp["price"] if nearest_tp else result["price"] * 1.05
-                            tp2_klines = get_klines(sym, interval="4h", limit=50)
-                            tp2_price = result["price"] * 1.10
-                            if tp2_klines:
-                                eql2 = detect_equal_highs_lows(tp2_klines, result["price"])
-                                if len(eql2["eq_highs"]) >= 2:
-                                    tp2_price = eql2["eq_highs"][1]["price"]
-                            risk_pct = (result["price"] - sl_price) / result["price"] * 100
-                            tp1_pct  = (tp1_price - result["price"]) / result["price"] * 100
-                            tp2_pct  = (tp2_price - result["price"]) / result["price"] * 100
-                            rr = tp1_pct / risk_pct if risk_pct > 0 else 0
-
-                            # Verdict — one line
-                            confirmed_tfs = [tf for tf in ["15m","30m","1h","4h"] if tf in pattern_notes and "confirmed" in pattern_notes[tf]]
-                            inprogress_tfs = [tf for tf in ["15m","30m","1h","4h"] if tf in pattern_notes and "in progress" in pattern_notes[tf]]
-                            daily_down = "❌ Daily downtrend" in details_str
-                            below_ema  = "❌ Below" in details_str and "EMA" in details_str
-
-                            if result["score"] < 50 or (daily_down and below_ema):
-                                verdict = f"⚠️ Score LOW + weak setup — skip or wait for major improvement"
-                            elif daily_down and not confirmed_tfs:
-                                verdict = f"⚠️ Daily downtrend — wait for reversal confirmation"
-                            elif inprogress_tfs and not confirmed_tfs:
-                                tfs_str = "/".join(t.upper() for t in inprogress_tfs)
-                                verdict = f"⏳ Wait for {tfs_str} green candle close to confirm"
-                            elif confirmed_tfs:
-                                tfs_str = "/".join(t.upper() for t in confirmed_tfs)
-                                verdict = f"✅ {tfs_str} confirmed — early entry valid, confirm on chart"
-                            else:
-                                verdict = f"⏳ No clear setup right now — monitor levels below"
-
-                            # Build compact message
-                            compact_lines = [
-                                f"📊 <b>{sym}</b> | {format_price(result['price'])} | {result['label']} ({result['score']}/{result['max_score']})\n",
-                                f"📐 Retest: {retest_row}",
-                            ]
-                            if pattern_line:
-                                compact_lines.append(pattern_line)
-                            if ifvg_compact:
-                                compact_lines.append(ifvg_compact)
-                            if liq_line:
-                                compact_lines.append(liq_line)
-                            compact_lines.append(
-                                f"\n📐 SL: {format_price(sl_price)} (-{risk_pct:.1f}%) | "
-                                f"TP1: {format_price(tp1_price)} (+{tp1_pct:.1f}%) | "
-                                f"TP2: {format_price(tp2_price)} (+{tp2_pct:.1f}%) | R/R: {rr:.1f}x"
-                            )
-                            compact_lines.append(f"\n💡 {verdict}")
+                            # Build powerful entry message
+                            entry_msg = build_powerful_entry(sym, result, ob_data)
 
                             try:
-                                reply("\n".join(compact_lines))
+                                reply(entry_msg)
                                 entry_sent = True
                             except Exception as e:
                                 print(f"Entry reply error: {e}")
-                                reply(f"📊 {sym} | {format_price(result['price'])} | {result['label']}\n{verdict}")
+                                # Fallback — short version
+                                reply(
+                                    f"📊 {sym} | {format_price(result['price'])} | {result['label']}\n"
+                                    f"⚠️ Confirm on chart before entry."
+                                )
                                 entry_sent = True
 
                             # Auto-start liquidation watch only if entry message sent
@@ -8089,17 +8306,19 @@ def handle_commands():
                                         f"   → {pct:.1f}% below — bounce/entry zone"
                                     )
 
-                            # Resistance ZONES above (for future breakout entries)
-                            res_zones = [(p, t, v) for p, t, v in c_highs if p > current_price * 1.005][:3]
+                            # Resistance ZONES above — show as both zone and line
+                            res_zones = [(p, t, v) for p, t, v in c_highs if p > current_price * 1.005][:4]
                             if res_zones:
-                                lines_out.append("\n🔴 <b>Resistance Zones above (addline for breakout):</b>")
-                                for p, touches, vol_r in res_zones[:2]:
+                                lines_out.append("\n🔴 <b>Resistance Zones above:</b>")
+                                for p, touches, vol_r in res_zones[:3]:
+                                    margin = p * 0.012  # 1.2% zone margin
                                     pct = (p - current_price) / current_price * 100
                                     strength = "🔥 Strong" if touches >= 3 else "✅ Moderate" if touches == 2 else "⚠️ Weak"
                                     lines_out.append(
-                                        f"{strength} ({touches}x tested)\n"
-                                        f"<code>/addline {sym.replace('USDT','')} {format_price(p)} 4h</code>\n"
-                                        f"   → {pct:.1f}% above — breakout entry / TP target"
+                                        f"{strength} ({touches}x tested, {vol_r:.1f}x vol)\n"
+                                        f"<code>/addzone {sym.replace('USDT','')} "
+                                        f"{format_price(p-margin)} {format_price(p+margin)} 4h</code>\n"
+                                        f"   → {pct:.1f}% above — resistance / TP target"
                                     )
 
                             # Situation summary
