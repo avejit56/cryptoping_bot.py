@@ -5572,6 +5572,7 @@ def build_powerful_entry(sym, result, ob_data):
             bs_note = f"🔴 BS Pressure: Negative ({bs_usdt/1000:.1f}K) — sellers active, wait for flip"
             analysis_lines.append(bs_note)
             analysis_lines.append("   → Bot will alert when BS turns positive")
+    tp_levels = []  # initialize before coil so pump high can be appended
     base_note = ""
     coil_note = ""
     if klines_1d and len(klines_1d) >= 10:
