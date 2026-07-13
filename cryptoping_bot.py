@@ -733,8 +733,10 @@ def get_updates():
             params={"offset": last_update_id + 1, "timeout": 5}, timeout=10)
         if r.status_code == 200:
             return r.json().get("result", [])
-    except:
-        pass
+        else:
+            print(f"⚠️ getUpdates failed: HTTP {r.status_code} — {r.text[:300]}")
+    except Exception as e:
+        print(f"⚠️ getUpdates exception: {e}")
     return []
 
 # ─── BINANCE ──────────────────────────────────────────────
