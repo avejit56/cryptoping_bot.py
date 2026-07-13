@@ -7939,26 +7939,36 @@ def handle_commands():
                     if not mine:
                         reply(f"📏 No active lines. Use /addline SYMBOL PRICE 1h to add one.")
                     else:
-                        out = "\n".join(
-                            f"• <code>{lid}</code> {v['symbol']} {v.get('tf','').upper()} "
-                            f"@ {format_price(v['price'])} "
-                            f"({'⏳' if v.get('state')=='waiting' else '📈' if v.get('state')=='broken' else '🔎'})"
-                            for lid, v in mine.items()
-                        )
-                        reply(f"📏 <b>Lines ({len(mine)}):</b>\n\n{out}")
+                        rows = []
+                        for lid, v in mine.items():
+                            try:
+                                rows.append(
+                                    f"• <code>{lid}</code> {v['symbol']} {v.get('tf','').upper()} "
+                                    f"@ {format_price(v['price'])} "
+                                    f"({'⏳' if v.get('state')=='waiting' else '📈' if v.get('state')=='broken' else '🔎'})"
+                                )
+                            except Exception as e:
+                                print(f"⚠️ Skipping malformed line {lid}: {e}")
+                        out = "\n".join(rows) if rows else "(no valid lines to show)"
+                        reply(f"📏 <b>Lines ({len(rows)}):</b>\n\n{out}")
                     continue
 
                 if text == "/ZONES":
                     if not manual_zones:
                         reply("📐 No active zones. Use /addzone SYMBOL LOW HIGH 4h to add one.")
                     else:
-                        out = "\n".join(
-                            f"• <code>{zid}</code> {z['symbol']} {z.get('tf','4h').upper()} "
-                            f"{format_price(z['low'])}–{format_price(z['high'])} "
-                            f"({'⏳' if z.get('state')=='waiting' else '✅'})"
-                            for zid, z in manual_zones.items()
-                        )
-                        reply(f"📐 <b>Zones ({len(manual_zones)}):</b>\n\n{out}")
+                        rows = []
+                        for zid, z in manual_zones.items():
+                            try:
+                                rows.append(
+                                    f"• <code>{zid}</code> {z['symbol']} {z.get('tf','4h').upper()} "
+                                    f"{format_price(z['low'])}–{format_price(z['high'])} "
+                                    f"({'⏳' if z.get('state')=='waiting' else '✅'})"
+                                )
+                            except Exception as e:
+                                print(f"⚠️ Skipping malformed zone {zid}: {e}")
+                        out = "\n".join(rows) if rows else "(no valid zones to show)"
+                        reply(f"📐 <b>Zones ({len(rows)}):</b>\n\n{out}")
                     continue
 
                 # ── Main command chain ──
