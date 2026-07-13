@@ -2476,7 +2476,7 @@ def check_manual_zones():
                 # Subscriber DMs
                 for sub_chat_id in subscribers:
                     send_to(sub_chat_id, msg)
-                print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}{' [TL SWEEP]' if tl_sweep_note else ''}")
+                print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}")
                 signal_performance[f"{symbol}_zone_{int(now)}"] = {
                     "symbol": symbol, "signal_price": current_price,
                     "signal_time": now, "signal_type": f"Zone OB [{tf.upper()}]",
