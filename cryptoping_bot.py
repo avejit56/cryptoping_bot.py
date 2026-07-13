@@ -3297,36 +3297,32 @@ def check_explosive_pump(symbol):
         check_high_confidence_signal(symbol, "Explosive Pump [5M]", current_price)
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
-def is_daily_downtrend(symbol, current_price):
+def is_daily_downtrend(symbol, current_price, klines_1h=None, klines_daily=None):
     """
     Returns True if the symbol is in a daily downtrend.
-    True = skip the signal.
-
-    EXCEPTION (SKL case): if volume is extreme (8x+ normal) and price is
-    moving up strongly on the latest candle, this is likely a reversal pump —
-    return False so detectors can fire even in a downtrend. These are some
-    of the biggest moves precisely because sellers are exhausted.
+    Accepts optional cached klines to avoid redundant API calls.
     """
     # Check for extreme volume reversal before applying downtrend filter
-    ticker = get_ticker(symbol)
-    if ticker:
-        klines_1h = get_klines(symbol, interval="1h", limit=12)
-        if klines_1h and len(klines_1h) >= 8:
-            closed_1h = klines_1h[:-1]
-            last_1h = closed_1h[-1]
-            l_open  = float(last_1h[1])
-            l_close = float(last_1h[4])
-            l_vol   = float(last_1h[5])
-            avg_vol = sum(float(k[5]) for k in closed_1h[-8:-1]) / 7
-            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
-            # Extreme reversal: 8x+ volume + strong green candle + price up 3%+
-            if (vol_ratio >= 8.0 and l_close > l_open and
-                    (l_close - l_open) / l_open >= 0.03):
-                return False  # bypass downtrend filter — reversal pump
+    if klines_1h is None:
+        ticker = get_ticker(symbol)
+        if ticker:
+            klines_1h = get_klines(symbol, interval="1h", limit=12)
+    if klines_1h and len(klines_1h) >= 8:
+        closed_1h = klines_1h[:-1]
+        last_1h = closed_1h[-1]
+        l_open  = float(last_1h[1])
+        l_close = float(last_1h[4])
+        l_vol   = float(last_1h[5])
+        avg_vol = sum(float(k[5]) for k in closed_1h[-8:-1]) / 7
+        vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+        if (vol_ratio >= 8.0 and l_close > l_open and
+                (l_close - l_open) / l_open >= 0.03):
+            return False  # bypass — reversal pump
 
-    klines_daily = get_klines(symbol, interval="1d", limit=15)
+    if klines_daily is None:
+        klines_daily = get_klines(symbol, interval="1d", limit=15)
     if not klines_daily or len(klines_daily) < 7:
-        return False  # no data, don't skip
+        return False
 
     daily_closes = [float(k[4]) for k in klines_daily[-8:-1]]
     daily_ema = calculate_ema(daily_closes, min(7, len(daily_closes)))
@@ -5477,8 +5473,8 @@ def build_powerful_entry(sym, result, ob_data):
 
     analysis_lines = []
 
-    # ── Daily trend ──
-    daily_down = is_daily_downtrend(sym, current_price)
+    # ── Daily trend — use cached klines ──
+    daily_down = is_daily_downtrend(sym, current_price, klines_1h=klines_1h, klines_daily=klines_1d)
     if not daily_down:
         analysis_lines.append("✅ Daily trend bullish/neutral")
     else:
@@ -8007,32 +8003,37 @@ def handle_commands():
                     text = raw_text.upper()
                 elif text == "/Z":
                     text = "/ZONES"
-                elif text == "/ML" or text == "/MYLINE":
-                    text = "/MYLINES"
-
                 elif text == "/LIST":
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
 
                 elif text == "/MYLINES":
-                    mine = {k: v for k, v in manual_lines.items() if v.get("chat_id") == chat_id or v.get("chat_id") == ADMIN_CHAT_ID}
+                    all_lines = {k: v for k, v in manual_lines.items()}
+                    mine = {k: v for k, v in all_lines.items()
+                            if str(v.get("chat_id","")) == str(chat_id) or
+                               str(v.get("chat_id","")) == str(ADMIN_CHAT_ID)}
                     if not mine:
-                        reply("📏 You have no active lines. Use /addline SYMBOL PRICE 1h to add one.")
+                        reply(f"📏 No active lines. ({len(all_lines)} total in system)\nUse /addline SYMBOL PRICE 1h to add one.")
                     else:
                         lines_out = []
                         for lid, ln in mine.items():
-                            state_label = {"waiting": "⏳ waiting", "broken": "📈 broken/retest", "followup": "🔎 tracking"}.get(ln.get("state"), ln.get("state",""))
-                            lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
-                        reply("📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
+                            state_label = {"waiting": "⏳", "broken": "📈", "followup": "🔎"}.get(ln.get("state",""), ln.get("state",""))
+                            lines_out.append(f"• <code>{lid}</code> {ln['symbol']} {ln.get('tf','').upper()} @ {format_price(ln['price'])} {state_label}")
+                        reply(f"📏 <b>Your lines ({len(mine)}):</b>\n\n" + "\n".join(lines_out))
 
                 elif text == "/ZONES":
                     if not manual_zones:
-                        reply("📐 No active zones. Use /addzone SYMBOL LOW HIGH 4h to add one.")
+                        reply(f"📐 No active zones. Use /addzone SYMBOL LOW HIGH 4h to add one.")
                     else:
                         lines_out = []
                         for zid, z in manual_zones.items():
-                            lines_out.append(f"• <code>{zid}</code> — {z['symbol']} {z['tf'].upper()} {format_price(z['low'])}–{format_price(z['high'])} ({z.get('state','waiting')})")
-                        reply("📐 <b>Active zones:</b>\n\n" + "\n".join(lines_out))
+                            state = z.get("state", "waiting")
+                            state_emoji = "⏳" if state == "waiting" else "✅" if state == "confirmed" else "❌"
+                            lines_out.append(
+                                f"• <code>{zid}</code> {z['symbol']} {z.get('tf','4h').upper()} "
+                                f"{format_price(z['low'])}–{format_price(z['high'])} {state_emoji}"
+                            )
+                        reply(f"📐 <b>Active zones ({len(manual_zones)}):</b>\n\n" + "\n".join(lines_out))
 
                 elif text.startswith("/ENTRY "):
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
