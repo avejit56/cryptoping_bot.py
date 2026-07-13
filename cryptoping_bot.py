@@ -9230,5 +9230,6 @@ def main():
         auto_update_watchlist()
         time.sleep(CHECK_INTERVAL)
 
+
 if __name__ == "__main__":
     main()
