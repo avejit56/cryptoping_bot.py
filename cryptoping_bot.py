@@ -88,6 +88,7 @@ def _rate_limited_get(url, *args, **kwargs):
 http_session.get = _rate_limited_get
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # set in Railway → Variables
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # set in Railway → Variables
 BOT_VERSION = "v2.1"  # increment this with every update
 
 
