@@ -4563,11 +4563,16 @@ def calc_entry_score(symbol):
     return {
         "score": score, "max_score": max_score, "label": label,
         "details": details, "price": current_price,
-        "pattern_note": pattern_notes.get("4h"),  # kept for backward compatibility
+        "pattern_note": pattern_notes.get("4h"),
         "pattern_note_4h": pattern_notes.get("4h"),
         "pattern_note_1h": pattern_notes.get("1h"),
-        "pattern_notes": pattern_notes,  # {tf_label: note} for all timeframes that had one
-        "chart_patterns": chart_patterns,  # list of detected pattern strings
+        "pattern_notes": pattern_notes,
+        "chart_patterns": chart_patterns,
+        # Pass klines so build_powerful_entry can reuse — avoids duplicate API calls
+        "klines_4h": klines_4h,
+        "klines_1h": klines_1h,
+        "klines_1d": klines_1d,
+        "ticker": ticker,
     }
 
 
@@ -5199,6 +5204,7 @@ def check_entry_watches():
                     if l_close > l_open and l_close > p_high and vol_r >= 1.5:
                         improvements.append(f"✅ Retest confirmed [{tf.upper()}] — green candle + volume ({vol_r:.1f}x)")
                         _entry_watch[symbol]["retest_alerted"] = True
+                        _entry_watch[symbol]["confirmed_tf"] = tf
                         break
 
             # ── Daily trend shift ──
@@ -5209,10 +5215,13 @@ def check_entry_watches():
 
             # ── Fire alert if improvements found ──
             if improvements:
-                # Re-run full entry analysis
                 result = calc_entry_score(symbol)
                 if result:
                     ob_data = get_order_book_clusters(symbol)
+                    # Override pattern_notes with confirmed TF from watch
+                    confirmed_tf = watch.get("confirmed_tf")
+                    if confirmed_tf and result.get("pattern_notes") is not None:
+                        result["pattern_notes"][confirmed_tf] = "Retest confirmed"
                     entry_msg = build_powerful_entry(symbol, result, ob_data)
 
                     improvement_str = "\n".join(f"  {i}" for i in improvements)
@@ -5455,11 +5464,13 @@ def build_powerful_entry(sym, result, ob_data):
         if m:
             pattern_line = m.group(1)
 
-    # ── Fetch klines ──
-    klines_4h = get_klines(sym, interval="4h", limit=100)
-    klines_1h = get_klines(sym, interval="1h", limit=50)
-    klines_1d = get_klines(sym, interval="1d", limit=60)
-    ticker    = get_ticker(sym)
+    # ── Fetch klines — use cached from calc_entry_score if available ──
+    klines_4h = result.get("klines_4h") or get_klines(sym, interval="4h", limit=100)
+    klines_1h = result.get("klines_1h") or get_klines(sym, interval="1h", limit=50)
+    klines_1d = result.get("klines_1d") or get_klines(sym, interval="1d", limit=60)
+    ticker    = result.get("ticker")    or get_ticker(sym)
+    if not ticker or not klines_4h:
+        return f"📊 {sym} — could not fetch data"
 
     change_24h = float(ticker["priceChangePercent"]) if ticker else 0
     vol_24h    = float(ticker.get("quoteVolume", 0)) if ticker else 0
@@ -6963,7 +6974,7 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             details.append("— No liq sweep")
 
         # Fire if score >= 4
-        if score < 4:
+        if score < 3:  # lowered from 4 for broader coverage
             return
 
         _high_confidence_alerted[key] = now
@@ -7046,7 +7057,7 @@ def scan_global_liq_reclaim():
                 vol_r = k_vol / avg_vol_5m if avg_vol_5m > 0 else 0
 
                 # Sweep: long lower wick + reclaim above open + volume
-                if wick_ratio >= 0.45 and k_close > k_open and vol_r >= 2.0:
+                if wick_ratio >= 0.40 and k_close > k_open and vol_r >= 1.5:
                     sweep_candle = k
                     sweep_low = k_low
                     sweep_vol_ratio = vol_r
@@ -7901,6 +7912,29 @@ def handle_commands():
                 if not text:
                     continue
 
+                # ── Command shortcuts — normalize FIRST before any if/elif ──
+                if text.startswith("/E ") and not text.startswith("/ENTRY"):
+                    raw_text = "/entry " + raw_text[3:]
+                    text = raw_text.upper()
+                elif text == "/E":
+                    text = "/ENTRY"
+                elif text.startswith("/W ") and not text.startswith("/WATCH"):
+                    raw_text = "/watch " + raw_text[3:]
+                    text = raw_text.upper()
+                elif text == "/W":
+                    text = "/WATCH"
+                elif text.startswith("/S ") and not text.startswith("/SUGGEST") and not text.startswith("/STATUS") and not text.startswith("/SUBSCRIBE"):
+                    raw_text = "/suggest " + raw_text[3:]
+                    text = raw_text.upper()
+                elif text.startswith("/U ") and not text.startswith("/UNWATCH"):
+                    raw_text = "/unwatch " + raw_text[3:]
+                    text = raw_text.upper()
+                elif text == "/Z":
+                    text = "/ZONES"
+                elif text in ("/ML", "/MYLINE"):
+                    text = "/MYLINES"
+
+                # ── Main command chain ──
                 if text == "/START":
                     if chat_id not in subscribers:
                         subscribers.append(chat_id)
@@ -7976,7 +8010,7 @@ def handle_commands():
                 elif text == "/ML" or text == "/MYLINE":
                     text = "/MYLINES"
 
-                if text == "/LIST":
+                elif text == "/LIST":
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
 
@@ -9125,7 +9159,7 @@ def main():
                 check_entry_watches()
             except Exception as e:
                 print(f"Entry watch error: {e}")
-            time.sleep(300)  # every 5 minutes
+            time.sleep(600)  # every 10 minutes
 
     Thread(target=run_entry_watches, daemon=True).start()
 
