@@ -272,6 +272,47 @@ def load_zones():
     except Exception as e:
         print(f"Zone load error: {e}")
 
+def auto_add_zone(sym, tf, low, high, source="auto_high_priority"):
+    """
+    Auto-adds a zone (used by the High Priority auto-zone feature). Reuses
+    the same duplicate/overlap check as the manual /addzone command so
+    auto-added zones never collide with existing ones (manual or auto).
+    Returns the new zone_id on success, or None if skipped (duplicate or
+    invalid range).
+    """
+    try:
+        if low is None or high is None or low >= high:
+            return None
+        for eid, ez in manual_zones.items():
+            try:
+                if ez.get("symbol") != sym or ez.get("tf", "4h") != tf:
+                    continue
+                e_low, e_high = ez["low"], ez["high"]
+                overlaps = low <= e_high and high >= e_low
+                nearly_same = (
+                    abs(low - e_low) <= e_low * 0.005
+                    and abs(high - e_high) <= e_high * 0.005
+                )
+                if overlaps or nearly_same:
+                    return None  # duplicate/overlap — skip silently
+            except Exception:
+                continue
+        zone_count = sum(1 for k in manual_zones if k.startswith(f"{sym}_{tf}"))
+        zone_id = f"{sym}_{tf}_{zone_count+1}"
+        manual_zones[zone_id] = {
+            "symbol": sym, "tf": tf,
+            "low": low, "high": high,
+            "added_time": time.time(),
+            "state": "waiting",
+            "alert_sent_time": 0,
+            "source": source,
+        }
+        save_zones()
+        return zone_id
+    except Exception as e:
+        print(f"Auto zone add error {sym}: {e}")
+        return None
+
 def save_manual_lines():
     try:
         with open(MANUAL_LINES_FILE, "w") as f:
@@ -430,6 +471,8 @@ def save_cooldown_trackers():
             "zone_high_alerted": zone_high_alerted,
             "big_pump_alerted": big_pump_alerted,
             "breakout_alerted": breakout_alerted,
+            "_global_liq_alerted": _global_liq_alerted,
+            "_high_confidence_alerted": _high_confidence_alerted,
         }
         with open(COOLDOWN_TRACKERS_FILE, "w") as f:
             _json.dump(bundle, f, indent=2)
@@ -457,6 +500,8 @@ def load_cooldown_trackers():
             zone_high_alerted.update(bundle.get("zone_high_alerted", {}))
             big_pump_alerted.update(bundle.get("big_pump_alerted", {}))
             breakout_alerted.update(bundle.get("breakout_alerted", {}))
+            _global_liq_alerted.update(bundle.get("_global_liq_alerted", {}))
+            _high_confidence_alerted.update(bundle.get("_high_confidence_alerted", {}))
             total = sum(len(v) if isinstance(v, dict) else 0 for v in bundle.values())
             print(f"✅ Cooldown trackers loaded: {total} entries across {len(bundle)} dicts")
         else:
@@ -591,10 +636,12 @@ def send_to(chat_id, message, thread_id=None):
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         if thread_id:
             payload["message_thread_id"] = thread_id
-        http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json=payload, timeout=10)
-    except:
-        pass
+        if r.status_code != 200:
+            print(f"⚠️ send_to failed: HTTP {r.status_code} — {r.text[:300]} (len={len(message)})")
+    except Exception as e:
+        print(f"⚠️ send_to exception: {e}")
 
 def send_to_topic(topic_id, message):
     """Send a message to a specific topic in the CryptoPing Alerts group"""
@@ -1690,6 +1737,7 @@ def check_range_breakout(symbol, tf, klines):
             }
             print(f"🚀 Range breakout CONFIRMED (4H hold): {symbol} +{breakout_pct:.1f}% above range")
             track_building_signal(symbol, "Range Breakout [1H→4H]", current_price)
+            check_high_confidence_signal(symbol, "Range Breakout [1H→4H]", current_price)
         elif current_price < range_high * 0.97:
             # Price dropped back below the range — false breakout, discard
             range_breakout_tracking.pop(symbol, None)
@@ -1802,6 +1850,7 @@ def check_range_breakout(symbol, tf, klines):
         }
         print(f"🚀 Range breakout (4H direct): {symbol} vol={vol_ratio:.1f}x")
         track_building_signal(symbol, "Range Breakout [4H]", current_price)
+        check_high_confidence_signal(symbol, "Range Breakout [4H]", current_price)
 
 
 # ─── HIGHER LOWS ──────────────────────────────────────────
@@ -2471,9 +2520,12 @@ def check_manual_zones():
                 ])
                 is_top_pick = top_pick_signals >= 2
 
-                # Route to My Setups (manual zone) always, plus Top Picks if qualifies
-                send_to_topic(TOPIC_MY_SETUPS, msg)
-                if is_top_pick:
+                # Route based on zone origin: auto-added (from High Priority)
+                # zones' results go back to High Priority; user's manually
+                # /addzone-added zones keep going to My Setups as before.
+                zone_dest = TOPIC_HIGH if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
+                send_to_topic(zone_dest, msg)
+                if is_top_pick and zone_dest != TOPIC_TOP_PICKS:
                     send_to_topic(TOPIC_TOP_PICKS, msg)
                 # Subscriber DMs
                 for sub_chat_id in subscribers:
@@ -2580,7 +2632,10 @@ def check_manual_zones():
                             f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                             f"⚠️ <i>Strong retest! Take the entry.</i>"
                         )
-                        send_all(ret_msg, symbol=symbol)
+                        zone_dest = TOPIC_HIGH if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
+                        for sub_chat_id in subscribers:
+                            send_to(sub_chat_id, ret_msg)
+                        send_to_topic(zone_dest, ret_msg)
                         print(f"🔄 Retest confirmed: {zone_id}")
                         if score >= 70:
                             push_signal_to_queue({
@@ -3199,6 +3254,81 @@ def check_active_trades_fast():
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
         print(f"{emoji} Trade monitor: {symbol} — {verdict}")
+
+
+def check_no_retest_pump_risk(symbol):
+    """
+    Early-warning detector for coins likely to pump 10-60%+ WITHOUT ever
+    giving a retest (unlike check_explosive_pump, this doesn't require the
+    move to already be 3 candles deep — it looks at the breakout candle
+    itself: body strength, abnormal volume vs baseline, and buy pressure).
+    Fires to Top Picks, then feeds the same instant-analysis promotion
+    pipeline (check_high_confidence_signal) that can escalate it to High
+    Priority as ⭐ HIGH CONFIDENCE if the broader confluence also checks out.
+    """
+    now = time.time()
+    key = f"{symbol}_noretest_pump"
+    if now - alerted_coins.get(key, 0) < 4 * 3600:
+        return
+
+    klines_1h = get_klines(symbol, interval="1h", limit=15)
+    if not klines_1h or len(klines_1h) < 10:
+        return
+
+    closed = klines_1h[:-1]
+    last = closed[-1]
+    l_open, l_close = float(last[1]), float(last[4])
+    l_vol = float(last[5])
+    l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+
+    if l_close <= l_open:
+        return  # must be a bullish breakout candle
+
+    body_pct = (l_close - l_open) / l_open * 100
+    if body_pct < 3.0:
+        return  # not a strong enough breakout candle
+
+    prev_vols = [float(k[5]) for k in closed[-8:-1]]
+    avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 1
+    vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+    if vol_ratio < 5.0:
+        return  # lower bar than check_explosive_pump's 10x — this fires earlier/faster
+
+    buy_ratio = l_buy / l_vol if l_vol > 0 else 0
+    if buy_ratio < 0.62:
+        return  # must be strongly buy-dominant
+
+    ticker = get_ticker(symbol)
+    if not ticker:
+        return
+    current_price = float(ticker["lastPrice"])
+    change_24h = float(ticker["priceChangePercent"])
+    if change_24h < 0:
+        return
+
+    # Still reasonably near the breakout candle's close (not already dumped)
+    if current_price < l_close * 0.95:
+        return
+
+    alerted_coins[key] = now
+
+    send_to_topic(TOPIC_TOP_PICKS,
+        f"⚠️ <b>PUMP RISK — NO RETEST YET</b>\n\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"📊 24h: {change_24h:+.2f}%\n"
+        f"🕯 Breakout candle: +{body_pct:.1f}% body, {vol_ratio:.1f}x volume\n"
+        f"🟢 Buy pressure: {buy_ratio*100:.0f}%\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"🚀 High probability of a 10-60%+ extended pump WITHOUT a retest.\n"
+        f"💡 Consider entry now based on volume/BS strength — waiting for a retest may mean missing this one.\n\n"
+        f"⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
+    )
+    track_building_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
+    check_high_confidence_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
+    print(f"⚠️ No-retest pump risk: {symbol} body={body_pct:.1f}% vol={vol_ratio:.1f}x buy={buy_ratio*100:.0f}%")
+
+
 def check_explosive_pump(symbol):
     """
     Detect a sudden explosive move across 1-3 candles.
@@ -3586,6 +3716,7 @@ def check_prepump(symbol):
         }
         print(f"🔔 Phase 2: {symbol}")
         track_building_signal(symbol, "Pre-pump Phase 2", current_price)
+        check_high_confidence_signal(symbol, "Pre-pump Setup [1H]", current_price)
         return
 
     # ── PHASE 3: Breakout — High Priority ──
@@ -3615,6 +3746,7 @@ def check_prepump(symbol):
         }
         print(f"🚀 Phase 3: {symbol}")
         track_building_signal(symbol, "Pre-pump Phase 3 🚀", current_price)
+        check_high_confidence_signal(symbol, "Pre-pump Setup [1H]", current_price)
 
 
 
@@ -4062,6 +4194,24 @@ def check_timeframe(symbol, tf):
         return
     if close_price <= open_price:
         return
+
+    # ── Fake breakout filter (note #1 backlog) ──
+    # (1) Consolidation before spike: prior candles should show a tight range,
+    #     not already trending/volatile — a real breakout emerges from a base.
+    candle_low = float(candle[3])
+    candle_range = spike_high - candle_low
+    prior_ranges_pct = [
+        (float(k[2]) - float(k[3])) / float(k[3]) * 100
+        for k in klines[-9:-2] if float(k[3]) > 0
+    ]
+    if prior_ranges_pct and (sum(prior_ranges_pct) / len(prior_ranges_pct)) > 3.0:
+        return  # prior candles too volatile to call this a real consolidation base
+
+    # (2) Breakout candle must have a real body, not just a long wick.
+    if candle_range > 0 and ((close_price - open_price) / candle_range) < 0.4:
+        return  # mostly wick — likely a fake/failed breakout attempt
+
+    # (3) Volume spike on the breakout candle itself is already required above.
 
     closes = [float(k[4]) for k in klines[:-1]]
     ema20 = calculate_ema(closes, 20)
@@ -5213,8 +5363,10 @@ def check_entry_watches():
                         break
 
             # ── Daily trend shift ──
+            daily_down_fresh = None
             if not watch["trend_alerted"] and "daily_down" in watch["weak_reasons"]:
-                if not is_daily_downtrend(symbol, current_price):
+                daily_down_fresh = is_daily_downtrend(symbol, current_price)
+                if not daily_down_fresh:
                     improvements.append("✅ Daily trend shifted bullish — bearish filter cleared")
                     _entry_watch[symbol]["trend_alerted"] = True
 
@@ -5227,7 +5379,13 @@ def check_entry_watches():
                     confirmed_tf = watch.get("confirmed_tf")
                     if confirmed_tf and result.get("pattern_notes") is not None:
                         result["pattern_notes"][confirmed_tf] = "Retest confirmed"
-                    entry_msg = build_powerful_entry(symbol, result, ob_data)
+                    # Reuse the daily_down_fresh result computed above (if we just
+                    # detected/checked a trend shift) so the rendered entry block
+                    # below can't contradict the "shifted bullish" header — both
+                    # now agree on the same is_daily_downtrend() call.
+                    entry_msg, _entry_meta = build_powerful_entry(
+                        symbol, result, ob_data, daily_down_override=daily_down_fresh
+                    )
 
                     improvement_str = "\n".join(f"  {i}" for i in improvements)
                     pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
@@ -5258,13 +5416,25 @@ def check_entry_watches():
         _entry_watch.pop(s, None)
 
 
-def start_liq_watch(symbol, ob_data, entry_price, chat_id):
+def start_liq_watch(symbol, ob_data, entry_price, chat_id, eql_price=None, eql_touches=None):
     """Called after /entry — starts background liquidation monitoring.
-    Works even if no liq zone exists yet — will detect one as it develops."""
+    Works even if no liq zone exists yet — will detect one as it develops.
+    Prefers the EQL level (real historical liquidity pool flagged in the /entry
+    analysis, e.g. 'Liquidity Hunt Risk') over the live order-book cluster,
+    since EQL is the specific 'wait for sweep+reclaim' level shown to the user."""
     lz = ob_data.get("liq_zone") if ob_data else None
+    if eql_price:
+        watch_price, watch_source, watch_usdt = eql_price, "EQL", 0
+    elif lz:
+        watch_price, watch_source, watch_usdt = lz["price"], "OB", lz["usdt"]
+    else:
+        watch_price, watch_source, watch_usdt = None, None, 0
+
     _liq_watch[symbol] = {
-        "liq_price":  lz["price"] if lz else None,
-        "liq_usdt":   lz["usdt"] if lz else 0,
+        "liq_price":   watch_price,
+        "liq_usdt":    watch_usdt,
+        "liq_source":  watch_source,
+        "liq_touches": eql_touches,
         "entry_price": entry_price,
         "chat_id":    chat_id,
         "started":    time.time(),
@@ -5272,7 +5442,8 @@ def start_liq_watch(symbol, ob_data, entry_price, chat_id):
         "sweep_time": None,
         "alerted":    False,
     }
-    print(f"💧 Liq watch started: {symbol} @ {format_price(lz['price']) if lz else 'no zone yet'}")
+    src_note = f" ({watch_source}{f', {eql_touches}x tested' if watch_source=='EQL' and eql_touches else ''})" if watch_source else ""
+    print(f"💧 Liq watch started: {symbol} @ {format_price(watch_price) if watch_price else 'no zone yet'}{src_note}")
 
 
 def check_liq_watches():
@@ -5428,7 +5599,7 @@ def check_liq_watches():
         _liq_watch.pop(s, None)
 
 
-def build_powerful_entry(sym, result, ob_data):
+def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
     """
     Builds the new comprehensive /entry message with:
     - Daily trend + volume + SMC all-in-one
@@ -5482,8 +5653,12 @@ def build_powerful_entry(sym, result, ob_data):
 
     analysis_lines = []
 
-    # ── Daily trend — use cached klines ──
-    daily_down = is_daily_downtrend(sym, current_price, klines_1h=klines_1h, klines_daily=klines_1d)
+    # ── Daily trend — use cached klines (or a caller-provided override so
+    # this can't disagree with an earlier trend-shift check on the same call) ──
+    daily_down = (
+        daily_down_override if daily_down_override is not None
+        else is_daily_downtrend(sym, current_price, klines_1h=klines_1h, klines_daily=klines_1d)
+    )
     if not daily_down:
         analysis_lines.append("✅ Daily trend bullish/neutral")
     else:
@@ -5806,7 +5981,11 @@ def build_powerful_entry(sym, result, ob_data):
         lines.append(f"\n📏 <b>Zones to add:</b>\n" + "\n".join(zone_suggestions))
         lines.append("💡 Add both — whichever fires first = your entry signal")
 
-    return "\n".join(lines)
+    entry_meta = {
+        "eql_price":   nearest_eql["price"]   if nearest_eql else None,
+        "eql_touches": nearest_eql["touches"] if nearest_eql else None,
+    }
+    return "\n".join(lines), entry_meta
 
 
 def build_entry_decision_block(symbol, current_price, tf="4h"):
@@ -6876,19 +7055,23 @@ HIGH_WINRATE_SIGNALS = {
 
 def check_high_confidence_signal(symbol, signal_type, current_price):
     """
-    After a high win-rate signal fires, run confluence check.
-    Score 4+ → send to High Priority with full analysis.
-    Conditions: Volume 3x+, BS positive, Daily bullish,
-                Higher lows, OB zone, Liq sweep bonus.
+    Runs an instant confluence check after ANY signal fires (Top Picks,
+    Building Momentum, Quick Spikes, Signal Results types, etc).
+    Conditions checked: Volume 3x+, BS positive, Daily bullish,
+                Higher lows, OB zone, Liq sweep bonus (score out of 6).
+    Threshold: high win-rate signal types need score>=3 (original behavior,
+    unchanged). All other signal types are now also evaluated (previously
+    skipped entirely) using a broader score>=2 bar — this is the "catch every
+    big pump" promotion pipeline: Top Picks / Building Momentum / Quick Spikes
+    / Signal Results signals get promoted up to High Priority as
+    ⭐ HIGH CONFIDENCE when they clear this bar.
     """
-    # Only run for high win-rate signal types
     win_rate = None
     for sig, wr in HIGH_WINRATE_SIGNALS.items():
         if sig in signal_type:
             win_rate = wr
             break
-    if not win_rate:
-        return
+    required_score = 3 if win_rate else 2
 
     now = time.time()
     key = f"{symbol}_hc"
@@ -6978,8 +7161,8 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
         if not sweep_found:
             details.append("— No liq sweep")
 
-        # Fire if score >= 4
-        if score < 3:  # lowered from 4 for broader coverage
+        # Fire if score >= required_score (3 for high-winrate types, 2 otherwise)
+        if score < required_score:
             return
 
         _high_confidence_alerted[key] = now
@@ -6997,9 +7180,10 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
         rr = tp1_pct / risk if risk > 0 else 0
 
         details_str = "\n".join(f"   {d}" for d in details)
+        winrate_line = f"🏆 Signal: {signal_type} ({win_rate}% win rate)\n" if win_rate else f"🏆 Signal: {signal_type}\n"
         send_to_topic(TOPIC_HIGH,
             f"⭐ <b>HIGH CONFIDENCE — {symbol}</b>\n\n"
-            f"🏆 Signal: {signal_type} ({win_rate}% win rate)\n"
+            f"{winrate_line}"
             f"📊 Confluence Score: {score}/6\n\n"
             f"{details_str}\n\n"
             f"📐 Entry: {format_price(current_price)}\n"
@@ -7009,6 +7193,23 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             f"⚠️ <i>Confirm on chart before entry.</i>"
         )
         print(f"⭐ High confidence: {symbol} score={score}/6 signal={signal_type}")
+
+        # ── Auto-add 4 high-confluence zones around this High Priority signal ──
+        # 2 above current price (resistance/EQH), 2 below (support/EQL).
+        # Tagged "auto_high_priority" so its confirm/retest results route back
+        # to High Priority instead of My Setups. Duplicate/overlap-safe.
+        try:
+            sym_short = symbol.replace("USDT", "")
+            eq_highs_above = [h for h in eql_data["eq_highs"] if h["price"] > current_price][:2]
+            eq_lows_below  = [l for l in eql_data["eq_lows"]  if l["price"] < current_price][:2]
+            for h in eq_highs_above:
+                margin = h["price"] * 0.01
+                auto_add_zone(sym_short, "4h", h["price"] - margin, h["price"] + margin)
+            for l in eq_lows_below:
+                margin = l["price"] * 0.01
+                auto_add_zone(sym_short, "4h", l["price"] - margin, l["price"] + margin)
+        except Exception as e:
+            print(f"Auto-zone (high confidence) error {symbol}: {e}")
 
     except Exception as e:
         print(f"High confidence check error {symbol}: {e}")
@@ -7148,10 +7349,14 @@ def scan_global_liq_reclaim():
             if pos_confluence < 1:
                 continue
 
-            # All liq reclaim signals → High Priority
-            # (weak ones already filtered by pos_confluence < 1 check above)
-            target_topic = TOPIC_HIGH
+            # Redesign: LIQUIDITY RECLAIM / RETEST RECLAIM / POWER SIGNAL no longer
+            # go straight to High Priority — they go to Top Picks. A separate
+            # instant-analysis promotion check (below) decides if this specific
+            # instance is strong enough to also land in High Priority as
+            # ⭐ HIGH CONFIDENCE. This keeps High Priority low-noise.
+            target_topic = TOPIC_TOP_PICKS
             signal_prefix = "🎯 RETEST RECLAIM" if is_retest_reclaim else "🔥 LIQUIDITY RECLAIM"
+            promotion_signal_type = "Retest Reclaim" if is_retest_reclaim else "Liquidity Reclaim"
             is_power_signal = (
                 is_retest_reclaim and
                 pos_confluence >= 4 and
@@ -7161,7 +7366,7 @@ def scan_global_liq_reclaim():
             )
             if is_power_signal:
                 signal_prefix = "🚀 POWER SIGNAL"
-                target_topic = TOPIC_HIGH
+                promotion_signal_type = "Power Signal"
 
             # ── TP scaling based on volume ──
             if sweep_vol_ratio >= 15:
@@ -7240,6 +7445,7 @@ def scan_global_liq_reclaim():
                 + suggest_str + prev_str +
                 f"\n\n⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
             )
+            check_high_confidence_signal(symbol, promotion_signal_type, current_price)
             track_building_signal(symbol, "Liquidity Reclaim", current_price)
             print(f"🔥 Global liq reclaim: {symbol} vol={sweep_vol_ratio:.1f}x")
 
@@ -7951,8 +8157,7 @@ def handle_commands():
                                 )
                             except Exception as e:
                                 print(f"⚠️ Skipping malformed line {lid}: {e}")
-                        out = "\n".join(rows) if rows else "(no valid lines to show)"
-                        reply(f"📏 <b>Lines ({len(rows)}):</b>\n\n{out}")
+                        send_chunked(reply_chat_id, rows, header=f"📏 <b>Lines ({len(rows)}):</b>\n\n")
                     continue
 
                 if text == "/ZONES":
@@ -7969,8 +8174,7 @@ def handle_commands():
                                 )
                             except Exception as e:
                                 print(f"⚠️ Skipping malformed zone {zid}: {e}")
-                        out = "\n".join(rows) if rows else "(no valid zones to show)"
-                        reply(f"📐 <b>Zones ({len(rows)}):</b>\n\n{out}")
+                        send_chunked(reply_chat_id, rows, header=f"📐 <b>Zones ({len(rows)}):</b>\n\n")
                     continue
 
                 # ── Main command chain ──
@@ -8134,7 +8338,7 @@ def handle_commands():
                             ob_data = get_order_book_clusters(sym)
 
                             # Build powerful entry message
-                            entry_msg = build_powerful_entry(sym, result, ob_data)
+                            entry_msg, entry_meta = build_powerful_entry(sym, result, ob_data)
 
                             # Extract confirmed TFs from pattern_notes for watch logic
                             pattern_notes = result.get("pattern_notes", {})
@@ -8155,7 +8359,9 @@ def handle_commands():
 
                             # Auto-start liquidation watch only if entry message sent
                             if entry_sent:
-                                start_liq_watch(sym, ob_data, result["price"], reply_chat_id)
+                                start_liq_watch(sym, ob_data, result["price"], reply_chat_id,
+                                                 eql_price=entry_meta.get("eql_price"),
+                                                 eql_touches=entry_meta.get("eql_touches"))
                                 # Note: liq sweep alerts go via entry watch (My Setups)
                                 # No separate "Liquidation watch started" message needed
 
@@ -8613,6 +8819,35 @@ def handle_commands():
                                     if z_low >= z_high:
                                         reply( "⚠️ Low must be less than High")
                                     else:
+                                        # Duplicate/overlap check — same symbol+tf zone that
+                                        # already covers this range (or is very close to it)
+                                        # gets rejected instead of creating a near-identical copy.
+                                        dup_id = None
+                                        for eid, ez in manual_zones.items():
+                                            try:
+                                                if ez["symbol"] != sym or ez.get("tf", "4h") != ztf:
+                                                    continue
+                                                e_low, e_high = ez["low"], ez["high"]
+                                                overlaps = z_low <= e_high and z_high >= e_low
+                                                nearly_same = (
+                                                    abs(z_low - e_low) <= e_low * 0.005
+                                                    and abs(z_high - e_high) <= e_high * 0.005
+                                                )
+                                                if overlaps or nearly_same:
+                                                    dup_id = eid
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if dup_id:
+                                            ez = manual_zones[dup_id]
+                                            reply(
+                                                f"⚠️ <b>Duplicate/overlapping zone</b>\n\n"
+                                                f"🪙 {sym} {ztf.upper()} already has a zone here:\n"
+                                                f"🔲 {format_price(ez['low'])} — {format_price(ez['high'])}\n"
+                                                f"🆔 ID: <code>{dup_id}</code>\n\n"
+                                                f"Use /removezone {dup_id} first if you want to replace it."
+                                            )
+                                            continue
                                         zone_count = sum(1 for k in manual_zones if k.startswith(f"{sym}_{ztf}"))
                                         zone_id = f"{sym}_{ztf}_{zone_count+1}"
                                         manual_zones[zone_id] = {
@@ -8621,6 +8856,7 @@ def handle_commands():
                                             "added_time": time.time(),
                                             "state": "waiting",
                                             "alert_sent_time": 0,
+                                            "source": "manual",
                                         }
 
                                         extra_lines = []
@@ -9096,6 +9332,7 @@ def main():
             check_buy_pressure(symbol)
             check_volume_surge(symbol)
             check_explosive_pump(symbol)
+            check_no_retest_pump_risk(symbol)
             check_abnormal_volume(symbol)
             check_prepump(symbol)
             check_big_pump_setup(symbol)
@@ -9181,6 +9418,7 @@ def main():
                             f"⚠️ <i>Check the chart before entry.</i>"
                         )
                         track_building_signal(symbol, "Range Breakout LIVE [1H]", current_price)
+                        check_high_confidence_signal(symbol, "Range Breakout LIVE [1H]", current_price)
                         print(f"⚡ Fast range scanner: {symbol} +{pct:.1f}%")
             except Exception as e:
                 print(f"Fast range scanner error: {e}")
