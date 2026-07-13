@@ -625,8 +625,12 @@ def send_chunked(chat_id, lines, header=""):
 
 def get_topic_for_message(message):
     """Decide which topic to route this message to, based on its content"""
-    if any(x in message for x in ["ZONE CONFIRMED", "RETEST CONFIRMED", "EXPLOSIVE PUMP", "MANUAL ZONE", "OB BOUNCE", "BUY PRESSURE", "TRENDLINE RETEST", "BREAKOUT!", "LIQUIDITY RECLAIM", "POWER SIGNAL"]):
+    if any(x in message for x in ["LIQUIDITY RECLAIM", "POWER SIGNAL", "RETEST RECLAIM", "HIGH CONFIDENCE"]):
         return TOPIC_HIGH
+    elif any(x in message for x in ["ZONE CONFIRMED", "RETEST CONFIRMED", "OB BOUNCE", "TRENDLINE RETEST", "Line Retest Complete", "Retest Complete"]):
+        return TOPIC_MY_SETUPS
+    elif any(x in message for x in ["EXPLOSIVE PUMP", "BUY PRESSURE", "BREAKOUT!"]):
+        return TOPIC_BUILDUPS
     elif any(x in message for x in ["VOLUME SPIKE", "VOLUME SURGE", "EARLY SIGNAL CONFIRMED"]):
         return TOPIC_SPIKES
     elif any(x in message for x in ["BUILD-UP", "ACCUMULATION", "HIGHER LOW", "DIRECT MOMENTUM", "PHASE 1", "PHASE 2", "PHASE 3", "PRE-PUMP", "Breakout!"]):
@@ -7908,27 +7912,51 @@ def handle_commands():
                 if not text:
                     continue
 
-                # ── Command shortcuts — normalize FIRST before any if/elif ──
-                if text.startswith("/E ") and not text.startswith("/ENTRY"):
-                    raw_text = "/entry " + raw_text[3:]
-                    text = raw_text.upper()
-                elif text == "/E":
-                    text = "/ENTRY"
+                # ── Bulletproof shortcuts — processed BEFORE any chain ──
+                _shortcut_map = {
+                    "/E": "/ENTRY", "/W": "/WATCH", "/Z": "/ZONES",
+                    "/ML": "/MYLINES", "/MYLINE": "/MYLINES",
+                    "/U": "/UNWATCH",
+                }
+                if text in _shortcut_map:
+                    text = _shortcut_map[text]
+                elif text.startswith("/E ") and not text.startswith("/ENTRY"):
+                    raw_text = "/entry " + raw_text[3:]; text = raw_text.upper()
                 elif text.startswith("/W ") and not text.startswith("/WATCH"):
-                    raw_text = "/watch " + raw_text[3:]
-                    text = raw_text.upper()
-                elif text == "/W":
-                    text = "/WATCH"
-                elif text.startswith("/S ") and not text.startswith("/SUGGEST") and not text.startswith("/STATUS") and not text.startswith("/SUBSCRIBE"):
-                    raw_text = "/suggest " + raw_text[3:]
-                    text = raw_text.upper()
+                    raw_text = "/watch " + raw_text[3:]; text = raw_text.upper()
+                elif text.startswith("/S ") and not text.startswith("/SUGGEST") and not text.startswith("/STATUS"):
+                    raw_text = "/suggest " + raw_text[3:]; text = raw_text.upper()
                 elif text.startswith("/U ") and not text.startswith("/UNWATCH"):
-                    raw_text = "/unwatch " + raw_text[3:]
-                    text = raw_text.upper()
-                elif text == "/Z":
-                    text = "/ZONES"
-                elif text in ("/ML", "/MYLINE"):
-                    text = "/MYLINES"
+                    raw_text = "/unwatch " + raw_text[3:]; text = raw_text.upper()
+
+                # ── Bulletproof direct handlers (respond immediately, skip chain) ──
+                if text == "/MYLINES":
+                    mine = {k: v for k, v in manual_lines.items()
+                            if str(v.get("chat_id","")) in (str(chat_id), str(ADMIN_CHAT_ID))}
+                    if not mine:
+                        reply(f"📏 No active lines. Use /addline SYMBOL PRICE 1h to add one.")
+                    else:
+                        out = "\n".join(
+                            f"• <code>{lid}</code> {v['symbol']} {v.get('tf','').upper()} "
+                            f"@ {format_price(v['price'])} "
+                            f"({'⏳' if v.get('state')=='waiting' else '📈' if v.get('state')=='broken' else '🔎'})"
+                            for lid, v in mine.items()
+                        )
+                        reply(f"📏 <b>Lines ({len(mine)}):</b>\n\n{out}")
+                    continue
+
+                if text == "/ZONES":
+                    if not manual_zones:
+                        reply("📐 No active zones. Use /addzone SYMBOL LOW HIGH 4h to add one.")
+                    else:
+                        out = "\n".join(
+                            f"• <code>{zid}</code> {z['symbol']} {z.get('tf','4h').upper()} "
+                            f"{format_price(z['low'])}–{format_price(z['high'])} "
+                            f"({'⏳' if z.get('state')=='waiting' else '✅'})"
+                            for zid, z in manual_zones.items()
+                        )
+                        reply(f"📐 <b>Zones ({len(manual_zones)}):</b>\n\n{out}")
+                    continue
 
                 # ── Main command chain ──
                 if text == "/START":
