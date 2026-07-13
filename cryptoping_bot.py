@@ -1498,6 +1498,7 @@ def check_volume_buildup(symbol, tf, klines):
                 "highest_after": price,
             }
             track_building_signal(symbol, f"Volume Build-up [{cfg['label']}]", price)
+        check_high_confidence_signal(symbol, f"Volume Build-up [{cfg['label']}]", price)
 """
 The existing check_volume_buildup() catches 3 consecutive candles each with
 2.5x+ volume — a short burst pattern. But some coins pump after a multi-day
@@ -1602,6 +1603,7 @@ def check_gradual_buildup(symbol, tf, klines):
     }
     print(f"🌊 Gradual buildup: {symbol} [{tf}] vol_slope={vol_slope:.1f} ratio={recent_vol_ratio:.1f}x{' [LIVE]' if live_moving else ''}")
     track_building_signal(symbol, f"Gradual Buildup [{tf.upper()}]", price)
+    check_high_confidence_signal(symbol, f"Gradual Buildup [{tf.upper()}]", price)
 
 
 # ─── RANGE BREAKOUT DETECTOR (ARPA case) ──────────────────
@@ -1863,6 +1865,7 @@ def check_higher_lows(symbol, tf, klines):
                 "highest_after": price,
             }
             track_building_signal(symbol, f"Accumulation [{cfg['label']}]", price)
+        check_high_confidence_signal(symbol, f"Accumulation [{cfg['label']}]", price)
 def check_buy_pressure(symbol):
     now = time.time()
     key = f"{symbol}_buypressure"
@@ -2015,6 +2018,7 @@ def check_volume_surge(symbol):
             "highest_after": current_price,
         }
         track_building_signal(symbol, "Volume Surge [1H]", current_price)
+        check_high_confidence_signal(symbol, "Volume Surge [1H]", current_price)
 def zone_history_key(symbol, z_low, z_high):
     """Stable key for a price zone, rounded so near-identical zones match"""
     return f"{symbol}_{z_low:.8f}_{z_high:.8f}"
@@ -3290,6 +3294,7 @@ def check_explosive_pump(symbol):
             "highest_after": current_price,
         }
         track_building_signal(symbol, "Explosive Pump [5M]", current_price)
+        check_high_confidence_signal(symbol, "Explosive Pump [5M]", current_price)
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
 def is_daily_downtrend(symbol, current_price):
@@ -4118,6 +4123,7 @@ def check_timeframe(symbol, tf):
             "highest_after": price,
         }
         track_building_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
+        check_high_confidence_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
 
     track_key = f"{symbol}_{tf}"
     momentum_tracking[track_key] = {
@@ -4667,6 +4673,7 @@ def calc_entry_score(symbol):
             "highest_after": price,
         }
         track_building_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
+        check_high_confidence_signal(symbol, f"Volume Spike [{cfg['label']}]", price)
 
     track_key = f"{symbol}_{tf}"
     momentum_tracking[track_key] = {
@@ -5103,7 +5110,8 @@ def start_entry_watch(symbol, chat_id, entry_price, weak_reasons, entry_analysis
         "vol_alerted":    False,
         "retest_alerted": False,
         "trend_alerted":  False,
-        "expires":        time.time() + 48 * 3600,  # watch for 48h
+        "bs_alerted":     False,
+        "expires":        time.time() + 48 * 3600,
     }
     print(f"👁 Entry watch started: {symbol} weak={weak_reasons}")
 
@@ -5145,6 +5153,30 @@ def check_entry_watches():
                     if vol_ratio >= 3.0:
                         improvements.append(f"⚡ Volume spike: {vol_ratio:.1f}x (was low before)")
                         _entry_watch[symbol]["vol_alerted"] = True
+
+            # ── BS (Buy/Sell Pressure) turned positive ──
+            if not watch.get("bs_alerted"):
+                klines_1h_bs = get_klines(symbol, interval="1h", limit=6)
+                if klines_1h_bs and len(klines_1h_bs) >= 3:
+                    closed_bs = klines_1h_bs[:-1]
+                    # Taker buy volume in field [9], total in [5]
+                    bs_values = []
+                    for k in closed_bs[-3:]:
+                        total_vol = float(k[5])
+                        buy_vol   = float(k[9]) if len(k) > 9 else total_vol * 0.5
+                        sell_vol  = total_vol - buy_vol
+                        bs_values.append(buy_vol - sell_vol)
+                    net_bs = sum(bs_values)
+                    was_negative = "bs_was_negative" in watch
+                    if not was_negative and net_bs < 0:
+                        _entry_watch[symbol]["bs_was_negative"] = True
+                    elif was_negative and net_bs > 0:
+                        bs_usdt = net_bs * float(ticker["lastPrice"])
+                        improvements.append(
+                            f"📈 Buy/Sell pressure turned POSITIVE (+{bs_usdt/1000:.1f}K USDT)\n"
+                            f"   → Sellers backing off — entry window opening"
+                        )
+                        _entry_watch[symbol]["bs_alerted"] = True
 
             # ── Retest confirm check ──
             if not watch["retest_alerted"]:
@@ -5521,8 +5553,25 @@ def build_powerful_entry(sym, result, ob_data):
                 f"({touches}x tested, {eql_pct:.1f}% below)"
             )
 
-    # ── Long Base / Coil After Pump detection ──
-    tp_levels = []  # initialized here so coil can add pump high as TP
+    # ── BS (Buy/Sell Pressure) ──
+    bs_note = ""
+    bs_positive = False
+    if klines_1h and len(klines_1h) >= 4:
+        closed_1h_bs = klines_1h[:-1]
+        bs_sum = 0
+        for k in closed_1h_bs[-3:]:
+            total_v = float(k[5])
+            buy_v   = float(k[9]) if len(k) > 9 else total_v * 0.5
+            bs_sum += (buy_v - (total_v - buy_v))
+        bs_usdt = bs_sum * current_price
+        if bs_sum > 0:
+            bs_note = f"✅ BS Pressure: Positive (+{bs_usdt/1000:.1f}K) — buyers in control"
+            bs_positive = True
+            analysis_lines.append(bs_note)
+        else:
+            bs_note = f"🔴 BS Pressure: Negative ({bs_usdt/1000:.1f}K) — sellers active, wait for flip"
+            analysis_lines.append(bs_note)
+            analysis_lines.append("   → Bot will alert when BS turns positive")
     base_note = ""
     coil_note = ""
     if klines_1d and len(klines_1d) >= 10:
@@ -5716,6 +5765,29 @@ def build_powerful_entry(sym, result, ob_data):
     )
 
     lines.append(f"\n🤖 <b>Opinion:</b>\n   {opinion}")
+
+    # ── Zone suggestions ──
+    zone_suggestions = []
+    sym_short = sym.replace("USDT", "")
+
+    # Current bounce zone (OB or support)
+    if ob_zone:
+        margin = ob_zone[0] * 0.01
+        zone_suggestions.append(
+            f"🟡 <code>/addzone {sym_short} {format_price(ob_zone[0]-margin)} {format_price(ob_zone[1]+margin)} 4h</code>"
+            f" ← current bounce zone"
+        )
+    # EQL sweep zone
+    if nearest_eql:
+        margin = nearest_eql["price"] * 0.015
+        pct = (current_price - nearest_eql["price"]) / current_price * 100
+        zone_suggestions.append(
+            f"🔴 <code>/addzone {sym_short} {format_price(nearest_eql['price']-margin)} {format_price(nearest_eql['price']+margin)} 4h</code>"
+            f" ← EQL sweep zone ({pct:.1f}% below, {nearest_eql['touches']}x tested)"
+        )
+    if zone_suggestions:
+        lines.append(f"\n📏 <b>Zones to add:</b>\n" + "\n".join(zone_suggestions))
+        lines.append("💡 Add both — whichever fires first = your entry signal")
 
     return "\n".join(lines)
 
@@ -6771,6 +6843,159 @@ _vol_accum_alerted  = {}  # {symbol: last_alert_time}
 _postpump_retest_alerted = {}  # {symbol: last_alert_time}
 
 _global_liq_alerted = {}  # {symbol: last_alert_time}
+
+_high_confidence_alerted = {}  # {symbol: last_alert_time}
+
+# Signal types with >20% win rate from /report performance
+HIGH_WINRATE_SIGNALS = {
+    "Explosive Pump [5M]": 50,
+    "Accumulation [1H]": 33,
+    "Volume Build-up [4H]": 25,
+    "Volume Spike [4H]": 28,
+    "Volume Surge [1H]": 30,
+    "OB Bounce [4H OB]": 33,
+    "Gradual Buildup [1D]": 20,
+}
+
+def check_high_confidence_signal(symbol, signal_type, current_price):
+    """
+    After a high win-rate signal fires, run confluence check.
+    Score 4+ → send to High Priority with full analysis.
+    Conditions: Volume 3x+, BS positive, Daily bullish,
+                Higher lows, OB zone, Liq sweep bonus.
+    """
+    # Only run for high win-rate signal types
+    win_rate = None
+    for sig, wr in HIGH_WINRATE_SIGNALS.items():
+        if sig in signal_type:
+            win_rate = wr
+            break
+    if not win_rate:
+        return
+
+    now = time.time()
+    key = f"{symbol}_hc"
+    if now - _high_confidence_alerted.get(key, 0) < 8 * 3600:
+        return
+
+    try:
+        ticker = get_ticker(symbol)
+        if not ticker:
+            return
+        change_24h = float(ticker["priceChangePercent"])
+
+        klines_1h = get_klines(symbol, interval="1h", limit=20)
+        klines_4h = get_klines(symbol, interval="4h", limit=20)
+        if not klines_1h or not klines_4h:
+            return
+
+        score = 0
+        details = []
+
+        # ── Volume 3x+ ──
+        closed_1h = klines_1h[:-1]
+        vols = [float(k[5]) for k in closed_1h[-10:]]
+        baseline = sum(vols[:6]) / 6 if len(vols) >= 6 else 1
+        vol_ratio = vols[-1] / baseline if baseline > 0 else 0
+        if vol_ratio >= 3.0:
+            score += 1
+            details.append(f"✅ Volume: {vol_ratio:.1f}x")
+        else:
+            details.append(f"⚠️ Volume: {vol_ratio:.1f}x")
+
+        # ── BS Positive ──
+        bs_sum = 0
+        for k in closed_1h[-3:]:
+            total_v = float(k[5])
+            buy_v = float(k[9]) if len(k) > 9 else total_v * 0.5
+            bs_sum += buy_v - (total_v - buy_v)
+        if bs_sum > 0:
+            score += 1
+            details.append("✅ BS Positive")
+        else:
+            details.append("⚠️ BS Negative")
+
+        # ── Daily trend ──
+        if not is_daily_downtrend(symbol, current_price):
+            score += 1
+            details.append("✅ Daily bullish/neutral")
+        else:
+            details.append("❌ Daily bearish")
+
+        # ── Higher lows ──
+        lows_1h = [float(k[3]) for k in closed_1h[-8:]]
+        hl_count = sum(1 for i in range(1, len(lows_1h)) if lows_1h[i] > lows_1h[i-1])
+        if hl_count >= 3:
+            score += 1
+            details.append("✅ Higher lows (1H)")
+        else:
+            details.append("⚠️ No clear higher lows")
+
+        # ── OB zone confirmed/retest ──
+        closed_4h = klines_4h[:-1]
+        avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+        ob_found = False
+        for k in reversed(closed_4h[-10:]):
+            ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+            if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+                score += 1
+                details.append(f"✅ OB zone: {format_price(kl)}–{format_price(kh)}")
+                ob_found = True
+                break
+        if not ob_found:
+            details.append("⚠️ No OB zone nearby")
+
+        # ── Liq sweep + reclaim (bonus) ──
+        sweep_found = False
+        for k in reversed(closed_1h[-6:]):
+            k_low = float(k[3])
+            k_close = float(k[4])
+            k_open = float(k[1])
+            k_vol = float(k[5])
+            avg_v = baseline
+            if k_vol / avg_v >= 2.0 and k_close > k_open and (k_close - k_low) / k_close > 0.005:
+                score += 1
+                details.append("✅ Liq sweep + reclaim detected")
+                sweep_found = True
+                break
+        if not sweep_found:
+            details.append("— No liq sweep")
+
+        # Fire if score >= 4
+        if score < 4:
+            return
+
+        _high_confidence_alerted[key] = now
+
+        # SL/TP
+        eql_data = detect_equal_highs_lows(klines_4h, current_price)
+        nearest_eql = eql_data["eq_lows"][0] if eql_data["eq_lows"] else None
+        nearest_eqh = eql_data["eq_highs"][0] if eql_data["eq_highs"] else None
+        sl = nearest_eql["price"] * 0.985 if nearest_eql else current_price * 0.92
+        tp1 = nearest_eqh["price"] if nearest_eqh else current_price * 1.08
+        tp2 = eql_data["eq_highs"][1]["price"] if len(eql_data["eq_highs"]) >= 2 else tp1 * 1.08
+        risk = (current_price - sl) / current_price * 100
+        tp1_pct = (tp1 - current_price) / current_price * 100
+        tp2_pct = (tp2 - current_price) / current_price * 100
+        rr = tp1_pct / risk if risk > 0 else 0
+
+        details_str = "\n".join(f"   {d}" for d in details)
+        send_to_topic(TOPIC_HIGH,
+            f"⭐ <b>HIGH CONFIDENCE — {symbol}</b>\n\n"
+            f"🏆 Signal: {signal_type} ({win_rate}% win rate)\n"
+            f"📊 Confluence Score: {score}/6\n\n"
+            f"{details_str}\n\n"
+            f"📐 Entry: {format_price(current_price)}\n"
+            f"🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
+            f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%) | TP2: {format_price(tp2)} (+{tp2_pct:.1f}%)\n"
+            f"⚖️ R/R: {rr:.1f}x\n\n"
+            f"⚠️ <i>Confirm on chart before entry.</i>"
+        )
+        print(f"⭐ High confidence: {symbol} score={score}/6 signal={signal_type}")
+
+    except Exception as e:
+        print(f"High confidence check error {symbol}: {e}")
+
 
 def scan_global_liq_reclaim():
     """
