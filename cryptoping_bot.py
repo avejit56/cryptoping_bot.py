@@ -88,7 +88,9 @@ def _rate_limited_get(url, *args, **kwargs):
 http_session.get = _rate_limited_get
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # set in Railway → Variables
-ADMIN_CHAT_ID = "6589114679"
+BOT_VERSION = "v2.1"  # increment this with every update
+
+
 CHECK_INTERVAL = 5 * 60
 
 # CryptoPing Alerts Group — categorized topics
@@ -8271,13 +8273,14 @@ def handle_commands():
 
                 elif text == "/STATUS" and is_admin:
                     reply(
-                        f"✅ <b>CryptoPing is running!</b>\n\n"
+                        f"✅ <b>CryptoPing {BOT_VERSION} is running!</b>\n\n"
                         f"📋 Coins: {len(watchlist)}\n"
                         f"👥 Subscribers: {len(subscribers)}\n"
                         f"🔍 Momentum: {len(momentum_tracking)}\n"
                         f"⚡ Pending 5M→15M: {len(spike_pending_confirm)}\n"
                         f"🎯 OB/FVG: {len(ob_fvg_zone_tracking)}\n"
                         f"📐 Manual Zones: {len(manual_zones)}\n"
+                        f"📏 Manual Lines: {len(manual_lines)}\n"
                         f"🏆 TL Retest: {len(trendline_retest_tracking)}\n"
                         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                     )
@@ -9024,7 +9027,7 @@ def main():
     print("=" * 50)
 
     send_to(ADMIN_CHAT_ID,
-        f"✅ <b>CryptoPing is running!</b>\n\n"
+        f"✅ <b>CryptoPing {BOT_VERSION} is running!</b>\n\n"
         f"📋 Coins: {len(watchlist)}\n"
         f"👥 Subscribers: {len(subscribers)}\n"
         f"💼 Active trades: {len(active_trades)}\n\n"
@@ -9229,7 +9232,6 @@ def main():
         print(f"Next check in 5 min...")
         auto_update_watchlist()
         time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
