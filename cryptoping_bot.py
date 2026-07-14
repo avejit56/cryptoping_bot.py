@@ -473,6 +473,9 @@ def save_cooldown_trackers():
             "breakout_alerted": breakout_alerted,
             "_global_liq_alerted": _global_liq_alerted,
             "_high_confidence_alerted": _high_confidence_alerted,
+            "_extreme_pump_alerted": _extreme_pump_alerted,
+            "_dormant_coil_alerted": _dormant_coil_alerted,
+            "_whale_trade_alerted": _whale_trade_alerted,
         }
         with open(COOLDOWN_TRACKERS_FILE, "w") as f:
             _json.dump(bundle, f, indent=2)
@@ -502,6 +505,9 @@ def load_cooldown_trackers():
             breakout_alerted.update(bundle.get("breakout_alerted", {}))
             _global_liq_alerted.update(bundle.get("_global_liq_alerted", {}))
             _high_confidence_alerted.update(bundle.get("_high_confidence_alerted", {}))
+            _extreme_pump_alerted.update(bundle.get("_extreme_pump_alerted", {}))
+            _dormant_coil_alerted.update(bundle.get("_dormant_coil_alerted", {}))
+            _whale_trade_alerted.update(bundle.get("_whale_trade_alerted", {}))
             total = sum(len(v) if isinstance(v, dict) else 0 for v in bundle.values())
             print(f"✅ Cooldown trackers loaded: {total} entries across {len(bundle)} dicts")
         else:
@@ -750,6 +756,28 @@ def build_report(window_seconds, window_label):
     lines.append(f"\n<b>Overall:</b> {total_all} signals | {hit_all} hit +10%+ ({overall_pct:.0f}%)")
     return "\n".join(lines)
 
+_coil_pattern_tracked = {}  # {symbol: last_tracked_time} — 24h cooldown for signal_performance recording
+
+def get_pattern_history_stats(pattern_name, min_samples=3):
+    """
+    Looks up historical performance for a specific pattern/signal type (e.g.
+    "Coil After Pump") from signal_performance, using the same "highest_after"
+    peak-gain tracking the SIGNAL RESULT messages use. Returns a formatted
+    stats line, or None if there isn't enough historical data yet (note #10:
+    helps size MEDIUM-score setups on data instead of gut feel).
+    """
+    samples = [
+        d for d in signal_performance.values()
+        if d.get("signal_type") == pattern_name and d.get("signal_price", 0) > 0
+    ]
+    if len(samples) < min_samples:
+        return None
+    gains = [(d["highest_after"] - d["signal_price"]) / d["signal_price"] * 100 for d in samples]
+    avg_gain = sum(gains) / len(gains)
+    hit_15 = sum(1 for g in gains if g >= 15.0)
+    hit_pct = hit_15 / len(gains) * 100
+    return f"📊 Historical ({len(gains)} past signals): avg +{avg_gain:.0f}% peak, {hit_pct:.0f}% reached +15%+"
+
 def is_important_signal(message):
     """OB, zone, retest — these important signals have no cooldown"""
     return any(x in message for x in [
@@ -902,6 +930,24 @@ def get_klines(symbol, interval="5m", limit=50):
         except Exception as e:
             print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
             _record_binance_call_result(success=False)
+    return None
+
+def get_agg_trades(symbol, limit=30):
+    """Fetch recent aggregated trades (for whale/block trade detection, note #14)."""
+    try:
+        _binance_rate_limit_wait()
+        r = http_session.get("https://api.binance.com/api/v3/aggTrades",
+            params={"symbol": symbol, "limit": limit}, timeout=10)
+        if r.status_code == 200:
+            _record_binance_call_result(success=True)
+            return r.json()
+        else:
+            print(f"⚠️ get_agg_trades {symbol}: HTTP {r.status_code} — {r.text[:200]}")
+            if r.status_code not in (418, 429):
+                _record_binance_call_result(success=False)
+    except Exception as e:
+        print(f"⚠️ get_agg_trades {symbol} exception: {e}")
+        _record_binance_call_result(success=False)
     return None
 
 # ─── BULK TICKER CACHE (rate-limit fix) ────────────────────
@@ -2525,8 +2571,8 @@ def check_manual_zones():
                 # /addzone-added zones keep going to My Setups as before.
                 zone_dest = TOPIC_HIGH if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
                 send_to_topic(zone_dest, msg)
-                if is_top_pick and zone_dest != TOPIC_TOP_PICKS:
-                    send_to_topic(TOPIC_TOP_PICKS, msg)
+                if is_top_pick and zone_dest != TOPIC_BUILDUPS:
+                    send_to_topic(TOPIC_BUILDUPS, msg)
                 # Subscriber DMs
                 for sub_chat_id in subscribers:
                     send_to(sub_chat_id, msg)
@@ -2795,21 +2841,22 @@ def check_manual_lines():
             f_buy  = float(forming[9]) if len(forming) > 9 else f_vol * 0.5
             f_vol_ratio = f_vol / avg_vol if avg_vol > 0 else 0
             f_buy_ratio = f_buy / f_vol if f_vol > 0 else 0
-            # FIX (AUDIO case): thresholds were too strict — pump starts with
-            # low volume that builds up, so by the time 1.3x vol was reached
-            # price was already far above the level. Now fire as soon as price
-            # is above level with ANY green body momentum, even minimal volume.
-            # Vol threshold: 0.8x (any above-average activity), buy: 0.48 (slight buy bias)
+            # FIX (note #5 backlog): volume/buy-pressure condition was still
+            # gated behind the 1h klines cache (120s TTL), so by the time
+            # f_vol_ratio caught up the price had often already moved well
+            # past the level (e.g. VANAUSDT: level $1.250, alert at $1.265).
+            # User wants this to fire on price alone — they'll check volume
+            # themselves via /entry right after getting the alert.
             live_body_above = current_price > level * 1.001  # just 0.1% above level
-            live_vol_ok = f_vol_ratio >= 0.8 and f_buy_ratio >= 0.48
-            if live_body_above and live_vol_ok:
+            if live_body_above:
                 manual_lines[line_id]["live_cross_alerted"] = True
                 save_manual_lines()
                 live_msg = (
                     f"⚡ <b>LINE CROSSED (Live) — {symbol} [{tf.upper()}]</b>\n\n"
                     f"💰 Price: {format_price(current_price)}\n"
                     f"📍 Level: {format_price(level)}\n"
-                    f"⚡ Volume: {f_vol_ratio:.1f}x | Buy: {f_buy_ratio*100:.0f}%\n\n"
+                    f"⚡ Volume: {f_vol_ratio:.1f}x | Buy: {f_buy_ratio*100:.0f}% "
+                    f"<i>(may lag live price slightly — check /entry for fresh volume)</i>\n\n"
                     f"🕐 Forming candle just crossed {format_price(level)} — "
                     f"check the chart NOW if you want to enter early. "
                     f"A confirmed break alert follows when the candle closes.\n\n"
@@ -3184,13 +3231,17 @@ def check_active_trades_fast():
                 alerts.append(f"   → Consider exiting now to protect capital")
                 is_urgent = True
 
-        # ── TP1 hit → suggest SL to breakeven ──
+        # ── TP1 hit → auto-move SL to breakeven (note #9) ──
         elif current_price >= tp1 and not trade.get("tp1_hit_alerted"):
             active_trades[trade_id]["tp1_hit_alerted"] = True
+            old_sl = sl
+            active_trades[trade_id]["sl"] = entry  # risk-free on the remaining position
+            sl = entry
+            sl_dist = (current_price - sl) / current_price * 100  # recalc for the updated SL
             save_active_trades()
             alerts.append(f"🎯 TP1 hit! (+{pnl_pct:.1f}%)")
-            alerts.append(f"   → Consider moving SL to breakeven ({format_price(entry)}) to lock in profit")
-            alerts.append(f"   → Or take partial profit and let rest run to TP2")
+            alerts.append(f"   → SL auto-moved to breakeven: {format_price(old_sl)} → {format_price(entry)} (risk-free on the rest)")
+            alerts.append(f"   → Remaining position rides toward TP2")
 
         # ── Routine checks (4h cooldown) ──
         elif now - trade.get("last_fast_alert", 0) > 4 * 3600:
@@ -3265,6 +3316,8 @@ def check_no_retest_pump_risk(symbol):
     Fires to Top Picks, then feeds the same instant-analysis promotion
     pipeline (check_high_confidence_signal) that can escalate it to High
     Priority as ⭐ HIGH CONFIDENCE if the broader confluence also checks out.
+    Also alerts My Setups directly if the user has manually /addzone-tracked
+    this coin (their own watched setups shouldn't get buried in Top Picks).
     """
     now = time.time()
     key = f"{symbol}_noretest_pump"
@@ -3312,7 +3365,7 @@ def check_no_retest_pump_risk(symbol):
 
     alerted_coins[key] = now
 
-    send_to_topic(TOPIC_TOP_PICKS,
+    msg = (
         f"⚠️ <b>PUMP RISK — NO RETEST YET</b>\n\n"
         f"🪙 <b>{symbol}</b>\n"
         f"💰 Price: {format_price(current_price)}\n"
@@ -3324,9 +3377,26 @@ def check_no_retest_pump_risk(symbol):
         f"💡 Consider entry now based on volume/BS strength — waiting for a retest may mean missing this one.\n\n"
         f"⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
     )
+    send_to_topic(TOPIC_BUILDUPS, msg)
+
+    # If the user has manually /addzone-tracked this coin, they're already
+    # watching it personally — also alert My Setups so it doesn't get lost
+    # among Building Momentum's broader coin coverage.
+    has_manual_zone = any(
+        z.get("symbol") == symbol and z.get("source", "manual") == "manual"
+        for z in manual_zones.values()
+    )
+    if has_manual_zone:
+        send_to_topic(TOPIC_MY_SETUPS, msg)
+
     track_building_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
     check_high_confidence_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
-    print(f"⚠️ No-retest pump risk: {symbol} body={body_pct:.1f}% vol={vol_ratio:.1f}x buy={buy_ratio*100:.0f}%")
+    print(f"⚠️ No-retest pump risk: {symbol} body={body_pct:.1f}% vol={vol_ratio:.1f}x buy={buy_ratio*100:.0f}%"
+          + (" [manual zone → My Setups]" if has_manual_zone else ""))
+
+    # Guaranteed High Priority bypass for extreme moves (note #7)
+    if vol_ratio >= 20.0 or body_pct >= 15.0:
+        send_extreme_pump_alert(symbol, current_price, body_pct, vol_ratio, buy_ratio, "No-Retest Pump Risk [1H]")
 
 
 def check_explosive_pump(symbol):
@@ -3434,6 +3504,40 @@ def check_explosive_pump(symbol):
         }
         track_building_signal(symbol, "Explosive Pump [5M]", current_price)
         check_high_confidence_signal(symbol, "Explosive Pump [5M]", current_price)
+
+        # ── Guaranteed High Priority path for EXTREME moves (note #7) ──
+        # GNOUSDT-style vertical wick spikes are extreme enough that no big
+        # pump should be missable via the normal score>=2/3 promotion gate —
+        # bypass it entirely and fire straight to High Priority.
+        if vol_ratio >= 20.0 or gain_pct >= 15.0:
+            send_extreme_pump_alert(symbol, current_price, gain_pct, vol_ratio, buy_ratio, "Explosive Pump [5M]")
+
+# ─── EXTREME PUMP: GUARANTEED HIGH PRIORITY BYPASS (note #7) ──────────
+_extreme_pump_alerted = {}
+
+def send_extreme_pump_alert(symbol, current_price, gain_pct, vol_ratio, buy_ratio, source_signal):
+    """
+    For sufficiently extreme single-move pumps (very high vol_ratio / body
+    size), sends straight to High Priority — bypassing check_high_confidence_
+    signal's score>=2/3 gate entirely, so no big pump is missable just
+    because the broader confluence checklist didn't fully line up.
+    """
+    now = time.time()
+    key = f"{symbol}_extreme"
+    if now - _extreme_pump_alerted.get(key, 0) < 6 * 3600:
+        return
+    _extreme_pump_alerted[key] = now
+    send_to_topic(TOPIC_HIGH,
+        f"🚨 <b>EXTREME PUMP — GUARANTEED ALERT</b>\n\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"🚀 Move: <b>+{gain_pct:.1f}%</b> | ⚡ Volume: <b>{vol_ratio:.1f}x</b> | 🟢 Buy: {buy_ratio*100:.0f}%\n"
+        f"📡 Source: {source_signal}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"⚠️ Extreme magnitude — sent directly to High Priority regardless of "
+        f"confluence score, so this can't be missed. Confirm on chart before entry."
+    )
+    print(f"🚨 Extreme pump guaranteed alert: {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
 def is_daily_downtrend(symbol, current_price, klines_1h=None, klines_daily=None):
@@ -5612,6 +5716,7 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
     details_str   = "\n".join(result["details"])
     pattern_notes = result.get("pattern_notes", {})
     chart_patterns = result.get("chart_patterns", [])
+    now = time.time()
 
     # ── Timeframe retest row ──
     tf_map = {"15m": "15M", "30m": "30M", "1h": "1H", "4h": "4H"}
@@ -5806,11 +5911,26 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
                 coil_note = (
                     f"🌀 Coil After Pump: +{pump_pct:.0f}% | Retracement: -{retrace:.0f}%\n"
                     f"   📈 2nd pump potential: +{est_low:.0f}–{est_high:.0f}% (historical)\n"
-                    f"   🎯 Target: previous high {format_price(past_high)} (+{prev_high_pct:.0f}%)"
+                    f"   🌙 Longer-term stretch target: previous high {format_price(past_high)} (+{prev_high_pct:.0f}%) "
+                    f"— informational only, separate from TP1/TP2 below"
                 )
-                # Add previous pump high as TP level
-                if past_high > current_price * 1.01:
-                    tp_levels.append((past_high, prev_high_pct))
+                # Record this occurrence + show the pattern's own historical
+                # track record (note #10) so a MEDIUM-score coil setup can be
+                # sized on data instead of gut feel.
+                if now - _coil_pattern_tracked.get(sym, 0) > 24 * 3600:
+                    _coil_pattern_tracked[sym] = now
+                    signal_performance[f"{sym}_coilpattern_{int(now)}"] = {
+                        "symbol": sym, "signal_price": current_price,
+                        "signal_time": now, "signal_type": "Coil After Pump",
+                        "highest_after": current_price,
+                    }
+                pattern_stats = get_pattern_history_stats("Coil After Pump")
+                if pattern_stats:
+                    coil_note += f"\n   {pattern_stats}"
+                # NOTE (note #8): previous pump high is intentionally NOT
+                # added to tp_levels — user wants TP1/TP2 to always stay
+                # near-term/nearest-resistance based. The coil target above
+                # is shown as an informational stretch target only.
 
     # ── Historical TP from actual resistance levels ──
     if klines_4h and len(klines_4h) >= 10:
@@ -5893,7 +6013,17 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
 
     # Entry timing
     if confirmed_tfs and not daily_down:
-        opinion_lines.append(f"✅ {'/'.join(t.upper() for t in confirmed_tfs)} confirmed — entry valid now")
+        if avg_vol_ratio >= 10:
+            # Extreme volume can mean strong accumulation OR a blow-off-top —
+            # ZBTUSDT reversed hard right after a 10.1x-volume "entry valid
+            # now" alert. Soften the language instead of a flat green light.
+            opinion_lines.append(
+                f"⚠️ {'/'.join(t.upper() for t in confirmed_tfs)} confirmed, "
+                f"but volume is extreme ({avg_vol_ratio:.1f}x) — could be strong "
+                f"accumulation OR a blow-off-top. Consider a smaller starter position."
+            )
+        else:
+            opinion_lines.append(f"✅ {'/'.join(t.upper() for t in confirmed_tfs)} confirmed — entry valid now")
     elif inprogress_tfs:
         opinion_lines.append(f"⏳ Wait for {'/'.join(t.upper() for t in inprogress_tfs).upper()} green candle to confirm")
     elif base_note or coil_note:
@@ -6374,7 +6504,7 @@ def track_building_signal(symbol, signal_type, current_price):
         change_24h = float(ticker["priceChangePercent"]) if ticker else 0
 
         urgency = "🚨" if len(signals) >= 3 else "🔥"
-        send_to_topic(TOPIC_TOP_PICKS,
+        send_to_topic(TOPIC_BUILDUPS,
             f"{urgency} <b>BUILDING SIGNAL — {symbol}</b>\n\n"
             f"💰 Price: {format_price(current_price)}\n"
             f"📊 24h: {change_24h:+.2f}%\n\n"
@@ -7163,6 +7293,25 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
 
         # Fire if score >= required_score (3 for high-winrate types, 2 otherwise)
         if score < required_score:
+            # Note #12: don't just drop low-confluence signals — if volume is
+            # abnormally high on its own (well beyond the normal 3x that
+            # already earns a confluence point), flag it distinctly instead
+            # of requiring the full score bar. Lighter weight than promotion:
+            # goes back to Building Momentum, not High Priority.
+            if vol_ratio >= 8.0:
+                vkey = f"{symbol}_volflag"
+                if now - _high_confidence_alerted.get(vkey, 0) >= 4 * 3600:
+                    _high_confidence_alerted[vkey] = now
+                    send_to_topic(TOPIC_BUILDUPS,
+                        f"⚠️ <b>HIGH VOLUME, LOW CONFLUENCE — {symbol}</b>\n\n"
+                        f"📡 Signal: {signal_type}\n"
+                        f"⚡ Volume: {vol_ratio:.1f}x (abnormal) but confluence only {score}/6\n"
+                        f"💰 Price: {format_price(current_price)}\n\n"
+                        f"💡 Weak structure/trend but unusually strong volume — "
+                        f"watch closely, some of these still run.\n"
+                        f"⚠️ <i>Not a full signal — confirm on chart before entry.</i>"
+                    )
+                    print(f"⚠️ High-volume/low-confluence flag: {symbol} vol={vol_ratio:.1f}x score={score}/6")
             return
 
         _high_confidence_alerted[key] = now
@@ -7181,7 +7330,7 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
 
         details_str = "\n".join(f"   {d}" for d in details)
         winrate_line = f"🏆 Signal: {signal_type} ({win_rate}% win rate)\n" if win_rate else f"🏆 Signal: {signal_type}\n"
-        send_to_topic(TOPIC_HIGH,
+        hc_msg = (
             f"⭐ <b>HIGH CONFIDENCE — {symbol}</b>\n\n"
             f"{winrate_line}"
             f"📊 Confluence Score: {score}/6\n\n"
@@ -7192,6 +7341,11 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             f"⚖️ R/R: {rr:.1f}x\n\n"
             f"⚠️ <i>Confirm on chart before entry.</i>"
         )
+        send_to_topic(TOPIC_HIGH, hc_msg)
+        if score >= 6:
+            # Top Picks (note #11) is reserved exclusively for perfect 6/6
+            # confluence scores — the absolute best-scoring signals get a copy.
+            send_to_topic(TOPIC_TOP_PICKS, "🏆 <b>PERFECT SCORE</b>\n\n" + hc_msg)
         print(f"⭐ High confidence: {symbol} score={score}/6 signal={signal_type}")
 
         # ── Auto-add 4 high-confluence zones around this High Priority signal ──
@@ -7213,6 +7367,140 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
 
     except Exception as e:
         print(f"High confidence check error {symbol}: {e}")
+
+
+_dormant_coil_alerted = {}  # {symbol: last_alert_time}
+
+def scan_dormant_coil_candidates():
+    """
+    Detects coins that have been deeply down AND stayed down for an extended
+    period (weeks) with declining volatility/volume — the hypothesis (note
+    #13) being that long-suppressed, quietly-basing coins are more likely to
+    give a sudden big pump (50-300%) later. This is distinct from every other
+    detector in this file: those catch pumps already starting, this flags
+    still-dormant coins that MIGHT pump later, so it's not confused with
+    active signals (separate 🌙 DORMANT COIL WATCH format, no trade plan).
+    Runs on 1D klines — no need to check often.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        if symbol in removed_coins:
+            continue
+        try:
+            key = symbol
+            if now - _dormant_coil_alerted.get(key, 0) < 3 * 24 * 3600:  # re-check every 3 days
+                continue
+
+            klines_1d = get_klines(symbol, interval="1d", limit=60)
+            if not klines_1d or len(klines_1d) < 30:
+                continue
+
+            closed = klines_1d[:-1]
+            highs  = [float(k[2]) for k in closed]
+            closes = [float(k[4]) for k in closed]
+            vols   = [float(k[5]) for k in closed]
+
+            recent_high = max(highs)
+            recent_high_idx = highs.index(recent_high)
+            current_price = closes[-1]
+            if recent_high <= 0:
+                continue
+
+            # (2) Large % decline from recent high
+            decline_pct = (recent_high - current_price) / recent_high * 100
+            if decline_pct < 40:
+                continue
+
+            # (1) Extended time suppressed: the high must be well in the past,
+            # and price has stayed in a tight range since
+            days_since_high = len(closed) - 1 - recent_high_idx
+            if days_since_high < 14:
+                continue
+
+            recent_window = closes[-14:]
+            if min(recent_window) <= 0:
+                continue
+            window_range_pct = (max(recent_window) - min(recent_window)) / min(recent_window) * 100
+            if window_range_pct > 25:
+                continue  # still too volatile to call it "coiling"
+
+            # (3) Decreasing volatility/volume exhaustion — classic pre-breakout coiling
+            if len(vols) < 30:
+                continue
+            early_vol = sum(vols[-30:-14]) / 16
+            recent_vol = sum(vols[-14:]) / 14
+            if early_vol <= 0 or recent_vol >= early_vol * 0.7:
+                continue  # volume hasn't meaningfully dried up yet
+
+            _dormant_coil_alerted[key] = now
+            send_to_topic(TOPIC_BUILDUPS,
+                f"🌙 <b>DORMANT COIL WATCH — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(current_price)}\n"
+                f"📉 Down {decline_pct:.0f}% from {format_price(recent_high)} ({days_since_high}d ago)\n"
+                f"📊 14d range: {window_range_pct:.0f}% (tight — coiling)\n"
+                f"📉 Volume exhausted: {recent_vol/early_vol*100:.0f}% of the earlier average\n\n"
+                f"💡 Long-suppressed, quietly basing — historically coins like this can give "
+                f"sudden 50-300% pumps. This is early monitoring only, not an active signal.\n"
+                f"⚠️ <i>No trade plan yet — just a watchlist flag.</i>"
+            )
+            print(f"🌙 Dormant coil candidate: {symbol} down {decline_pct:.0f}% for {days_since_high}d, "
+                  f"vol at {recent_vol/early_vol*100:.0f}% of earlier")
+        except Exception as e:
+            print(f"Dormant coil scan error {symbol}: {e}")
+
+
+_whale_trade_alerted = {}  # {symbol: last_alert_time}
+
+def check_whale_trades(symbol):
+    """
+    Whale/block trade detection (note #14): Binance's API can't identify
+    wallet identities (no on-chain data), so this approximates "smart money
+    entering" using the closest available proxy — an individual trade that's
+    abnormally large vs this coin's typical recent trade size, from the
+    aggTrades stream (single trade size, not aggregated candle volume like
+    every other volume-ratio signal in this file).
+    """
+    now = time.time()
+    if now - _whale_trade_alerted.get(symbol, 0) < 2 * 3600:
+        return
+
+    trades = get_agg_trades(symbol, limit=30)
+    if not trades or len(trades) < 15:
+        return
+
+    sizes = [float(t["p"]) * float(t["q"]) for t in trades]
+    baseline_sizes = sorted(sizes)[:-1]  # exclude the largest so it doesn't skew its own baseline
+    avg_size = sum(baseline_sizes) / len(baseline_sizes) if baseline_sizes else 0
+    if avg_size <= 0:
+        return
+
+    latest = trades[-1]
+    latest_value = float(latest["p"]) * float(latest["q"])
+    ratio = latest_value / avg_size
+
+    # Ratio alone isn't enough on a near-zero baseline (illiquid coin) — require
+    # a real dollar floor too.
+    if ratio < 15.0 or latest_value < 5000:
+        return
+
+    # isBuyerMaker=True means the seller was the aggressor (a sell); False means
+    # the buyer was the aggressor (a buy).
+    is_buy = not latest.get("m", True)
+
+    ticker = get_ticker(symbol)
+    current_price = float(ticker["lastPrice"]) if ticker else float(latest["p"])
+
+    _whale_trade_alerted[symbol] = now
+    send_to_topic(TOPIC_SPIKES,
+        f"🐋 <b>Large trade detected — {symbol}</b>\n\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"💵 Trade size: ${latest_value:,.0f} ({ratio:.0f}x typical trade size)\n"
+        f"{'🟢 Buy-side' if is_buy else '🔴 Sell-side'} aggressor\n\n"
+        f"💡 Approximated \"smart money\" signal — one unusually large single trade, "
+        f"not aggregated candle volume. Not confirmation on its own.\n"
+        f"⚠️ <i>Confirm on chart before entry.</i>"
+    )
+    print(f"🐋 Whale trade: {symbol} ${latest_value:,.0f} ({ratio:.0f}x, {'buy' if is_buy else 'sell'})")
 
 
 def scan_global_liq_reclaim():
@@ -7349,12 +7637,11 @@ def scan_global_liq_reclaim():
             if pos_confluence < 1:
                 continue
 
-            # Redesign: LIQUIDITY RECLAIM / RETEST RECLAIM / POWER SIGNAL no longer
-            # go straight to High Priority — they go to Top Picks. A separate
-            # instant-analysis promotion check (below) decides if this specific
-            # instance is strong enough to also land in High Priority as
-            # ⭐ HIGH CONFIDENCE. This keeps High Priority low-noise.
-            target_topic = TOPIC_TOP_PICKS
+            # Redesign (note #11): LIQUIDITY RECLAIM / RETEST RECLAIM / POWER
+            # SIGNAL go to Building Momentum. High Priority only gets ⭐ HIGH
+            # CONFIDENCE (via the promotion check below), and Top Picks is now
+            # reserved exclusively for perfect 6/6 confluence scores.
+            target_topic = TOPIC_BUILDUPS
             signal_prefix = "🎯 RETEST RECLAIM" if is_retest_reclaim else "🔥 LIQUIDITY RECLAIM"
             promotion_signal_type = "Retest Reclaim" if is_retest_reclaim else "Liquidity Reclaim"
             is_power_signal = (
@@ -7615,7 +7902,7 @@ def scan_postpump_retest():
                     retest_note = pattern
 
             _postpump_retest_alerted[symbol] = now
-            send_to_topic(TOPIC_TOP_PICKS,
+            send_to_topic(TOPIC_BUILDUPS,
                 f"🎯 <b>POST-PUMP RETEST — {symbol}</b>\n\n"
                 f"💰 Price: {format_price(current_price)} ({change_24h:+.1f}% 24h)\n"
                 f"📈 Recent pump: +{pump_pct:.0f}% "
@@ -9373,6 +9660,32 @@ def main():
             time.sleep(120)  # every 2 minutes, but internal cooldown is 8h per coin
 
     Thread(target=run_vol_accum_scanner, daemon=True).start()
+
+    def run_dormant_coil_scanner():
+        while True:
+            try:
+                scan_dormant_coil_candidates()
+            except Exception as e:
+                print(f"Dormant coil scan error: {e}")
+            time.sleep(3600)  # every hour — 1D-based data, internal cooldown is 3 days per coin
+
+    Thread(target=run_dormant_coil_scanner, daemon=True).start()
+
+    def run_whale_trade_scanner():
+        while True:
+            try:
+                for _sym in list(watchlist):
+                    if _sym in removed_coins:
+                        continue
+                    try:
+                        check_whale_trades(_sym)
+                    except Exception as e:
+                        print(f"Whale trade check error {_sym}: {e}")
+            except Exception as e:
+                print(f"Whale trade scan error: {e}")
+            time.sleep(300)  # every 5 minutes, internal cooldown is 2h per coin
+
+    Thread(target=run_whale_trade_scanner, daemon=True).start()
 
     def run_postpump_retest_scanner():
         while True:
