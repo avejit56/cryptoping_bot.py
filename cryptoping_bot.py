@@ -104,6 +104,7 @@ TOPIC_TRADES      = 1463  # 💼 Trade Monitor (admin-only — Avejit's own trad
 TOPIC_USER_TRADES = 3042  # 👥 User Trades (admin-only — subscriber trade activity log)
 TOPIC_USER_RESULTS = 3045 # 🏆 User Trade Results (admin-only — subscriber win/loss log)
 TOPIC_TOP_PICKS   = 3046  # 🔥 Top Picks (highest-confidence prospects only)
+TOPIC_BIG_PUMP    = 22047  # 🚀 Big Pump — dedicated last-line-of-defense channel (note #7)
 TOPIC_MY_SETUPS   = 6386  # 📍 My Setups (manual zones, lines, watches — Avejit's own marked levels)
 
 # ─── TRADE MONITOR SETTINGS ──────────────────────────
@@ -1706,6 +1707,7 @@ def check_gradual_buildup(symbol, tf, klines):
     print(f"🌊 Gradual buildup: {symbol} [{tf}] vol_slope={vol_slope:.1f} ratio={recent_vol_ratio:.1f}x{' [LIVE]' if live_moving else ''}")
     track_building_signal(symbol, f"Gradual Buildup [{tf.upper()}]", price)
     check_high_confidence_signal(symbol, f"Gradual Buildup [{tf.upper()}]", price)
+    start_prospect_watch(symbol, f"Gradual Buildup [{tf.upper()}]")
 
 
 # ─── RANGE BREAKOUT DETECTOR (ARPA case) ──────────────────
@@ -1784,6 +1786,7 @@ def check_range_breakout(symbol, tf, klines):
             print(f"🚀 Range breakout CONFIRMED (4H hold): {symbol} +{breakout_pct:.1f}% above range")
             track_building_signal(symbol, "Range Breakout [1H→4H]", current_price)
             check_high_confidence_signal(symbol, "Range Breakout [1H→4H]", current_price)
+            start_prospect_watch(symbol, "Range Breakout [1H→4H]")
         elif current_price < range_high * 0.97:
             # Price dropped back below the range — false breakout, discard
             range_breakout_tracking.pop(symbol, None)
@@ -1897,6 +1900,7 @@ def check_range_breakout(symbol, tf, klines):
         print(f"🚀 Range breakout (4H direct): {symbol} vol={vol_ratio:.1f}x")
         track_building_signal(symbol, "Range Breakout [4H]", current_price)
         check_high_confidence_signal(symbol, "Range Breakout [4H]", current_price)
+        start_prospect_watch(symbol, "Range Breakout [4H]")
 
 
 # ─── HIGHER LOWS ──────────────────────────────────────────
@@ -2577,6 +2581,7 @@ def check_manual_zones():
                 for sub_chat_id in subscribers:
                     send_to(sub_chat_id, msg)
                 print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}")
+                start_confirm_watch(symbol, current_price, zone_dest, "Zone Confirmed")
                 signal_performance[f"{symbol}_zone_{int(now)}"] = {
                     "symbol": symbol, "signal_price": current_price,
                     "signal_time": now, "signal_type": f"Zone OB [{tf.upper()}]",
@@ -2877,6 +2882,7 @@ def check_manual_lines():
                 manual_lines[line_id]["lowest_since_break"] = l_close
                 manual_lines[line_id]["live_cross_alerted"] = False  # reset for next level
                 save_manual_lines()
+                full_confluence = build_entry_decision_block(symbol, current_price, tf=tf if tf in ("1h","4h") else "1h")
                 msg = (
                     f"📏 <b>Line Break Confirmed — {symbol} [{tf.upper()}]</b>\n\n"
                     f"💰 Price: {format_price(current_price)}\n"
@@ -2884,13 +2890,15 @@ def check_manual_lines():
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n\n"
                     f"✅ Candle closed above {format_price(level)} with body confirmation.\n"
                     f"⏳ Watching for a retest now — you'll get another alert "
-                    f"if/when it confirms.\n\n"
-                    f"⚠️ <i>Confirm on the chart before treating this as actionable.</i>"
+                    f"if/when it confirms.\n"
+                    + (f"\n{full_confluence}\n" if full_confluence else "") +
+                    f"\n⚠️ <i>Confirm on the chart before treating this as actionable.</i>"
                 )
                 send_to_topic(TOPIC_MY_SETUPS, msg)
                 if chat_id:
                     send_to(chat_id, msg)
                 print(f"📏 Line break confirmed: {line_id}")
+                start_confirm_watch(symbol, current_price, TOPIC_MY_SETUPS, "Line Break Confirmed")
             continue
 
         # ── broken → retest confirmed / failed ──
@@ -2913,12 +2921,14 @@ def check_manual_lines():
                 continue
 
             near_level = abs(current_price - level) / level <= 0.05
+            # FIX (note #8, same issue as LINE CROSSED Live): vol_ratio/buy_ratio
+            # here come from the 1h-cached klines (up to 120s stale), causing
+            # this to fire late relative to live price. Fire on price action
+            # alone — user checks volume themselves via /entry afterward.
             retest_confirmed = (
                 near_level and
                 l_close > l_open and
                 l_close > level and
-                vol_ratio >= 1.3 and
-                buy_ratio >= 0.50 and
                 line.get("last_retest_candle") != candle_key
             )
 
@@ -3123,22 +3133,37 @@ def check_active_trades():
 
         # ── Hard SL/TP hit check ──
         if current_price <= sl:
+            sl_pnl_pct = (current_price - entry) / entry * 100
             send_to_topic(TOPIC_TRADES,
-                f"🛑 <b>SL HIT</b>\n\n🪙 {symbol}\n💰 Entry: {format_price(entry)} → SL: {format_price(sl)}\n📉 Current: {format_price(current_price)}\n\n<i>Trade auto-closed from monitor.</i>"
+                f"🛑 <b>SL HIT</b>\n\n🪙 {symbol}\n💰 Entry: {format_price(entry)} → SL: {format_price(sl)}\n"
+                f"📉 Current: {format_price(current_price)} ({sl_pnl_pct:+.1f}%)\n\n<i>Trade auto-closed from monitor.</i>"
             )
             to_close.append(trade_id)
             continue
 
         hit_tps = trade.get("hit_tps", [])
+        final_tp_hit = False
         for i, tp in enumerate(tps):
             tp_label = f"tp{i+1}"
             if current_price >= tp and tp_label not in hit_tps:
                 hit_tps.append(tp_label)
                 active_trades[trade_id]["hit_tps"] = hit_tps
                 save_active_trades()
+                tp_pnl_pct = (current_price - entry) / entry * 100
                 send_to_topic(TOPIC_TRADES,
-                    f"✅ <b>TP{i+1} HIT!</b>\n\n🪙 {symbol}\n🎯 Target: {format_price(tp)}\n💰 Current: {format_price(current_price)}\n\n<i>Consider partial close / trail SL.</i>"
+                    f"✅ <b>TP{i+1} HIT!</b>\n\n🪙 {symbol}\n🎯 Target: {format_price(tp)}\n"
+                    f"💰 Current: {format_price(current_price)} ({tp_pnl_pct:+.1f}%)\n\n<i>Consider partial close / trail SL.</i>"
                 )
+                # Note #5 part 3: auto-remove once the FINAL TP is hit
+                if len(hit_tps) >= len(tps) and tps:
+                    send_to_topic(TOPIC_TRADES,
+                        f"🏁 <b>Final TP reached — {symbol}</b>\n\n"
+                        f"All targets hit ({tp_pnl_pct:+.1f}% from entry). Removing from Trade Monitor."
+                    )
+                    to_close.append(trade_id)
+                    final_tp_hit = True
+        if final_tp_hit:
+            continue
 
         # ── Dynamic SL trail suggestion (R-multiple based) ──
         risk = entry - sl
@@ -3168,23 +3193,27 @@ def check_active_trades():
         cooldown_ok = now - trade_alert_cooldown.get(trade_id, 0) > 3 * 3600
         crossed_up_threshold = score >= TRADE_SCORE_CAUTION and (last_score < TRADE_SCORE_CAUTION or cooldown_ok)
 
-        if score >= TRADE_SCORE_CAUTION and crossed_up_threshold:
+        # Note #5 part 1: only actually message the user at real conviction
+        # (WEAKENING or HIGH). The lowest "Early Caution — just monitor, no
+        # action needed" tier used to fire too, which is exactly the kind of
+        # low-value repeat notification the user doesn't want — score/trend
+        # is still tracked internally every cycle (last_score above), it's
+        # just silent until it's actually worth telling the user about.
+        if score >= TRADE_SCORE_WEAKENING and crossed_up_threshold:
             trade_alert_cooldown[trade_id] = now
+            pnl_pct = (current_price - entry) / entry * 100
             details_str = "\n   ".join(details)
             if score >= TRADE_SCORE_HIGH:
                 header = "🔴 <b>HIGH PRIORITY — Trend Reversal Risk</b>"
                 footer = "<i>⚠️ Strongly consider exiting or tightening SL now.</i>"
-            elif score >= TRADE_SCORE_WEAKENING:
+            else:
                 header = "🔶 <b>Trend Weakening</b>"
                 footer = "<i>Consider tightening SL to reduce risk.</i>"
-            else:
-                header = "⚠️ <b>Early Caution</b>"
-                footer = "<i>Just monitor — no action needed yet.</i>"
 
             send_to_topic(TOPIC_TRADES,
                 f"{header}\n\n"
                 f"🪙 <b>{symbol}</b> | {tf.upper()}\n"
-                f"💰 Entry: {format_price(entry)} | Current: {format_price(current_price)}\n"
+                f"💰 Entry: {format_price(entry)} | Current: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
                 f"📊 Trend Score: {score} ({label})\n"
                 f"   {details_str}\n\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
@@ -3307,7 +3336,7 @@ def check_active_trades_fast():
         print(f"{emoji} Trade monitor: {symbol} — {verdict}")
 
 
-def check_no_retest_pump_risk(symbol):
+def check_no_retest_pump_risk(symbol, tf="1h"):
     """
     Early-warning detector for coins likely to pump 10-60%+ WITHOUT ever
     giving a retest (unlike check_explosive_pump, this doesn't require the
@@ -3318,17 +3347,21 @@ def check_no_retest_pump_risk(symbol):
     Priority as ⭐ HIGH CONFIDENCE if the broader confluence also checks out.
     Also alerts My Setups directly if the user has manually /addzone-tracked
     this coin (their own watched setups shouldn't get buried in Top Picks).
+
+    Note #10: runs on BOTH 1H and 4H (tf param) — a move concentrated across
+    a single 4H candle (like ONDOUSDT) could slip through 1H-only checking.
     """
     now = time.time()
-    key = f"{symbol}_noretest_pump"
-    if now - alerted_coins.get(key, 0) < 4 * 3600:
+    key = f"{symbol}_noretest_pump_{tf}"
+    cooldown = 4 * 3600 if tf == "1h" else 8 * 3600
+    if now - alerted_coins.get(key, 0) < cooldown:
         return
 
-    klines_1h = get_klines(symbol, interval="1h", limit=15)
-    if not klines_1h or len(klines_1h) < 10:
+    klines = get_klines(symbol, interval=tf, limit=15)
+    if not klines or len(klines) < 10:
         return
 
-    closed = klines_1h[:-1]
+    closed = klines[:-1]
     last = closed[-1]
     l_open, l_close = float(last[1]), float(last[4])
     l_vol = float(last[5])
@@ -3338,7 +3371,8 @@ def check_no_retest_pump_risk(symbol):
         return  # must be a bullish breakout candle
 
     body_pct = (l_close - l_open) / l_open * 100
-    if body_pct < 3.0:
+    body_min = 3.0 if tf == "1h" else 5.0  # 4H candles naturally have bigger bodies
+    if body_pct < body_min:
         return  # not a strong enough breakout candle
 
     prev_vols = [float(k[5]) for k in closed[-8:-1]]
@@ -3366,7 +3400,7 @@ def check_no_retest_pump_risk(symbol):
     alerted_coins[key] = now
 
     msg = (
-        f"⚠️ <b>PUMP RISK — NO RETEST YET</b>\n\n"
+        f"⚠️ <b>PUMP RISK — NO RETEST YET [{tf.upper()}]</b>\n\n"
         f"🪙 <b>{symbol}</b>\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"📊 24h: {change_24h:+.2f}%\n"
@@ -3389,14 +3423,15 @@ def check_no_retest_pump_risk(symbol):
     if has_manual_zone:
         send_to_topic(TOPIC_MY_SETUPS, msg)
 
-    track_building_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
-    check_high_confidence_signal(symbol, "No-Retest Pump Risk [1H]", current_price)
-    print(f"⚠️ No-retest pump risk: {symbol} body={body_pct:.1f}% vol={vol_ratio:.1f}x buy={buy_ratio*100:.0f}%"
+    sig_label = f"No-Retest Pump Risk [{tf.upper()}]"
+    track_building_signal(symbol, sig_label, current_price)
+    check_high_confidence_signal(symbol, sig_label, current_price)
+    print(f"⚠️ No-retest pump risk [{tf.upper()}]: {symbol} body={body_pct:.1f}% vol={vol_ratio:.1f}x buy={buy_ratio*100:.0f}%"
           + (" [manual zone → My Setups]" if has_manual_zone else ""))
 
-    # Guaranteed High Priority bypass for extreme moves (note #7)
+    # Guaranteed High Priority bypass for extreme moves (note #7 from prior session)
     if vol_ratio >= 20.0 or body_pct >= 15.0:
-        send_extreme_pump_alert(symbol, current_price, body_pct, vol_ratio, buy_ratio, "No-Retest Pump Risk [1H]")
+        send_extreme_pump_alert(symbol, current_price, body_pct, vol_ratio, buy_ratio, sig_label)
 
 
 def check_explosive_pump(symbol):
@@ -3538,6 +3573,55 @@ def send_extreme_pump_alert(symbol, current_price, gain_pct, vol_ratio, buy_rati
         f"confluence score, so this can't be missed. Confirm on chart before entry."
     )
     print(f"🚨 Extreme pump guaranteed alert: {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
+    send_big_pump_alert(symbol, current_price, f"Extreme Pump ({source_signal})")
+
+
+_big_pump_alerted = {}  # {symbol: last_alert_time}
+
+def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
+    """
+    Note #7: dedicated "last line of defense" alert for the user's Big Pump
+    topic (TOPIC_BIG_PUMP). For coins showing strong signs of an actual big
+    pump developing (fed from check_high_confidence_signal at score>=4,
+    fast-pumper hits, and extreme-pump guaranteed alerts), sends directly
+    here with a guaranteed TP2>=20% trade plan — separate from every other
+    topic, specifically so a real big pump can't be missed.
+    """
+    now = time.time()
+    if now - _big_pump_alerted.get(symbol, 0) < 6 * 3600:
+        return
+    if not klines_4h:
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+    if not klines_4h:
+        return
+
+    eql_data = detect_equal_highs_lows(klines_4h, current_price)
+    nearest_eql = eql_data["eq_lows"][0] if eql_data.get("eq_lows") else None
+    sl = nearest_eql["price"] * 0.985 if nearest_eql else current_price * 0.90
+    risk = (current_price - sl) / current_price * 100
+
+    nearest_eqh = eql_data["eq_highs"][0] if eql_data.get("eq_highs") else None
+    tp1 = nearest_eqh["price"] if nearest_eqh else current_price * 1.10
+    tp1 = max(tp1, current_price * 1.05)
+    tp2_candidate = eql_data["eq_highs"][1]["price"] if len(eql_data.get("eq_highs", [])) >= 2 else tp1 * 1.15
+    tp2 = max(tp2_candidate, current_price * 1.20)  # TP2 minimum 20% floor (note #7)
+
+    tp1_pct = (tp1 - current_price) / current_price * 100
+    tp2_pct = (tp2 - current_price) / current_price * 100
+
+    _big_pump_alerted[symbol] = now
+    send_to_topic(TOPIC_BIG_PUMP,
+        f"🚀 <b>BIG PUMP ALERT — {symbol}</b>\n\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"📡 Source: {source_signal}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"📐 Entry: {format_price(current_price)}\n"
+        f"🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
+        f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%)\n"
+        f"🟢 TP2: {format_price(tp2)} (+{tp2_pct:.1f}%)\n\n"
+        f"⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
+    )
+    print(f"🚀 Big Pump alert: {symbol} @ {format_price(current_price)} (TP2 +{tp2_pct:.1f}%)")
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
 def is_daily_downtrend(symbol, current_price, klines_1h=None, klines_daily=None):
@@ -3851,6 +3935,7 @@ def check_prepump(symbol):
         print(f"🚀 Phase 3: {symbol}")
         track_building_signal(symbol, "Pre-pump Phase 3 🚀", current_price)
         check_high_confidence_signal(symbol, "Pre-pump Setup [1H]", current_price)
+        start_prospect_watch(symbol, "Pre-pump Breakout [Phase 3]")
 
 
 
@@ -3935,6 +4020,7 @@ def check_big_pump_setup(symbol):
     )
     if sent:
         print(f"🔥 Big pump setup: {symbol} ({score}/5)")
+        start_prospect_watch(symbol, "Big Pump Setup")
 
 # ─── AUTO WATCHLIST UPDATE (Daily) ───────────────────────
 last_auto_update = 0
@@ -5806,7 +5892,12 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
             ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
             if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
                 ob_zone = (kl, kh)
-                analysis_lines.append(f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}")
+                # Note #9: label whether this OB is "valid" (swept + FVG +
+                # unmitigated) using the same classifier as the background scanner.
+                valid_ob = find_valid_order_block(sym, tf="4h")
+                is_valid_ob = bool(valid_ob and abs(valid_ob["low"] - kl) < kl * 0.01 and abs(valid_ob["high"] - kh) < kh * 0.01)
+                ob_label = " ✅ Valid OB (swept+FVG+unmitigated)" if is_valid_ob else ""
+                analysis_lines.append(f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}{ob_label}")
                 break
 
     # ── iFVG ──
@@ -6008,6 +6099,20 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
         rr = tp_pct / risk_pct if risk_pct > 0 else 0
         tp_rr.append((tp_p, tp_pct, rr))
 
+    # Note #1 fix: TP2 minimum floor of 20%. Nearest-resistance-based TP2 was
+    # often much smaller than the coil "2nd pump potential" — user targets
+    # 20-30%+ coins, so TP2 shouldn't undersell that. If the 2nd nearest
+    # resistance gives less than 20%, look further out in tp_levels for one
+    # that clears 20%; otherwise fall back to a flat +20% synthetic target.
+    if len(tp_rr) >= 2 and tp_rr[1][1] < 20.0:
+        better_tp2 = next((lvl for lvl in tp_levels if lvl[1] >= 20.0), None)
+        if better_tp2:
+            tp2_p, tp2_pct = better_tp2
+        else:
+            tp2_p, tp2_pct = current_price * 1.20, 20.0
+        tp2_rr = tp2_pct / risk_pct if risk_pct > 0 else 0
+        tp_rr[1] = (tp2_p, tp2_pct, tp2_rr)
+
     # ── Smart Bot Opinion ──
     opinion_lines = []
 
@@ -6118,19 +6223,190 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
     return "\n".join(lines), entry_meta
 
 
+def get_quick_confluence_score(symbol, current_price):
+    """
+    Lightweight version of the extra-confluence scoring inside
+    build_entry_decision_block (daily trend, BS pressure, OB zone, liq
+    sweep presence) without building the full text block — used by the
+    confirmation-message follow-up watcher (note #6) to detect improvement.
+    Returns an int 0-4.
+    """
+    try:
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        klines_1h = get_klines(symbol, interval="1h", limit=20)
+        if not klines_4h:
+            return 0
+        closed_4h = klines_4h[:-1]
+        score = 0
+
+        if not is_daily_downtrend(symbol, current_price):
+            score += 1
+
+        eql_data = detect_equal_highs_lows(klines_4h, current_price)
+        if eql_data.get("eq_lows"):
+            score += 1
+
+        if klines_1h and len(klines_1h) >= 3:
+            last_1h = klines_1h[:-1][-1]
+            vol_1h = float(last_1h[5])
+            buy_1h = float(last_1h[9]) if len(last_1h) > 9 else vol_1h * 0.5
+            buy_ratio = buy_1h / vol_1h if vol_1h > 0 else 0.5
+            if buy_ratio >= 0.55:
+                score += 1
+
+        if closed_4h and len(closed_4h) >= 10:
+            avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+            for k in reversed(closed_4h[-15:]):
+                ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+                if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+                    score += 1
+                    break
+
+        return score
+    except Exception:
+        return 0
+
+
+_confirm_watch = {}  # {symbol: {"topic": id, "score": int, "started": time, "label": str}}
+
+def start_confirm_watch(symbol, current_price, topic, label):
+    """Registers a confirmation-style alert (Zone Confirmed, Line Break
+    Confirmed, etc) for follow-up monitoring (note #6) — if confluence
+    improves afterward, a follow-up goes back to the SAME topic."""
+    _confirm_watch[symbol] = {
+        "topic": topic,
+        "score": get_quick_confluence_score(symbol, current_price),
+        "started": time.time(),
+        "label": label,
+    }
+
+def check_confirm_watches():
+    """Runs periodically — if a watched symbol's confluence score has
+    improved since its confirmation alert fired, sends a follow-up to the
+    same topic. Expires after 48h."""
+    now = time.time()
+    to_remove = []
+    for symbol, watch in list(_confirm_watch.items()):
+        if now - watch["started"] > 48 * 3600:
+            to_remove.append(symbol)
+            continue
+        ticker = get_ticker(symbol)
+        if not ticker:
+            continue
+        current_price = float(ticker["lastPrice"])
+        new_score = get_quick_confluence_score(symbol, current_price)
+        if new_score > watch["score"]:
+            send_to_topic(watch["topic"],
+                f"📈 <b>Confluence Improved — {symbol}</b>\n\n"
+                f"Since the earlier {watch['label']} alert, confluence went "
+                f"{watch['score']}/4 → <b>{new_score}/4</b>.\n"
+                f"💰 Now: {format_price(current_price)}\n\n"
+                f"⚠️ <i>Confirm on chart before entry.</i>"
+            )
+            watch["score"] = new_score
+            print(f"📈 Confirm watch improved: {symbol} {watch['score']}/4")
+    for s in to_remove:
+        _confirm_watch.pop(s, None)
+
+
+_prospect_watch = {}  # {symbol: {"signal_type": str, "started": time}}
+
+def start_prospect_watch(symbol, signal_type):
+    """
+    Note #2: registers a "prospect" signal (Large Trade Detected, Big Pump
+    Setup, Pre-pump Breakout Phase 3, Range Breakout, Gradual Buildup, High
+    Confidence) for continued monitoring — these often fire before real
+    price impact/OB/FVG exists yet. check_prospect_watches() re-runs the
+    same instant-analysis (check_high_confidence_signal) on the symbol going
+    forward; if/when confluence clears the bar (pump actually developing),
+    it fires normally through that pipeline (including the Top Picks copy
+    for perfect 6/6 scores).
+    """
+    if symbol not in _prospect_watch:
+        _prospect_watch[symbol] = {"signal_type": signal_type, "started": time.time()}
+
+def check_prospect_watches():
+    """Runs periodically for up to 24h per prospect signal."""
+    now = time.time()
+    to_remove = []
+    for symbol, watch in list(_prospect_watch.items()):
+        if now - watch["started"] > 24 * 3600:
+            to_remove.append(symbol)
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            check_high_confidence_signal(symbol, watch["signal_type"], current_price)
+        except Exception as e:
+            print(f"Prospect watch error {symbol}: {e}")
+    for s in to_remove:
+        _prospect_watch.pop(s, None)
+
+
+_hc_followup_watch = {}  # {symbol: {"score": int, "started": time}}
+
+def start_hc_followup_watch(symbol, current_price):
+    """
+    Note #4: distinct from note #2's prospect watch — this tracks a symbol
+    AFTER a High Priority (⭐ HIGH CONFIDENCE) alert already fired. If
+    confluence merely improves afterward (e.g. BS Negative → Positive), a
+    follow-up goes to Top Picks (not re-sent to High Priority).
+    """
+    _hc_followup_watch[symbol] = {
+        "score": get_quick_confluence_score(symbol, current_price),
+        "started": time.time(),
+    }
+
+def check_hc_followup_watches():
+    """Runs periodically for up to 48h per High Priority alert."""
+    now = time.time()
+    to_remove = []
+    for symbol, watch in list(_hc_followup_watch.items()):
+        if now - watch["started"] > 48 * 3600:
+            to_remove.append(symbol)
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            new_score = get_quick_confluence_score(symbol, current_price)
+            if new_score > watch["score"]:
+                send_to_topic(TOPIC_TOP_PICKS,
+                    f"📈 <b>High Priority Setup Improved — {symbol}</b>\n\n"
+                    f"Confluence improved since the earlier High Priority alert: "
+                    f"{watch['score']}/4 → <b>{new_score}/4</b>\n"
+                    f"💰 Now: {format_price(current_price)}\n\n"
+                    f"⚠️ <i>Confirm on chart before entry.</i>"
+                )
+                watch["score"] = new_score
+                print(f"📈 HC follow-up improved: {symbol} {new_score}/4")
+        except Exception as e:
+            print(f"HC follow-up watch error {symbol}: {e}")
+    for s in to_remove:
+        _hc_followup_watch.pop(s, None)
+
+
 def build_entry_decision_block(symbol, current_price, tf="4h"):
     """
     Generates a complete entry decision block for retest completion messages
-    (/watch, /addline, zone confirm). Combines confluence analysis with a
-    ready-to-use trade plan: entry confirmation, SL, TP targets, and a
-    one-line decision summary so the user can act immediately without
+    (/watch, /addline, zone confirm, line break confirm). Combines confluence
+    analysis with a ready-to-use trade plan: entry confirmation, SL, TP
+    targets, and a decision summary so the user can act immediately without
     having to run /entry separately.
+
+    Note #6: now also checks liquidity sweep (EQL), BS pressure, and OB zone
+    confluence — matching /entry's build_powerful_entry depth — and computes
+    an overall score that the decision text factors in (not just raw R/R).
     """
     # Full confluence (trendline sweep + fib + volume/HL + key levels)
     confluence = build_full_confluence_block(symbol, current_price, tf=tf)
 
     # Get key levels for trade plan
     klines_4h = get_klines(symbol, interval="4h", limit=100)
+    klines_1h = get_klines(symbol, interval="1h", limit=20)
     ticker    = get_ticker(symbol)
     if not klines_4h or not ticker:
         return confluence  # fallback to just confluence if data unavailable
@@ -6165,26 +6441,75 @@ def build_entry_decision_block(symbol, current_price, tf="4h"):
     reward2 = (tp2 - current_price) / current_price * 100
     rr      = reward1 / risk if risk > 0 else 0
 
-    # Decision quality
-    is_bearish = change_24h < -5
-    rr_ok      = rr >= 2.0
+    # ── Note #6: additional confluence — liq sweep, BS pressure, OB zone ──
+    extra_lines = []
+    extra_score = 0
 
-    if is_bearish and not rr_ok:
+    daily_down = is_daily_downtrend(symbol, current_price)
+
+    eql_data = detect_equal_highs_lows(klines_4h, current_price)
+    nearest_eql = eql_data["eq_lows"][0] if eql_data.get("eq_lows") else None
+    if nearest_eql:
+        extra_score += 1
+        pct_below = (current_price - nearest_eql["price"]) / current_price * 100
+        extra_lines.append(f"💧 Liq sweep zone: EQL {format_price(nearest_eql['price'])} ({nearest_eql['touches']}x tested, {pct_below:.1f}% below)")
+
+    buy_ratio = None
+    if klines_1h and len(klines_1h) >= 3:
+        last_1h = klines_1h[:-1][-1]
+        vol_1h = float(last_1h[5])
+        buy_1h = float(last_1h[9]) if len(last_1h) > 9 else vol_1h * 0.5
+        buy_ratio = buy_1h / vol_1h if vol_1h > 0 else 0.5
+        if buy_ratio >= 0.55:
+            extra_score += 1
+            extra_lines.append(f"✅ BS Pressure: Positive (+{buy_ratio*100:.0f}% buy) — buyers in control")
+        else:
+            extra_lines.append(f"🔴 BS Pressure: Negative ({buy_ratio*100:.0f}% buy) — sellers active")
+
+    ob_zone_here = None
+    avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+    for k in reversed(closed_4h[-15:]):
+        ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+        if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+            ob_zone_here = (kl, kh)
+            extra_score += 1
+            extra_lines.append(f"🔲 OB zone confluence: {format_price(kl)}–{format_price(kh)}")
+            break
+
+    if not daily_down:
+        extra_score += 1
+
+    # Decision quality — now factors in the extra confluence, not just R/R
+    is_bearish = change_24h < -5 or daily_down
+    rr_ok      = rr >= 2.0
+    strong_confluence = extra_score >= 3  # e.g. liq sweep + BS positive + OB zone all present
+
+    if strong_confluence and not is_bearish:
+        decision_emoji = "✅"
+        decision_text  = f"Strong confluence ({extra_score}/4) backs this even with R/R at {rr:.1f}x — setup looks solid, confirm on chart then enter"
+    elif is_bearish and not rr_ok and extra_score < 2:
         decision_emoji = "⚠️"
-        decision_text  = "Daily trend bearish + R/R weak — consider skipping or very small size"
+        decision_text  = "Daily trend bearish + R/R weak + limited confluence — consider skipping or very small size"
+    elif is_bearish and extra_score >= 2:
+        decision_emoji = "🟡"
+        decision_text  = f"Daily bearish but confluence ({extra_score}/4) is decent — small position, tight SL"
     elif is_bearish:
         decision_emoji = "🟡"
         decision_text  = "Daily trend bearish but R/R acceptable — small position, tight SL"
+    elif not rr_ok and extra_score < 2:
+        decision_emoji = "🟡"
+        decision_text  = "R/R below 2:1 and confluence limited — consider waiting for a deeper retest or skip"
     elif not rr_ok:
         decision_emoji = "🟡"
-        decision_text  = "R/R below 2:1 — consider waiting for a deeper retest or skip"
+        decision_text  = f"R/R below 2:1, but confluence ({extra_score}/4) is meaningful — smaller position could work"
     else:
         decision_emoji = "✅"
         decision_text  = "Setup looks clean — R/R favorable, confirm on chart then enter"
 
     trade_block = (
         f"\n🎯 <b>Entry Decision (2-10 day hold):</b>\n"
-        f"   💰 Entry: {format_price(current_price)}\n"
+        + ("   " + "\n   ".join(extra_lines) + "\n" if extra_lines else "")
+        + f"   💰 Entry: {format_price(current_price)}\n"
         f"   🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
         f"   🟢 TP1: {format_price(tp1)} (+{reward1:.1f}%)\n"
         f"   🟢 TP2: {format_price(tp2)} (+{reward2:.1f}%)\n"
@@ -7183,6 +7508,173 @@ HIGH_WINRATE_SIGNALS = {
     "Gradual Buildup [1D]": 20,
 }
 
+def find_valid_order_block(symbol, tf="4h"):
+    """
+    Finds a "valid Order Block" per the 3-part definition (note #9, from a
+    shared trading reference): (1) a liquidity sweep occurred right before
+    the OB candle, (2) an FVG sits right after/adjacent to it, (3) it's
+    unmitigated — no candle since has traded back into its range. Returns
+    the OB dict (symbol/tf/low/high/candle_idx) or None.
+    """
+    klines = get_klines(symbol, interval=tf, limit=60)
+    if not klines or len(klines) < 20:
+        return None
+    closed = klines[:-1]
+    fvgs = detect_fvg(klines)
+
+    for i in range(len(closed) - 3, 5, -1):
+        c = closed[i]
+        ko, kc, kh, kl, kv = float(c[1]), float(c[4]), float(c[2]), float(c[3]), float(c[5])
+        if kc <= ko:
+            continue  # OB candle must be bullish (green)
+
+        prior_vols = [float(k[5]) for k in closed[max(0, i - 10):i]]
+        avg_v = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+        if avg_v <= 0 or kv < avg_v * 1.3:
+            continue  # needs real volume behind it
+
+        # (1) Liquidity sweep — this candle (or the one right before it)
+        # undercut a recent swing low before reversing up
+        lookback_lows = [float(k[3]) for k in closed[max(0, i - 10):i]]
+        if not lookback_lows:
+            continue
+        swing_low = min(lookback_lows)
+        swept = kl < swing_low
+        if not swept and i > 0:
+            swept = float(closed[i - 1][3]) < swing_low
+        if not swept:
+            continue
+
+        # (2) FVG present right after/adjacent to the OB candle
+        has_fvg = any(f["type"] == "bullish" and abs(f["candle_idx"] - i) <= 2 for f in fvgs)
+        if not has_fvg:
+            continue
+
+        # (3) Unmitigated — no candle since has traded back into [kl, kh]
+        mitigated = any(float(k[3]) <= kh and float(k[2]) >= kl for k in closed[i + 1:])
+        if mitigated:
+            continue
+
+        return {"symbol": symbol, "tf": tf, "low": kl, "high": kh, "candle_idx": i}
+
+    return None
+
+
+_valid_ob_alerted = {}  # {symbol: last_alert_time}
+
+def check_valid_order_block(symbol):
+    """
+    Note #9: scans a symbol for a valid Order Block (swept + FVG +
+    unmitigated), then scores it with a lightweight 4-point confluence check
+    (daily trend, BS/buy pressure, volume strength, higher lows). Routes:
+    score>=2 → High Priority, score>=4 (all pass) → also Top Picks.
+    """
+    now = time.time()
+    if now - _valid_ob_alerted.get(symbol, 0) < 8 * 3600:
+        return
+
+    ob = find_valid_order_block(symbol, tf="4h")
+    if not ob:
+        return
+
+    ticker = get_ticker(symbol)
+    if not ticker:
+        return
+    current_price = float(ticker["lastPrice"])
+    if not (ob["low"] * 0.98 <= current_price <= ob["high"] * 1.05):
+        return  # only relevant while price is still near the OB
+
+    klines_1d = get_klines(symbol, interval="1d", limit=30)
+    klines_1h = get_klines(symbol, interval="1h", limit=20)
+
+    score = 0
+    details = []
+
+    daily_down = is_daily_downtrend(symbol, current_price)
+    if not daily_down:
+        score += 1
+        details.append("✅ Daily trend bullish/neutral")
+    else:
+        details.append("❌ Daily trend bearish")
+
+    buy_ratio = None
+    if klines_1h and len(klines_1h) >= 3:
+        last_1h = klines_1h[:-1][-1]
+        vol_1h = float(last_1h[5])
+        buy_1h = float(last_1h[9]) if len(last_1h) > 9 else vol_1h * 0.5
+        buy_ratio = buy_1h / vol_1h if vol_1h > 0 else 0.5
+    if buy_ratio is not None and buy_ratio >= 0.55:
+        score += 1
+        details.append(f"✅ BS Positive ({buy_ratio*100:.0f}% buy)")
+    else:
+        details.append("⚠️ BS Negative/neutral")
+
+    vol_strong = False
+    if klines_1d and len(klines_1d) >= 10:
+        closed_1d = klines_1d[:-1]
+        vols = [float(k[5]) for k in closed_1d[-10:]]
+        baseline = sum(vols[:-1]) / max(1, len(vols) - 1)
+        vol_strong = baseline > 0 and vols[-1] >= baseline * 1.3
+    if vol_strong:
+        score += 1
+        details.append("✅ Volume elevated")
+    else:
+        details.append("⚠️ Volume unremarkable")
+
+    hl_forming = False
+    if klines_1h and len(klines_1h) >= 8:
+        lows_1h = [float(k[3]) for k in klines_1h[:-1][-8:]]
+        hl_forming = sum(1 for j in range(1, len(lows_1h)) if lows_1h[j] > lows_1h[j - 1]) >= 3
+    if hl_forming:
+        score += 1
+        details.append("✅ Higher lows forming (1H)")
+    else:
+        details.append("⚠️ No clear higher lows")
+
+    if score < 2:
+        return
+
+    _valid_ob_alerted[symbol] = now
+    details_str = "\n   ".join(details)
+    msg = (
+        f"🔲 <b>VALID ORDER BLOCK — {symbol}</b>\n\n"
+        f"📐 Definition: liquidity swept ✅ | FVG present ✅ | unmitigated ✅\n"
+        f"🔲 OB Zone: {format_price(ob['low'])}–{format_price(ob['high'])} [{ob['tf'].upper()}]\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"📊 Confluence Score: {score}/4\n\n"
+        f"   {details_str}\n\n"
+        f"⚠️ <i>Confirm on chart before entry.</i>"
+    )
+    send_to_topic(TOPIC_HIGH, msg)
+    if score >= 4:
+        send_to_topic(TOPIC_TOP_PICKS, "🏆 <b>VALID OB — STRONG</b>\n\n" + msg)
+    print(f"🔲 Valid OB: {symbol} score={score}/4 zone={format_price(ob['low'])}-{format_price(ob['high'])}")
+
+
+def is_fast_pumper(symbol, min_samples=3, max_hours=48, min_gain=30.0):
+    """
+    Note #3: classifies a symbol as a "fast pumper" — one whose historical
+    signals consistently reach big gains (>=30%) within a short window
+    (<48h) rather than slow multi-day/week grinds. Uses the existing
+    peak_time/peak_hrs tracking in signal_performance (same data the SIGNAL
+    RESULT messages use). Needs at least min_samples historical signals to
+    make a call; returns False (not fast-pumper) if there isn't enough data.
+    """
+    samples = [
+        d for d in signal_performance.values()
+        if d.get("symbol") == symbol and d.get("signal_price", 0) > 0 and "peak_time" in d
+    ]
+    if len(samples) < min_samples:
+        return False
+    fast_hits = 0
+    for d in samples:
+        gain = (d["highest_after"] - d["signal_price"]) / d["signal_price"] * 100
+        hrs = (d["peak_time"] - d["signal_time"]) / 3600
+        if gain >= min_gain and hrs <= max_hours:
+            fast_hits += 1
+    return fast_hits / len(samples) >= 0.5  # majority of historical signals were fast+big
+
+
 def check_high_confidence_signal(symbol, signal_type, current_price):
     """
     Runs an instant confluence check after ANY signal fires (Top Picks,
@@ -7202,6 +7694,15 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             win_rate = wr
             break
     required_score = 3 if win_rate else 2
+
+    # Note #3: symbols classified as historical "fast pumpers" get a much
+    # lower confluence bar — score>=1 is enough to reach High Priority (vs
+    # the normal 2/3), since their track record already shows fast, sizable
+    # moves. This is a per-symbol override, not a global change (would be
+    # too noisy applied to every coin).
+    fast_pumper = is_fast_pumper(symbol)
+    if fast_pumper:
+        required_score = 1
 
     now = time.time()
     key = f"{symbol}_hc"
@@ -7346,7 +7847,18 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             # Top Picks (note #11) is reserved exclusively for perfect 6/6
             # confluence scores — the absolute best-scoring signals get a copy.
             send_to_topic(TOPIC_TOP_PICKS, "🏆 <b>PERFECT SCORE</b>\n\n" + hc_msg)
+        elif fast_pumper and score >= 4:
+            # Note #3: fast-pumper coins get a lower Top Picks bar too (4+, not 6/6)
+            send_to_topic(TOPIC_TOP_PICKS, "⚡ <b>FAST PUMPER</b>\n\n" + hc_msg)
         print(f"⭐ High confidence: {symbol} score={score}/6 signal={signal_type}")
+        start_prospect_watch(symbol, signal_type)
+        start_hc_followup_watch(symbol, current_price)
+
+        # Note #7: feed the Big Pump topic from strong High Priority hits too
+        # — score>=4 (solid confluence) or any fast-pumper hit, since those
+        # coins have a track record of fast, sizable moves.
+        if score >= 4 or fast_pumper:
+            send_big_pump_alert(symbol, current_price, signal_type, klines_4h=klines_4h)
 
         # ── Auto-add 4 high-confluence zones around this High Priority signal ──
         # 2 above current price (resistance/EQH), 2 below (support/EQL).
@@ -7501,6 +8013,7 @@ def check_whale_trades(symbol):
         f"⚠️ <i>Confirm on chart before entry.</i>"
     )
     print(f"🐋 Whale trade: {symbol} ${latest_value:,.0f} ({ratio:.0f}x, {'buy' if is_buy else 'sell'})")
+    start_prospect_watch(symbol, "Large Trade Detected")
 
 
 def scan_global_liq_reclaim():
@@ -9619,7 +10132,8 @@ def main():
             check_buy_pressure(symbol)
             check_volume_surge(symbol)
             check_explosive_pump(symbol)
-            check_no_retest_pump_risk(symbol)
+            check_no_retest_pump_risk(symbol, tf="1h")
+            check_no_retest_pump_risk(symbol, tf="4h")
             check_abnormal_volume(symbol)
             check_prepump(symbol)
             check_big_pump_setup(symbol)
@@ -9670,6 +10184,52 @@ def main():
             time.sleep(3600)  # every hour — 1D-based data, internal cooldown is 3 days per coin
 
     Thread(target=run_dormant_coil_scanner, daemon=True).start()
+
+    def run_valid_ob_scanner():
+        while True:
+            try:
+                for _sym in list(watchlist):
+                    if _sym in removed_coins:
+                        continue
+                    try:
+                        check_valid_order_block(_sym)
+                    except Exception as e:
+                        print(f"Valid OB check error {_sym}: {e}")
+            except Exception as e:
+                print(f"Valid OB scan error: {e}")
+            time.sleep(600)  # every 10 minutes, internal cooldown is 8h per coin
+
+    Thread(target=run_valid_ob_scanner, daemon=True).start()
+
+    def run_confirm_watch_checker():
+        while True:
+            try:
+                check_confirm_watches()
+            except Exception as e:
+                print(f"Confirm watch check error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_confirm_watch_checker, daemon=True).start()
+
+    def run_prospect_watch_checker():
+        while True:
+            try:
+                check_prospect_watches()
+            except Exception as e:
+                print(f"Prospect watch check error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_prospect_watch_checker, daemon=True).start()
+
+    def run_hc_followup_checker():
+        while True:
+            try:
+                check_hc_followup_watches()
+            except Exception as e:
+                print(f"HC follow-up check error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_hc_followup_checker, daemon=True).start()
 
     def run_whale_trade_scanner():
         while True:
