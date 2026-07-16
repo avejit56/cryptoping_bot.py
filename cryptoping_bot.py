@@ -5941,6 +5941,14 @@ def check_liq_watches():
                     to_remove.append(symbol)
                     print(f"🔥 Liq reclaim alert: {symbol}{' [COMBINED]' if combined_setup else ''}")
 
+                    # User clarification: LIQUIDATION SWEEP COMPLETE itself
+                    # isn't the High Priority message — it feeds into the
+                    # same confluence-scored Big Pump pipeline as everything
+                    # else. Only once the pump ACTUALLY confirms (via
+                    # check_big_pump_watches) does "Pump Confirmed" land in
+                    # High Priority.
+                    check_high_confidence_signal(symbol, "Liquidity Sweep+Reclaim", current_price)
+
     for s in to_remove:
         _liq_watch.pop(s, None)
 
