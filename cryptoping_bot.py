@@ -647,6 +647,15 @@ def send_to(chat_id, message, thread_id=None):
             json=payload, timeout=10)
         if r.status_code != 200:
             print(f"⚠️ send_to failed: HTTP {r.status_code} — {r.text[:300]} (len={len(message)})")
+            # Auto-cleanup: a permanently-invalid subscriber (blocked the bot,
+            # deleted account, never actually started a DM) causes this same
+            # 400 "chat not found" on EVERY single message forever. Remove it
+            # from subscribers so it doesn't keep failing on every send.
+            if r.status_code == 400 and "chat not found" in r.text.lower() and chat_id in subscribers:
+                subscribers.remove(chat_id)
+                subscribers_info.pop(str(chat_id), None)
+                save_subscribers_file()
+                print(f"🧹 Removed invalid subscriber chat_id {chat_id} (chat not found)")
     except Exception as e:
         print(f"⚠️ send_to exception: {e}")
 
@@ -3307,7 +3316,13 @@ def check_active_trades_fast():
             continue
 
         # Build verdict
-        negative = any(x in " ".join(alerts) for x in ["📉","🔴","⚡ 5M sell","⚡ 1H sell","URGENT"])
+        # FIX: a single 5M sell spike alone is too short-term/noisy to drive
+        # an exit recommendation on a multi-day hold (KATUSDT case: exited on
+        # a lone 4.3x 5M spike, then price recovered). It still shows in the
+        # message as an FYI, but only the more sustained signals (lower
+        # highs+lows over 6 candles, 1H below EMA, 1H sell spike) count
+        # toward the "negative/consider exiting" classification.
+        negative = any(x in " ".join(alerts) for x in ["📉","🔴","⚡ 1H sell","URGENT"])
         if is_urgent:
             verdict = "🚨 EXIT or tighten SL immediately"
         elif negative and pnl_pct < 0:
@@ -3584,14 +3599,19 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
     topic (TOPIC_BIG_PUMP). For coins showing strong signs of an actual big
     pump developing (fed from check_high_confidence_signal at score>=4,
     fast-pumper hits, and extreme-pump guaranteed alerts), sends directly
-    here with a guaranteed TP2>=20% trade plan — separate from every other
-    topic, specifically so a real big pump can't be missed.
+    here with a trade plan — separate from every other topic, specifically
+    so a real big pump can't be missed.
+
+    TP2 is resistance/liquidity/volume-based (nearest real resistance
+    cluster from EQH + 4H/1D swing highs), NOT a fixed percentage — it
+    reports whatever % that actually works out to (could be 17%, could be
+    35%), rather than forcing a round 20% every time.
     """
     now = time.time()
     if now - _big_pump_alerted.get(symbol, 0) < 6 * 3600:
         return
     if not klines_4h:
-        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        klines_4h = get_klines(symbol, interval="4h", limit=100)
     if not klines_4h:
         return
 
@@ -3600,14 +3620,33 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
     sl = nearest_eql["price"] * 0.985 if nearest_eql else current_price * 0.90
     risk = (current_price - sl) / current_price * 100
 
-    nearest_eqh = eql_data["eq_highs"][0] if eql_data.get("eq_highs") else None
-    tp1 = nearest_eqh["price"] if nearest_eqh else current_price * 1.10
-    tp1 = max(tp1, current_price * 1.05)
-    tp2_candidate = eql_data["eq_highs"][1]["price"] if len(eql_data.get("eq_highs", [])) >= 2 else tp1 * 1.15
-    tp2 = max(tp2_candidate, current_price * 1.20)  # TP2 minimum 20% floor (note #7)
+    # Gather resistance candidates from multiple real sources — EQH levels,
+    # 4H swing highs, 1D swing highs — instead of a fixed percentage.
+    closed_4h = klines_4h[:-1]
+    res_candidates = [(h["price"], h["touches"]) for h in eql_data.get("eq_highs", [])]
+    res_candidates += [(float(k[2]), 1) for k in closed_4h[-40:]]
+    klines_1d = get_klines(symbol, interval="1d", limit=60)
+    if klines_1d:
+        res_candidates += [(float(k[2]), 1) for k in klines_1d[:-1]]
+
+    res_above = sorted(set(p for p, _ in res_candidates if p > current_price * 1.03))
+    # Cluster levels within 3% of each other, keep the lower of each cluster
+    res_clean = []
+    for p in res_above:
+        if not res_clean or (p - res_clean[-1]) / res_clean[-1] > 0.03:
+            res_clean.append(p)
+
+    tp1 = next((p for p in res_clean if p >= current_price * 1.05), current_price * 1.08)
+    tp2 = next((p for p in res_clean if p > tp1 * 1.03), None)
+    if tp2 is None:
+        # No further real resistance found — use historical pattern context
+        # (peak_hrs/peak_pct track record) as a reference instead of a flat %
+        hist = get_pattern_history_stats(source_signal, min_samples=3)
+        tp2 = tp1 * 1.15 if hist else tp1 * 1.10
 
     tp1_pct = (tp1 - current_price) / current_price * 100
     tp2_pct = (tp2 - current_price) / current_price * 100
+    hist_note = get_pattern_history_stats(source_signal, min_samples=3)
 
     _big_pump_alerted[symbol] = now
     send_to_topic(TOPIC_BIG_PUMP,
@@ -3618,8 +3657,9 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
         f"📐 Entry: {format_price(current_price)}\n"
         f"🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
         f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%)\n"
-        f"🟢 TP2: {format_price(tp2)} (+{tp2_pct:.1f}%)\n\n"
-        f"⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
+        f"🟢 TP2: {format_price(tp2)} (+{tp2_pct:.1f}%) — nearest real resistance\n"
+        + (f"   {hist_note}\n" if hist_note else "") +
+        f"\n⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
     )
     print(f"🚀 Big Pump alert: {symbol} @ {format_price(current_price)} (TP2 +{tp2_pct:.1f}%)")
 
