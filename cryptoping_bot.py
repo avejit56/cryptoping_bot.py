@@ -3261,6 +3261,34 @@ def check_active_trades_fast():
         alerts = []
         is_urgent = False
 
+        # ── Bigger pump potential: strong volume still coming in after a
+        # meaningful gain — heads-up that this could run well past the
+        # planned TP, so the user can watch the chart for a higher exit
+        # instead of just taking the fixed target. Independent of the other
+        # checks below (own 2h re-notify cooldown, since the move may keep extending).
+        if pnl_pct >= 10.0 and now - trade.get("big_pump_watch_alerted", 0) > 2 * 3600:
+            klines_1h_bp = get_klines(symbol, interval="1h", limit=10)
+            if klines_1h_bp and len(klines_1h_bp) >= 5:
+                closed_1h_bp = klines_1h_bp[:-1]
+                vols_1h_bp = [float(k[5]) for k in closed_1h_bp[-5:]]
+                avg_vol_1h_bp = sum(vols_1h_bp[:-1]) / max(1, len(vols_1h_bp) - 1)
+                last_vol_1h_bp = vols_1h_bp[-1]
+                vol_ratio_bp = last_vol_1h_bp / avg_vol_1h_bp if avg_vol_1h_bp > 0 else 0
+                last_candle_bp = closed_1h_bp[-1]
+                buy_vol_bp = float(last_candle_bp[9]) if len(last_candle_bp) > 9 else last_vol_1h_bp * 0.5
+                buy_ratio_bp = buy_vol_bp / last_vol_1h_bp if last_vol_1h_bp > 0 else 0.5
+                if vol_ratio_bp >= 2.0 and buy_ratio_bp >= 0.55:
+                    active_trades[trade_id]["big_pump_watch_alerted"] = now
+                    send_to_topic(TOPIC_TRADES,
+                        f"🚀 <b>Bigger Pump Potential — {symbol}</b>\n\n"
+                        f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+                        f"⚡ Volume still elevated: {vol_ratio_bp:.1f}x | Buy: {buy_ratio_bp*100:.0f}%\n\n"
+                        f"💡 This may extend well past your planned TP — keep an eye on the chart, "
+                        f"consider holding part of the position for a higher exit instead of taking full profit here.\n"
+                        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+                    )
+                    print(f"🚀 Big pump potential (trade): {symbol} +{pnl_pct:.1f}% vol={vol_ratio_bp:.1f}x")
+
         # ── URGENT: price near SL (within 2%) ──
         if sl_dist <= 2.0 and sl_dist > 0:
             if now - trade.get("last_sl_alert", 0) > 30 * 60:  # 30min cooldown for SL alerts
@@ -3682,16 +3710,48 @@ def start_big_pump_watch(symbol, alert_price, source_signal):
             "confirmed": False,
         }
 
+def _check_tf_pump_signal(symbol, tf, limit=12):
+    """
+    Helper for check_big_pump_watches: checks ONE timeframe for a
+    developing pump. Requires at least 2 of the last 3 CLOSED candles to be
+    bullish (not just a single candle/wick), plus elevated volume and buy
+    pressure on the most recent one — sustained pattern, not one-candle noise.
+    Returns (developing: bool, vol_ratio: float, buy_ratio: float).
+    """
+    klines = get_klines(symbol, interval=tf, limit=limit)
+    if not klines or len(klines) < 8:
+        return False, 0, 0.5
+    closed = klines[:-1]
+    last3 = closed[-3:]
+    bullish_count = sum(1 for k in last3 if float(k[4]) > float(k[1]))
+
+    prior_vols = [float(k[5]) for k in closed[-9:-3]]
+    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+    last_vol = float(last3[-1][5])
+    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
+
+    last_buy = float(last3[-1][9]) if len(last3[-1]) > 9 else last_vol * 0.5
+    buy_ratio = last_buy / last_vol if last_vol > 0 else 0.5
+
+    developing = bullish_count >= 2 and vol_ratio >= 3.0 and buy_ratio >= 0.58
+    return developing, vol_ratio, buy_ratio
+
+
 def check_big_pump_watches():
     """
     Runs periodically. For each watched symbol, checks whether the actual
-    pump has started — a strong bullish 1H candle with abnormal volume and
-    buy pressure, OR price already up meaningfully (10%+) from the alert
-    price with volume still elevated (covers the "pumped directly, no
-    retest" case as well as the "retested first, then pumped" case, since
-    both end up satisfying this once the real move happens).
-    Fires ONE confirmed-pump follow-up to TOPIC_BIG_PUMP, then keeps
-    tracking (won't re-fire) until it expires after 72h.
+    pump has started, using 5M/15M/1H together (SMC-style multi-timeframe
+    confirmation) rather than waiting on a single 1H candle:
+    - If at least 2 of these 3 timeframes show a "developing" pattern
+      (2 of last 3 candles bullish + volume 3x+ + buy pressure 58%+) at the
+      same time, that's cross-timeframe agreement → confirmed. This catches
+      fast moves within minutes instead of waiting up to an hour, while
+      still requiring sustained (not single-candle) confirmation to keep
+      false positives down.
+    - Fallback: price already up 10%+ from the alert price with volume
+      still elevated (covers a move that's already well underway).
+    Fires ONE confirmed-pump follow-up to TOPIC_HIGH, then keeps tracking
+    (won't re-fire) until it expires after 72h.
     """
     now = time.time()
     to_remove = []
@@ -3702,30 +3762,34 @@ def check_big_pump_watches():
         if watch["confirmed"]:
             continue
         try:
-            klines_1h = get_klines(symbol, interval="1h", limit=15)
             ticker = get_ticker(symbol)
-            if not klines_1h or not ticker or len(klines_1h) < 10:
+            if not ticker:
                 continue
             current_price = float(ticker["lastPrice"])
 
-            closed = klines_1h[:-1]
-            last = closed[-1]
-            l_open, l_close = float(last[1]), float(last[4])
-            l_vol = float(last[5])
-            l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
-            buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+            tf_results = {}
+            for tf in ("5m", "15m", "1h"):
+                tf_results[tf] = _check_tf_pump_signal(symbol, tf)
 
-            prior_vols = [float(k[5]) for k in closed[-8:-1]]
-            avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
-            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+            developing_count = sum(1 for d, _, _ in tf_results.values() if d)
+            # Use the fastest timeframe that's developing for the display numbers
+            display_vol_ratio, display_buy_ratio = 0, 0.5
+            for tf in ("5m", "15m", "1h"):
+                d, vr, br = tf_results[tf]
+                if d:
+                    display_vol_ratio, display_buy_ratio = vr, br
+                    break
+            if display_vol_ratio == 0:
+                display_vol_ratio, display_buy_ratio = tf_results["1h"][1], tf_results["1h"][2]
 
             gain_from_alert = (current_price - watch["alert_price"]) / watch["alert_price"] * 100
 
-            strong_candle = l_close > l_open and vol_ratio >= 4.0 and buy_ratio >= 0.60
-            already_pumping = gain_from_alert >= 10.0 and vol_ratio >= 2.0
+            multi_tf_confirmed = developing_count >= 2
+            already_pumping = gain_from_alert >= 10.0 and display_vol_ratio >= 2.0
 
-            if strong_candle or already_pumping:
+            if multi_tf_confirmed or already_pumping:
                 watch["confirmed"] = True
+                vol_ratio, buy_ratio = display_vol_ratio, display_buy_ratio
 
                 # Lightweight confluence summary (NOT the full /entry-style
                 # analysis — that needs multi-timeframe retest checks + chart
@@ -3762,8 +3826,10 @@ def check_big_pump_watches():
 
                 extra_str = ("\n" + "\n".join(f"   {l}" for l in extra_lines) + "\n") if extra_lines else ""
 
+                confirmed_tfs = [tf.upper() for tf, (d, _, _) in tf_results.items() if d]
+                tf_note = f" [{'+'.join(confirmed_tfs)}]" if confirmed_tfs else ""
                 send_to_topic(TOPIC_HIGH,
-                    f"🚀 <b>PUMP CONFIRMED — {symbol}</b>\n\n"
+                    f"🚀 <b>PUMP CONFIRMED — {symbol}</b>{tf_note}\n\n"
                     f"💰 Alert price: {format_price(watch['alert_price'])} → Now: {format_price(current_price)} "
                     f"({gain_from_alert:+.1f}%)\n"
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
