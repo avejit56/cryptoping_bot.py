@@ -692,7 +692,7 @@ def send_chunked(chat_id, lines, header=""):
 def get_topic_for_message(message):
     """Decide which topic to route this message to, based on its content"""
     if any(x in message for x in ["LIQUIDITY RECLAIM", "POWER SIGNAL", "RETEST RECLAIM", "HIGH CONFIDENCE"]):
-        return TOPIC_HIGH
+        return TOPIC_BUILDUPS
     elif any(x in message for x in ["ZONE CONFIRMED", "RETEST CONFIRMED", "OB BOUNCE", "TRENDLINE RETEST", "Line Retest Complete", "Retest Complete"]):
         return TOPIC_MY_SETUPS
     elif any(x in message for x in ["EXPLOSIVE PUMP", "BUY PRESSURE", "BREAKOUT!"]):
@@ -2582,7 +2582,7 @@ def check_manual_zones():
                 # Route based on zone origin: auto-added (from High Priority)
                 # zones' results go back to High Priority; user's manually
                 # /addzone-added zones keep going to My Setups as before.
-                zone_dest = TOPIC_HIGH if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
+                zone_dest = TOPIC_BUILDUPS if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
                 send_to_topic(zone_dest, msg)
                 if is_top_pick and zone_dest != TOPIC_BUILDUPS:
                     send_to_topic(TOPIC_BUILDUPS, msg)
@@ -2636,7 +2636,7 @@ def check_manual_zones():
                             f"📉 Close: {format_price(l_close)} (below zone)\n\n"
                             f"⚠️ Went up, then broke back below the zone."
                         )
-                        send_to_topic(TOPIC_HIGH, inv_msg)
+                        send_to_topic(TOPIC_BUILDUPS, inv_msg)
                         send_to(ADMIN_CHAT_ID, inv_msg)
                         continue
 
@@ -2692,7 +2692,7 @@ def check_manual_zones():
                             f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                             f"⚠️ <i>Strong retest! Take the entry.</i>"
                         )
-                        zone_dest = TOPIC_HIGH if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
+                        zone_dest = TOPIC_BUILDUPS if zone.get("source") == "auto_high_priority" else TOPIC_MY_SETUPS
                         for sub_chat_id in subscribers:
                             send_to(sub_chat_id, ret_msg)
                         send_to_topic(zone_dest, ret_msg)
@@ -3568,24 +3568,24 @@ _extreme_pump_alerted = {}
 def send_extreme_pump_alert(symbol, current_price, gain_pct, vol_ratio, buy_ratio, source_signal):
     """
     For sufficiently extreme single-move pumps (very high vol_ratio / body
-    size), sends straight to High Priority — bypassing check_high_confidence_
-    signal's score>=2/3 gate entirely, so no big pump is missable just
-    because the broader confluence checklist didn't fully line up.
+    size), bypasses check_high_confidence_signal's score>=2/3 gate entirely
+    — sends to Building Momentum and the Big Pump topic, so no big pump is
+    missable just because the broader confluence checklist didn't line up.
     """
     now = time.time()
     key = f"{symbol}_extreme"
     if now - _extreme_pump_alerted.get(key, 0) < 6 * 3600:
         return
     _extreme_pump_alerted[key] = now
-    send_to_topic(TOPIC_HIGH,
+    send_to_topic(TOPIC_BUILDUPS,
         f"🚨 <b>EXTREME PUMP — GUARANTEED ALERT</b>\n\n"
         f"🪙 <b>{symbol}</b>\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"🚀 Move: <b>+{gain_pct:.1f}%</b> | ⚡ Volume: <b>{vol_ratio:.1f}x</b> | 🟢 Buy: {buy_ratio*100:.0f}%\n"
         f"📡 Source: {source_signal}\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-        f"⚠️ Extreme magnitude — sent directly to High Priority regardless of "
-        f"confluence score, so this can't be missed. Confirm on chart before entry."
+        f"⚠️ Extreme magnitude — bypasses the normal confluence gate entirely "
+        f"(also sent to Big Pump topic), so this can't be missed. Confirm on chart before entry."
     )
     print(f"🚨 Extreme pump guaranteed alert: {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
     send_big_pump_alert(symbol, current_price, f"Extreme Pump ({source_signal})")
@@ -3726,14 +3726,51 @@ def check_big_pump_watches():
 
             if strong_candle or already_pumping:
                 watch["confirmed"] = True
-                send_to_topic(TOPIC_BIG_PUMP,
+
+                # Lightweight confluence summary (NOT the full /entry-style
+                # analysis — that needs multi-timeframe retest checks + chart
+                # pattern detection, which risks delaying this alert right
+                # when speed matters most). Reuses cheap, usually-cached
+                # calls only: daily trend, BS pressure (already fetched
+                # above), OB zone, and nearest EQL — same cost as
+                # get_quick_confluence_score.
+                extra_lines = []
+                try:
+                    klines_4h = get_klines(symbol, interval="4h", limit=30)
+                    if klines_4h:
+                        closed_4h = klines_4h[:-1]
+                        if not is_daily_downtrend(symbol, current_price):
+                            extra_lines.append("✅ Daily trend bullish/neutral")
+                        else:
+                            extra_lines.append("❌ Daily trend bearish")
+
+                        extra_lines.append(f"{'✅' if buy_ratio >= 0.55 else '🔴'} BS Pressure: {'Positive' if buy_ratio >= 0.55 else 'Negative'} ({buy_ratio*100:.0f}% buy)")
+
+                        avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+                        for k in reversed(closed_4h[-15:]):
+                            ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+                            if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+                                extra_lines.append(f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}")
+                                break
+
+                        eql_data = detect_equal_highs_lows(klines_4h, current_price)
+                        if eql_data.get("eq_lows"):
+                            eql = eql_data["eq_lows"][0]
+                            extra_lines.append(f"💧 Liq sweep zone: EQL {format_price(eql['price'])} ({eql['touches']}x tested)")
+                except Exception as e:
+                    print(f"Pump confirmed quick-analysis error {symbol}: {e}")
+
+                extra_str = ("\n" + "\n".join(f"   {l}" for l in extra_lines) + "\n") if extra_lines else ""
+
+                send_to_topic(TOPIC_HIGH,
                     f"🚀 <b>PUMP CONFIRMED — {symbol}</b>\n\n"
                     f"💰 Alert price: {format_price(watch['alert_price'])} → Now: {format_price(current_price)} "
                     f"({gain_from_alert:+.1f}%)\n"
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
                     f"📡 Original signal: {watch['source']}\n"
-                    f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-                    f"✅ The pump flagged earlier is actually moving now.\n"
+                    f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
+                    + extra_str +
+                    f"\n✅ The pump flagged earlier is actually moving now.\n"
                     f"⚠️ <i>Confirm on chart before entry.</i>"
                 )
                 print(f"🚀 Big Pump CONFIRMED: {symbol} {gain_from_alert:+.1f}% vol={vol_ratio:.1f}x")
@@ -7764,7 +7801,7 @@ def check_valid_order_block(symbol):
         f"   {details_str}\n\n"
         f"⚠️ <i>Confirm on chart before entry.</i>"
     )
-    send_to_topic(TOPIC_HIGH, msg)
+    send_to_topic(TOPIC_BUILDUPS, msg)
     if score >= 4:
         send_to_topic(TOPIC_TOP_PICKS, "🏆 <b>VALID OB — STRONG</b>\n\n" + msg)
     print(f"🔲 Valid OB: {symbol} score={score}/4 zone={format_price(ob['low'])}-{format_price(ob['high'])}")
@@ -7961,7 +7998,7 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             f"⚖️ R/R: {rr:.1f}x\n\n"
             f"⚠️ <i>Confirm on chart before entry.</i>"
         )
-        send_to_topic(TOPIC_HIGH, hc_msg)
+        send_to_topic(TOPIC_BUILDUPS, hc_msg)
         if score >= 6:
             # Top Picks (note #11) is reserved exclusively for perfect 6/6
             # confluence scores — the absolute best-scoring signals get a copy.
