@@ -3662,6 +3662,85 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
         f"\n⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
     )
     print(f"🚀 Big Pump alert: {symbol} @ {format_price(current_price)} (TP2 +{tp2_pct:.1f}%)")
+    start_big_pump_watch(symbol, current_price, source_signal)
+
+
+_big_pump_watch = {}  # {symbol: {"alert_price": float, "started": time, "source": str, "confirmed": bool}}
+
+def start_big_pump_watch(symbol, alert_price, source_signal):
+    """
+    Note (build session): after a Big Pump alert fires, some coins retest
+    before actually pumping, others pump immediately — user wants a distinct
+    follow-up once the REAL pump starts either way. Registers the coin for
+    continued monitoring (up to 72h).
+    """
+    if symbol not in _big_pump_watch:
+        _big_pump_watch[symbol] = {
+            "alert_price": alert_price,
+            "started": time.time(),
+            "source": source_signal,
+            "confirmed": False,
+        }
+
+def check_big_pump_watches():
+    """
+    Runs periodically. For each watched symbol, checks whether the actual
+    pump has started — a strong bullish 1H candle with abnormal volume and
+    buy pressure, OR price already up meaningfully (10%+) from the alert
+    price with volume still elevated (covers the "pumped directly, no
+    retest" case as well as the "retested first, then pumped" case, since
+    both end up satisfying this once the real move happens).
+    Fires ONE confirmed-pump follow-up to TOPIC_BIG_PUMP, then keeps
+    tracking (won't re-fire) until it expires after 72h.
+    """
+    now = time.time()
+    to_remove = []
+    for symbol, watch in list(_big_pump_watch.items()):
+        if now - watch["started"] > 72 * 3600:
+            to_remove.append(symbol)
+            continue
+        if watch["confirmed"]:
+            continue
+        try:
+            klines_1h = get_klines(symbol, interval="1h", limit=15)
+            ticker = get_ticker(symbol)
+            if not klines_1h or not ticker or len(klines_1h) < 10:
+                continue
+            current_price = float(ticker["lastPrice"])
+
+            closed = klines_1h[:-1]
+            last = closed[-1]
+            l_open, l_close = float(last[1]), float(last[4])
+            l_vol = float(last[5])
+            l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+            buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+
+            prior_vols = [float(k[5]) for k in closed[-8:-1]]
+            avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+            gain_from_alert = (current_price - watch["alert_price"]) / watch["alert_price"] * 100
+
+            strong_candle = l_close > l_open and vol_ratio >= 4.0 and buy_ratio >= 0.60
+            already_pumping = gain_from_alert >= 10.0 and vol_ratio >= 2.0
+
+            if strong_candle or already_pumping:
+                watch["confirmed"] = True
+                send_to_topic(TOPIC_BIG_PUMP,
+                    f"🚀 <b>PUMP CONFIRMED — {symbol}</b>\n\n"
+                    f"💰 Alert price: {format_price(watch['alert_price'])} → Now: {format_price(current_price)} "
+                    f"({gain_from_alert:+.1f}%)\n"
+                    f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
+                    f"📡 Original signal: {watch['source']}\n"
+                    f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                    f"✅ The pump flagged earlier is actually moving now.\n"
+                    f"⚠️ <i>Confirm on chart before entry.</i>"
+                )
+                print(f"🚀 Big Pump CONFIRMED: {symbol} {gain_from_alert:+.1f}% vol={vol_ratio:.1f}x")
+        except Exception as e:
+            print(f"Big pump watch error {symbol}: {e}")
+    for s in to_remove:
+        _big_pump_watch.pop(s, None)
 
 # ─── DAILY TREND FILTER ───────────────────────────────────
 def is_daily_downtrend(symbol, current_price, klines_1h=None, klines_daily=None):
@@ -10270,6 +10349,16 @@ def main():
             time.sleep(300)  # every 5 minutes
 
     Thread(target=run_hc_followup_checker, daemon=True).start()
+
+    def run_big_pump_watch_checker():
+        while True:
+            try:
+                check_big_pump_watches()
+            except Exception as e:
+                print(f"Big pump watch check error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_big_pump_watch_checker, daemon=True).start()
 
     def run_whale_trade_scanner():
         while True:
