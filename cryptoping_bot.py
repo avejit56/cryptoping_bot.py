@@ -10350,6 +10350,7 @@ def handle_commands():
                         reply( "\n".join(lines))
 
                 elif raw_text.upper().startswith("/CLOSETRADE ") or raw_text.upper().startswith("/TR "):
+                    print(f"🗑 /TR or /closetrade command received: '{raw_text}' from chat_id={chat_id} is_admin={is_admin}")
                     if not is_admin:
                         reply( "⚠️ Admin only.")
                     else:
