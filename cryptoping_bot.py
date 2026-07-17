@@ -477,6 +477,7 @@ def save_cooldown_trackers():
             "_extreme_pump_alerted": _extreme_pump_alerted,
             "_dormant_coil_alerted": _dormant_coil_alerted,
             "_whale_trade_alerted": _whale_trade_alerted,
+            "_btc_divergence_alerted": _btc_divergence_alerted,
         }
         with open(COOLDOWN_TRACKERS_FILE, "w") as f:
             _json.dump(bundle, f, indent=2)
@@ -509,6 +510,7 @@ def load_cooldown_trackers():
             _extreme_pump_alerted.update(bundle.get("_extreme_pump_alerted", {}))
             _dormant_coil_alerted.update(bundle.get("_dormant_coil_alerted", {}))
             _whale_trade_alerted.update(bundle.get("_whale_trade_alerted", {}))
+            _btc_divergence_alerted.update(bundle.get("_btc_divergence_alerted", {}))
             total = sum(len(v) if isinstance(v, dict) else 0 for v in bundle.values())
             print(f"✅ Cooldown trackers loaded: {total} entries across {len(bundle)} dicts")
         else:
@@ -2908,6 +2910,16 @@ def check_manual_lines():
                     send_to(chat_id, msg)
                 print(f"📏 Line break confirmed: {line_id}")
                 start_confirm_watch(symbol, current_price, TOPIC_MY_SETUPS, "Line Break Confirmed")
+
+                # User's specific scenario: after a market-wide down move, a
+                # coin repeatedly touches/rejects at a resistance, then goes
+                # sideways there — user manually marks that as a 1H line.
+                # A green-body break of THAT line gets elevated importance:
+                # skip the normal score>=4 confluence gate and feed straight
+                # into the Big Pump pipeline (with an approximate % target),
+                # so this specific setup can't be missed.
+                if tf == "1h":
+                    send_big_pump_alert(symbol, current_price, "Manual Line Break [1H]")
             continue
 
         # ── broken → retest confirmed / failed ──
@@ -8113,6 +8125,77 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
 
 _dormant_coil_alerted = {}  # {symbol: last_alert_time}
 
+_btc_divergence_alerted = {}  # {symbol: last_alert_time}
+
+def scan_btc_divergence():
+    """
+    Relative strength scanner: when BTC is meaningfully red, finds coins
+    showing real relative strength (positive or much-less-negative than BTC)
+    — these often have a coin-specific catalyst, are getting quietly
+    accumulated regardless of the broader market, or become the leaders
+    once the market recovers. Confirms with volume/BS pressure so it's not
+    just noise, then feeds straight into the existing Big Pump pipeline
+    (send_big_pump_alert → later "PUMP CONFIRMED" in High Priority once the
+    move actually develops), same as every other Big Pump source.
+    """
+    btc_ticker = get_ticker("BTCUSDT")
+    if not btc_ticker:
+        return
+    btc_change = float(btc_ticker["priceChangePercent"])
+    if btc_change > -1.0:
+        return  # only scan when BTC is meaningfully down
+
+    now = time.time()
+    for symbol in list(watchlist):
+        if symbol in removed_coins or symbol == "BTCUSDT":
+            continue
+        if now - _btc_divergence_alerted.get(symbol, 0) < 6 * 3600:
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            change = float(ticker["priceChangePercent"])
+            divergence = change - btc_change
+            # Require genuine relative strength: coin actually green, and
+            # meaningfully stronger than BTC — not just "less red"
+            if change < 0.5 or divergence < 5.0:
+                continue
+
+            current_price = float(ticker["lastPrice"])
+
+            klines_1h = get_klines(symbol, interval="1h", limit=10)
+            if not klines_1h or len(klines_1h) < 5:
+                continue
+            closed = klines_1h[:-1]
+            last = closed[-1]
+            l_vol = float(last[5])
+            l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+            buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+            prior_vols = [float(k[5]) for k in closed[-6:-1]]
+            avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+            if buy_ratio < 0.55 or vol_ratio < 1.5:
+                continue  # not enough real volume/buy conviction behind the divergence
+
+            _btc_divergence_alerted[symbol] = now
+            send_to_topic(TOPIC_BUILDUPS,
+                f"💪 <b>RELATIVE STRENGTH — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(current_price)}\n"
+                f"📊 24h: {change:+.2f}% (BTC: {btc_change:+.2f}%) — {divergence:+.1f}% stronger than BTC\n"
+                f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n\n"
+                f"💡 Holding up/pumping while BTC and the broader market are red — "
+                f"possible catalyst, quiet accumulation, or early-recovery leader.\n"
+                f"⚠️ <i>Confirm on chart before entry.</i>"
+            )
+            print(f"💪 BTC divergence: {symbol} {change:+.1f}% vs BTC {btc_change:+.1f}%")
+            track_building_signal(symbol, "BTC Divergence", current_price)
+            send_big_pump_alert(symbol, current_price, "BTC Divergence (Relative Strength)")
+        except Exception as e:
+            print(f"BTC divergence check error {symbol}: {e}")
+
+
 def scan_dormant_coil_candidates():
     """
     Detects coins that have been deeply down AND stayed down for an extended
@@ -10266,18 +10349,31 @@ def handle_commands():
                             )
                         reply( "\n".join(lines))
 
-                elif raw_text.upper().startswith("/CLOSETRADE "):
+                elif raw_text.upper().startswith("/CLOSETRADE ") or raw_text.upper().startswith("/TR "):
                     if not is_admin:
                         reply( "⚠️ Admin only.")
                     else:
-                        trade_id = raw_text.strip().split(None, 1)[1].strip()
-                        if trade_id in active_trades:
-                            active_trades.pop(trade_id)
-                            trade_alert_cooldown.pop(trade_id, None)
+                        arg = raw_text.strip().split(None, 1)[1].strip()
+                        if arg in active_trades:
+                            # Exact trade ID given (old /closetrade usage)
+                            active_trades.pop(arg)
+                            trade_alert_cooldown.pop(arg, None)
                             save_active_trades()
-                            reply( f"🗑 Trade closed/removed: <code>{trade_id}</code>")
+                            reply( f"🗑 Trade closed/removed: <code>{arg}</code>")
                         else:
-                            reply( f"⚠️ Trade not found: {trade_id}\nUse /trades to see the list")
+                            # Simple symbol-based removal (/TR POL, /TR POLUSDT, case-insensitive)
+                            sym_query = arg.upper()
+                            if not sym_query.endswith("USDT"):
+                                sym_query += "USDT"
+                            matches = [tid for tid, t in active_trades.items() if t.get("symbol", "").upper() == sym_query]
+                            if matches:
+                                for tid in matches:
+                                    active_trades.pop(tid, None)
+                                    trade_alert_cooldown.pop(tid, None)
+                                save_active_trades()
+                                reply( f"🗑 Trade(s) closed/removed for {sym_query}: {len(matches)} removed")
+                            else:
+                                reply( f"⚠️ No active trade found for: {arg}\nUse /trades to see the list")
 
         except Exception as e:
             print(f"Command error: {e}")
@@ -10342,7 +10438,7 @@ def main():
         f"• 🐛 Duplicate-message and topic-routing fixes\n"
         f"• ⚡ Re-pump detection for sideways→breakout moves with no retest\n"
         f"• 🔥 Follow-through score on Volume Spike/Explosive Pump\n"
-        f"• 💼 Active Trade Monitor (/trade, /trades, /closetrade)\n"
+        f"• 💼 Active Trade Monitor (/trade, /trades, /closetrade or /TR <symbol>)\n"
         f"• 📊 EMA + candle/volume + structure combo trend score\n"
         f"• 📈 Dynamic SL trail suggestion (1R/2R)\n"
         f"• 🎯 4H↔Daily zone confluence tagging\n"
@@ -10414,6 +10510,16 @@ def main():
             time.sleep(3600)  # every hour — 1D-based data, internal cooldown is 3 days per coin
 
     Thread(target=run_dormant_coil_scanner, daemon=True).start()
+
+    def run_btc_divergence_scanner():
+        while True:
+            try:
+                scan_btc_divergence()
+            except Exception as e:
+                print(f"BTC divergence scan error: {e}")
+            time.sleep(600)  # every 10 minutes, internal cooldown is 6h per coin
+
+    Thread(target=run_btc_divergence_scanner, daemon=True).start()
 
     def run_valid_ob_scanner():
         while True:
