@@ -2142,8 +2142,10 @@ def zone_history_key(symbol, z_low, z_high):
     """Stable key for a price zone, rounded so near-identical zones match"""
     return f"{symbol}_{z_low:.8f}_{z_high:.8f}"
 
-def record_zone_outcome(symbol, z_low, z_high, outcome):
-    """outcome: 'confirmed', 'invalidated', 'retest_confirmed'"""
+def record_zone_outcome(symbol, z_low, z_high, outcome, vol_ratio=None):
+    """outcome: 'confirmed', 'invalidated', 'retest_confirmed'.
+    vol_ratio (optional): volume ratio at the time of this attempt, stored
+    so future attempts can be compared against past ones (note #3)."""
     key = zone_history_key(symbol, z_low, z_high)
     hist = zone_bounce_history.setdefault(key, {
         "symbol": symbol, "low": z_low, "high": z_high,
@@ -2151,7 +2153,7 @@ def record_zone_outcome(symbol, z_low, z_high, outcome):
         "last_time": 0, "outcomes": []
     })
     hist["last_time"] = time.time()
-    hist["outcomes"].append({"outcome": outcome, "time": time.time()})
+    hist["outcomes"].append({"outcome": outcome, "time": time.time(), "vol_ratio": vol_ratio})
     hist["outcomes"] = hist["outcomes"][-10:]  # keep last 10 only
     if outcome in ("confirmed", "retest_confirmed"):
         hist["bounce_count"] += 1
@@ -2171,6 +2173,46 @@ def get_zone_bounce_info(symbol, z_low, z_high):
         if abs(hist["low"] - z_low) / z_low < 0.02 and abs(hist["high"] - z_high) / z_high < 0.02:
             return hist
     return None
+
+def check_resistance_rejection_history(symbol, current_price, current_vol_ratio=None):
+    """
+    Note #3 (part 2): finds a resistance zone slightly ABOVE current price
+    that has a history of repeated rejections (reuses zone_bounce_history),
+    and — if current_vol_ratio is given — compares this attempt's volume
+    against the average of past rejection attempts, flagging if this one
+    looks meaningfully stronger. Returns a formatted string or None.
+    """
+    best = None
+    for hist in zone_bounce_history.values():
+        if hist["symbol"] != symbol:
+            continue
+        if hist["low"] <= current_price:
+            continue  # not above current price
+        if (hist["low"] - current_price) / current_price > 0.15:
+            continue  # too far away to be relevant right now
+        if hist["invalid_count"] < 2:
+            continue  # need at least 2 rejections to call this "repeated"
+        if best is None or hist["low"] < best["low"]:
+            best = hist
+
+    if not best:
+        return None
+
+    lines = [f"🔴 Resistance above: {format_price(best['low'])}–{format_price(best['high'])} — rejected {best['invalid_count']}x before"]
+
+    if current_vol_ratio is not None:
+        past_vols = [o["vol_ratio"] for o in best.get("outcomes", [])
+                     if o.get("outcome") == "invalidated" and o.get("vol_ratio") is not None]
+        if past_vols:
+            avg_past_vol = sum(past_vols) / len(past_vols)
+            if current_vol_ratio > avg_past_vol * 1.3:
+                lines.append(f"   💪 This attempt's volume ({current_vol_ratio:.1f}x) is meaningfully stronger "
+                             f"than past rejection attempts (avg {avg_past_vol:.1f}x) — may break through this time")
+            else:
+                lines.append(f"   ⚠️ Volume ({current_vol_ratio:.1f}x) similar to/weaker than past rejection "
+                             f"attempts (avg {avg_past_vol:.1f}x) — may reject again")
+
+    return "\n".join(lines)
 
 def check_daily_confluence(symbol, z_low, z_high):
     """
@@ -2304,6 +2346,25 @@ def check_manual_zones():
                 manual_zones[zone_id]["confirmed"] = False
                 manual_zones[zone_id]["zone_high_below"] = False
                 save_zones()
+
+                # Note #6: on zone entry, do NOT message immediately —
+                # start a multi-timeframe retest watch (5M/15M/30M/1H) and
+                # only message My Setups once the retest completes/holds.
+                # Include the resistance-rejection-history comparison
+                # (note #3) if a repeatedly-rejected zone sits above.
+                rejection_note = check_resistance_rejection_history(symbol, current_price)
+                context_lines = [
+                    f"🔲 Zone: {format_price(z_low)}–{format_price(z_high)} [{tf.upper()}]",
+                    f"💰 Entered at: {format_price(current_price)}",
+                ]
+                if rejection_note:
+                    context_lines.append(rejection_note)
+                start_shared_retest_watch(
+                    key=f"zone_{zone_id}_retest",
+                    symbol=symbol, level=z_low, topic=TOPIC_MY_SETUPS,
+                    header=f"🎯 <b>Zone Retest — {symbol}</b>",
+                    context="\n".join(context_lines),
+                )
             continue
 
         # ── in_zone ──
@@ -2621,16 +2682,20 @@ def check_manual_zones():
 
             # Post-confirm invalidation
             if zone.get("went_up") and elapsed <= 3 * 3600:
-                klines_tf = get_klines(symbol, interval=tf, limit=4)
-                if klines_tf and len(klines_tf) >= 2:
+                klines_tf = get_klines(symbol, interval=tf, limit=10)
+                if klines_tf and len(klines_tf) >= 4:
                     last   = klines_tf[-2]
                     l_open = float(last[1])
                     l_close= float(last[4])
+                    l_vol  = float(last[5])
+                    prior_vols = [float(k[5]) for k in klines_tf[-8:-2]]
+                    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+                    inval_vol_ratio = l_vol / avg_vol if avg_vol > 0 else None
                     if l_close < z_low and l_close < l_open and not zone.get("post_invalid_sent"):
                         manual_zones[zone_id]["post_invalid_sent"] = True
                         manual_zones[zone_id]["state"] = "waiting"
                         save_zones()
-                        record_zone_outcome(symbol, z_low, z_high, "invalidated")
+                        record_zone_outcome(symbol, z_low, z_high, "invalidated", vol_ratio=inval_vol_ratio)
                         inv_msg = (
                             f"❌ <b>POST-CONFIRM INVALIDATED!</b>\n\n"
                             f"🪙 {symbol} | {tf.upper()} OB\n"
@@ -3248,6 +3313,61 @@ def check_active_trades():
         save_active_trades()
 
 
+def check_2m_reversal_structure(symbol):
+    """
+    Note #8 (Trade Monitor 2M enhancement): watches SEVERAL 2M candles (not
+    a single one) for early reversal signs — volume in/out flow shifting
+    from buying to selling, plus SMC structure: CHoCH (Change of Character)
+    and LH (Lower High) formation. Requires at least 2 of these 3 signals
+    together to reduce noise. Returns a warning string or None.
+    """
+    klines_2m = get_klines(symbol, interval="2m", limit=20)
+    if not klines_2m or len(klines_2m) < 15:
+        return None
+    closed = klines_2m[:-1]
+    recent = closed[-12:]
+    if len(recent) < 10:
+        return None
+
+    highs = [float(k[2]) for k in recent]
+    lows  = [float(k[3]) for k in recent]
+    closes = [float(k[4]) for k in recent]
+    vols  = [float(k[5]) for k in recent]
+    buys  = [float(k[9]) if len(k) > 9 else float(k[5]) * 0.5 for k in recent]
+
+    # Volume in/out flow: buy-dominant first half vs sell-dominant second half
+    half = len(recent) // 2
+    first_half_net  = sum(buys[:half]) - sum(vols[i] - buys[i] for i in range(half))
+    second_half_net = sum(buys[half:]) - sum(vols[i] - buys[i] for i in range(half, len(recent)))
+    volume_flow_reversing = first_half_net > 0 and second_half_net < first_half_net * -0.5
+
+    # Swing highs/lows for CHoCH / LH
+    swing_highs = [(i, highs[i]) for i in range(1, len(highs) - 1) if highs[i] > highs[i-1] and highs[i] > highs[i+1]]
+    swing_lows  = [(i, lows[i])  for i in range(1, len(lows) - 1)  if lows[i]  < lows[i-1]  and lows[i]  < lows[i+1]]
+
+    lh_detected = len(swing_highs) >= 2 and swing_highs[-1][1] < swing_highs[-2][1]
+
+    choch_detected = False
+    if len(swing_lows) >= 2:
+        last_low, prev_low = swing_lows[-1][1], swing_lows[-2][1]
+        # Was making higher lows (uptrend structure), then closed below the
+        # most recent one — a break of structure (CHoCH)
+        if last_low > prev_low and closes[-1] < last_low:
+            choch_detected = True
+
+    warnings = []
+    if volume_flow_reversing:
+        warnings.append("📉 2M volume flow reversing: buy pressure fading, sell volume increasing")
+    if lh_detected:
+        warnings.append("📉 2M Lower High (LH) forming — momentum weakening")
+    if choch_detected:
+        warnings.append("🔴 2M CHoCH (Change of Character) — structure just broke bearish")
+
+    if len(warnings) >= 2:  # require 2+ confirming signals to keep this from being noisy
+        return "\n   ".join(warnings)
+    return None
+
+
 def check_active_trades_fast():
     """
     Fast trade monitor — runs every 60s on 5M/15M/1H.
@@ -3301,6 +3421,54 @@ def check_active_trades_fast():
                     )
                     print(f"🚀 Big pump potential (trade): {symbol} +{pnl_pct:.1f}% vol={vol_ratio_bp:.1f}x")
 
+                    # Note #11: also judge whether ADDING to the position
+                    # (re-entry) makes sense here, not just holding — daily
+                    # trend, sustained higher lows, and genuine room to a
+                    # further resistance before calling it favorable.
+                    try:
+                        klines_4h_re = get_klines(symbol, interval="4h", limit=40)
+                        re_ok = True
+                        re_reasons = []
+                        if is_daily_downtrend(symbol, current_price):
+                            re_ok = False
+                            re_reasons.append("❌ Daily trend still bearish")
+                        else:
+                            re_reasons.append("✅ Daily trend bullish/neutral")
+
+                        lows_1h_re = [float(k[3]) for k in closed_1h_bp[-6:]]
+                        hl_re = sum(1 for j in range(1, len(lows_1h_re)) if lows_1h_re[j] > lows_1h_re[j-1]) >= 3
+                        if hl_re:
+                            re_reasons.append("✅ Higher lows sustained (1H)")
+                        else:
+                            re_ok = False
+                            re_reasons.append("⚠️ Higher lows not clearly sustained")
+
+                        room_pct = None
+                        if klines_4h_re and len(klines_4h_re) >= 10:
+                            closed_4h_re = klines_4h_re[:-1]
+                            highs_above = [float(k[2]) for k in closed_4h_re[-30:] if float(k[2]) > current_price * 1.03]
+                            if highs_above:
+                                nearest_res_re = min(highs_above)
+                                room_pct = (nearest_res_re - current_price) / current_price * 100
+                                if room_pct >= 8.0:
+                                    re_reasons.append(f"✅ Room to next resistance: +{room_pct:.1f}%")
+                                else:
+                                    re_ok = False
+                                    re_reasons.append(f"⚠️ Only +{room_pct:.1f}% room before next resistance")
+
+                        if re_ok:
+                            send_to_topic(TOPIC_MY_SETUPS,
+                                f"💰 <b>Re-Entry Worth Considering — {symbol}</b>\n\n"
+                                f"Following up on the Bigger Pump Potential alert — conditions still "
+                                f"look favorable to add to the position:\n"
+                                + "\n".join(f"   {r}" for r in re_reasons) +
+                                f"\n\n💰 Current: {format_price(current_price)} ({pnl_pct:+.1f}% from original entry)\n"
+                                f"⚠️ <i>Confirm on chart before adding — this is not guaranteed.</i>"
+                            )
+                            print(f"💰 Re-entry suggested: {symbol}")
+                    except Exception as e:
+                        print(f"Re-entry analysis error {symbol}: {e}")
+
         # ── URGENT: price near SL (within 2%) ──
         if sl_dist <= 2.0 and sl_dist > 0:
             if now - trade.get("last_sl_alert", 0) > 30 * 60:  # 30min cooldown for SL alerts
@@ -3351,6 +3519,11 @@ def check_active_trades_fast():
                     alerts.append(f"🔴 1H below 20EMA ({format_price(ema20_1h)}) — trend weakening")
                 if sell_spike_1h:
                     alerts.append(f"⚡ 1H sell spike ({vols_1h[-1]/avg_vol_1h:.1f}x) — distribution risk")
+
+            # Note #8: 2M multi-candle volume flow + SMC structure (CHoCH/LH)
+            two_m_warning = check_2m_reversal_structure(symbol)
+            if two_m_warning:
+                alerts.append(two_m_warning)
 
         if not alerts:
             continue
@@ -3503,6 +3676,49 @@ def check_explosive_pump(symbol):
     klines = get_klines(symbol, interval="5m", limit=15)
     if not klines or len(klines) < 10:
         return
+
+    # Note #7: faster path — check the STILL-FORMING candle (klines[-1],
+    # not yet closed) for extreme volume already accumulating. GUSDT-style
+    # 974x-volume events shouldn't need to wait for check_explosive_pump's
+    # normal 3-fully-closed-candle requirement — this catches them mid-
+    # candle instead. Deliberately a MUCH higher bar (15x+) than the normal
+    # path since it's acting on incomplete data.
+    fast_key = f"{symbol}_explosive_fast"
+    if now - alerted_coins.get(fast_key, 0) >= 1800:
+        forming = klines[-1]
+        f_open, f_close = float(forming[1]), float(forming[4])
+        f_vol = float(forming[5])
+        f_buy = float(forming[9]) if len(forming) > 9 else f_vol * 0.5
+        f_buy_ratio = f_buy / f_vol if f_vol > 0 else 0.5
+        closed_for_baseline = klines[-9:-1]
+        baseline_vols = [float(k[5]) for k in closed_for_baseline]
+        avg_baseline = sum(baseline_vols) / len(baseline_vols) if baseline_vols else 1
+        f_vol_ratio = f_vol / avg_baseline if avg_baseline > 0 else 0
+        f_body_pct = (f_close - f_open) / f_open * 100 if f_open > 0 else 0
+
+        if f_close > f_open and f_vol_ratio >= 15.0 and f_buy_ratio >= 0.60 and f_body_pct >= 2.0:
+            ticker_fast = get_ticker(symbol)
+            if ticker_fast:
+                current_price_fast = float(ticker_fast["lastPrice"])
+                change_24h_fast = float(ticker_fast["priceChangePercent"])
+                if change_24h_fast >= 0:
+                    alerted_coins[fast_key] = now
+                    send_to_topic(TOPIC_BUILDUPS,
+                        f"🚨 <b>EXTREME VOLUME FORMING [5M, live]</b>\n\n"
+                        f"🪙 <b>{symbol}</b>\n"
+                        f"💰 Price: {format_price(current_price_fast)}\n"
+                        f"⚡ Volume (mid-candle): {f_vol_ratio:.1f}x normal\n"
+                        f"🟢 Buy pressure: {f_buy_ratio*100:.0f}%\n"
+                        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                        f"⚠️ Detected on the STILL-FORMING candle — earlier than the normal "
+                        f"3-closed-candle check. Extreme magnitude, moving fast.\n"
+                        f"⚠️ <i>Confirm on chart before entry.</i>"
+                    )
+                    print(f"🚨 Fast explosive detection: {symbol} vol={f_vol_ratio:.1f}x (forming candle)")
+                    track_building_signal(symbol, "Explosive Pump [5M]", current_price_fast)
+                    check_high_confidence_signal(symbol, "Explosive Pump [5M]", current_price_fast)
+                    if f_vol_ratio >= 20.0:
+                        send_extreme_pump_alert(symbol, current_price_fast, f_body_pct, f_vol_ratio, f_buy_ratio, "Explosive Pump [5M] (forming)")
 
     # Last 3 closed candles
     c3 = klines[-4]  # 3 candles ago
@@ -3749,6 +3965,88 @@ def _check_tf_pump_signal(symbol, tf, limit=12):
     return developing, vol_ratio, buy_ratio
 
 
+_shared_retest_watch = {}  # {key: {...}} — shared multi-timeframe retest state machine
+
+def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_sequence=None, chat_id=None):
+    """
+    Shared multi-timeframe retest-monitoring watch (notes #1 and #6).
+    Escalates 5M → 15M → 30M → 1H(→4H): watches for price to dip back to
+    `level` and either hold (reclaim with a green candle → notify "retest
+    held") or fail (drop meaningfully below → move to the NEXT timeframe in
+    the sequence). If retest fails on 2 different timeframes, that's treated
+    as a real warning sign and reported directly instead of silently retrying
+    forever.
+    """
+    if key in _shared_retest_watch:
+        return
+    _shared_retest_watch[key] = {
+        "symbol": symbol, "level": level, "topic": topic, "chat_id": chat_id,
+        "context": context, "header": header,
+        "tf_sequence": tf_sequence or ["5m", "15m", "30m", "1h"],
+        "tf_index": 0, "fail_count": 0, "state": "waiting_dip",
+        "started": time.time(),
+    }
+
+def check_shared_retest_watches():
+    """Runs periodically for up to 24h per watch."""
+    now = time.time()
+    to_remove = []
+    for key, w in list(_shared_retest_watch.items()):
+        if now - w["started"] > 24 * 3600:
+            to_remove.append(key)
+            continue
+        symbol, level = w["symbol"], w["level"]
+        tf = w["tf_sequence"][w["tf_index"]]
+        try:
+            ticker = get_ticker(symbol)
+            klines = get_klines(symbol, interval=tf, limit=10)
+            if not ticker or not klines or len(klines) < 5:
+                continue
+            current_price = float(ticker["lastPrice"])
+            closed = klines[:-1]
+            last = closed[-1]
+            l_low, l_open, l_close = float(last[3]), float(last[1]), float(last[4])
+
+            if w["state"] == "waiting_dip":
+                if l_low <= level * 1.005:
+                    w["state"] = "dipped"
+            elif w["state"] == "dipped":
+                if l_close > level and l_close > l_open:
+                    # Retest held — notify and finish
+                    send_to_topic(w["topic"],
+                        f"{w['header']}\n\n{w['context']}\n\n"
+                        f"✅ Retest held on {tf.upper()} — reclaimed with a green candle.\n"
+                        f"💰 Now: {format_price(current_price)}"
+                    )
+                    if w.get("chat_id"):
+                        send_to(w["chat_id"], f"{w['header']} — retest held on {tf.upper()}, now {format_price(current_price)}")
+                    to_remove.append(key)
+                    print(f"✅ Retest watch held: {symbol} [{tf.upper()}]")
+                    continue
+                elif current_price < level * 0.97:
+                    # Failed on this timeframe — escalate to the next one
+                    w["fail_count"] += 1
+                    w["tf_index"] += 1
+                    w["state"] = "waiting_dip"
+                    if w["fail_count"] >= 2:
+                        send_to_topic(w["topic"],
+                            f"⚠️ <b>Retest Failed Twice — {symbol}</b>\n\n"
+                            f"{w['context']}\n\n"
+                            f"Retest failed on 2 different timeframes — something's off with this move, "
+                            f"be cautious here.\n"
+                            f"💰 Now: {format_price(current_price)}"
+                        )
+                        to_remove.append(key)
+                        print(f"⚠️ Retest watch failed twice: {symbol}")
+                        continue
+                    if w["tf_index"] >= len(w["tf_sequence"]):
+                        to_remove.append(key)  # exhausted the sequence quietly
+        except Exception as e:
+            print(f"Retest watch error {key}: {e}")
+    for k in to_remove:
+        _shared_retest_watch.pop(k, None)
+
+
 def check_big_pump_watches():
     """
     Runs periodically. For each watched symbol, checks whether the actual
@@ -3852,6 +4150,16 @@ def check_big_pump_watches():
                     f"⚠️ <i>Confirm on chart before entry.</i>"
                 )
                 print(f"🚀 Big Pump CONFIRMED: {symbol} {gain_from_alert:+.1f}% vol={vol_ratio:.1f}x")
+
+                # Note #1: start the post-confirmation retest watch —
+                # if this coin retests instead of continuing straight up,
+                # monitor 5M→15M→30M→1H for the retest to hold or fail.
+                start_shared_retest_watch(
+                    key=f"{symbol}_pumpconfirm_retest",
+                    symbol=symbol, level=current_price, topic=TOPIC_HIGH,
+                    header=f"🔄 <b>Post-Pump Retest — {symbol}</b>",
+                    context=f"Following up on the PUMP CONFIRMED alert at {format_price(current_price)}.",
+                )
         except Exception as e:
             print(f"Big pump watch error {symbol}: {e}")
     for s in to_remove:
@@ -4955,8 +5263,25 @@ def _build_retest_guidance(level_price, current_price, candles_since_break):
     near_level = abs(current_price - level_price) / level_price <= 0.05
     still_above = current_price >= level_price * 0.98  # hasn't broken back below it
     pct_from_level = (current_price - level_price) / level_price * 100
+
+    # Note #2 fix: the old check only looked at current price's distance
+    # from the level + whether the LAST candle is green — it never verified
+    # that price actually DIPPED back down to test the level at all. A coin
+    # that broke out and just kept climbing on green candles (never pulling
+    # back) could satisfy "near_level" simply because it hadn't traveled far
+    # from the breakout point yet, producing a false "retest confirmed"
+    # (JASMYUSDT case — no retest pattern existed at all on the chart).
+    # Fix: require at least one candle SINCE the breakout (before the final
+    # one) to have actually dipped down near/into the level — a genuine
+    # touch-back, not just proximity.
+    genuine_dip_occurred = any(
+        float(c[3]) <= level_price * 1.02  # candle's LOW came within 2% of the level
+        for c in candles_since_break[:-1]
+    )
+
     print(f"📐 /entry pattern: current={current_price:.6g} level={level_price:.6g} "
-          f"({pct_from_level:+.1f}% from level) near={near_level} still_above={still_above}")
+          f"({pct_from_level:+.1f}% from level) near={near_level} still_above={still_above} "
+          f"genuine_dip={genuine_dip_occurred}")
 
     last_candle = candles_since_break[-1]
     last_o, last_c = float(last_candle[1]), float(last_candle[4])
@@ -4967,7 +5292,7 @@ def _build_retest_guidance(level_price, current_price, candles_since_break):
         (last_c - last_o) / last_range >= 0.55
     )
 
-    if near_level and still_above and last_is_strong_green and last_c > level_price:
+    if near_level and still_above and last_is_strong_green and last_c > level_price and genuine_dip_occurred:
         return (f"✅ <b>Retest confirmed</b> — price broke {format_price(level_price)} resistance, "
                 f"retested, and just closed back above it with a strong green candle. Continuation looks favorable.")
     elif near_level and still_above:
@@ -5096,6 +5421,18 @@ def calc_entry_score(symbol):
             max_score += 10
             score += 10
             details.append(f"🎯 Daily confluence — {conf_note}")
+
+        # Note #2/#9 part 2: a zone with a history of repeated rejections
+        # shouldn't score the same as a fresh clean retest — apply a
+        # confidence penalty so it doesn't mislead into "HIGH" territory.
+        bounce_info = get_zone_bounce_info(symbol, recent_low_4h, recent_high_4h)
+        if bounce_info and bounce_info.get("invalid_count", 0) >= 2:
+            penalty = min(20, bounce_info["invalid_count"] * 7)
+            score = max(0, score - penalty)
+            details.append(
+                f"⚠️ This zone has been rejected {bounce_info['invalid_count']}x before — "
+                f"treat with extra caution, confidence reduced"
+            )
 
     # ── Pattern context: break-retest-continuation, checked across 15m/30m/1H/4H ──
     # Previously only 4H and 1H were checked. The SOPH and BROCCOLI714 cases
@@ -5795,34 +6132,66 @@ def check_entry_watches():
                     _entry_watch[symbol]["trend_alerted"] = True
 
             # ── Fire alert if improvements found ──
+            # Note #4 redesign: accumulate improvements SILENTLY instead of
+            # messaging on every single one (was disturbing/too frequent).
+            # Only fire ONE combined message right when the pump actually
+            # starts — and critically, don't wait for ALL improvements to
+            # align first (good pumps happen without every criterion
+            # improving), so this must not become over-conservative.
             if improvements:
-                result = calc_entry_score(symbol)
-                if result:
-                    ob_data = get_order_book_clusters(symbol)
-                    # Override pattern_notes with confirmed TF from watch
-                    confirmed_tf = watch.get("confirmed_tf")
-                    if confirmed_tf and result.get("pattern_notes") is not None:
-                        result["pattern_notes"][confirmed_tf] = "Retest confirmed"
-                    # Reuse the daily_down_fresh result computed above (if we just
-                    # detected/checked a trend shift) so the rendered entry block
-                    # below can't contradict the "shifted bullish" header — both
-                    # now agree on the same is_daily_downtrend() call.
-                    entry_msg, _entry_meta = build_powerful_entry(
-                        symbol, result, ob_data, daily_down_override=daily_down_fresh
-                    )
+                _entry_watch[symbol].setdefault("accumulated_improvements", []).extend(improvements)
+                print(f"🔕 Entry watch improvement (silent): {symbol} — {improvements}")
 
-                    improvement_str = "\n".join(f"  {i}" for i in improvements)
-                    pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
-                    alert = (
-                        f"🔔 <b>SETUP IMPROVING — {symbol}</b>\n\n"
-                        f"📈 <b>Changes detected:</b>\n{improvement_str}\n\n"
-                        f"💰 Now: {format_price(current_price)} ({pct_from_entry:+.1f}% from /entry price)\n\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"{entry_msg}"
+            # ── Pump-starting detection (reuses the same pattern as
+            # check_no_retest_pump_risk: strong body + volume + buy pressure)
+            # — fires the ONE combined alert regardless of how many
+            # improvements have accumulated, even zero.
+            if not watch.get("pump_start_alerted"):
+                klines_1h_ps = get_klines(symbol, interval="1h", limit=10)
+                if klines_1h_ps and len(klines_1h_ps) >= 8:
+                    closed_ps = klines_1h_ps[:-1]
+                    last_ps = closed_ps[-1]
+                    ps_open, ps_close = float(last_ps[1]), float(last_ps[4])
+                    ps_vol = float(last_ps[5])
+                    ps_buy = float(last_ps[9]) if len(last_ps) > 9 else ps_vol * 0.5
+                    ps_buy_ratio = ps_buy / ps_vol if ps_vol > 0 else 0.5
+                    prior_vols_ps = [float(k[5]) for k in closed_ps[-7:-1]]
+                    avg_vol_ps = sum(prior_vols_ps) / len(prior_vols_ps) if prior_vols_ps else 1
+                    ps_vol_ratio = ps_vol / avg_vol_ps if avg_vol_ps > 0 else 0
+                    body_pct_ps = (ps_close - ps_open) / ps_open * 100 if ps_open > 0 else 0
+
+                    pump_starting = (
+                        ps_close > ps_open and body_pct_ps >= 2.0 and
+                        ps_vol_ratio >= 3.0 and ps_buy_ratio >= 0.58
                     )
-                    send_to_topic(TOPIC_MY_SETUPS, alert)
-                    send_to(watch["chat_id"], alert)
-                    print(f"🔔 Entry watch alert: {symbol} — {improvements}")
+                    if pump_starting:
+                        watch["pump_start_alerted"] = True
+                        result = calc_entry_score(symbol)
+                        if result:
+                            ob_data = get_order_book_clusters(symbol)
+                            confirmed_tf = watch.get("confirmed_tf")
+                            if confirmed_tf and result.get("pattern_notes") is not None:
+                                result["pattern_notes"][confirmed_tf] = "Retest confirmed"
+                            entry_msg, _entry_meta = build_powerful_entry(
+                                symbol, result, ob_data, daily_down_override=daily_down_fresh
+                            )
+                            all_improvements = _entry_watch[symbol].get("accumulated_improvements", [])
+                            improvement_str = ("\n".join(f"  {i}" for i in all_improvements)
+                                                if all_improvements else "  (no notable changes flagged, but pump signs detected)")
+                            pct_from_entry = (current_price - watch["entry_price"]) / watch["entry_price"] * 100
+                            alert = (
+                                f"🚀 <b>PUMP STARTING — {symbol}</b>\n\n"
+                                f"📈 <b>Accumulated changes since /entry:</b>\n{improvement_str}\n\n"
+                                f"⚡ Volume: {ps_vol_ratio:.1f}x | Buy: {ps_buy_ratio*100:.0f}%\n"
+                                f"💰 Now: {format_price(current_price)} ({pct_from_entry:+.1f}% from /entry price)\n\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"{entry_msg}"
+                            )
+                            send_to_topic(TOPIC_MY_SETUPS, alert)
+                            send_to(watch["chat_id"], alert)
+                            print(f"🚀 Entry watch — pump starting: {symbol}")
+                        to_remove.append(symbol)
+                        continue
 
                 # If all improvements found or 24h passed, remove from watch
                 all_done = (
@@ -6019,6 +6388,54 @@ def check_liq_watches():
                     to_remove.append(symbol)
                     print(f"🔥 Liq reclaim alert: {symbol}{' [COMBINED]' if combined_setup else ''}")
 
+                    # User request: weighted multi-factor "low retest risk"
+                    # score for COMBINED SETUP → also-send-to-High-Priority
+                    # decision. Volume is the heaviest-weighted factor (daily
+                    # trend alone was too strict — a pump can start before
+                    # daily trend has flipped, e.g. ALLOUSDT). Kept fast/
+                    # cheap on purpose (reuses already-fetched data + one
+                    # cheap 1H call) since timely delivery matters more than
+                    # exhaustive analysis — don't want to miss the pump.
+                    if combined_setup:
+                        rr_score = 0
+                        sweep_vol = watch.get("sweep_vol", 0)
+                        # Volume — heaviest weight (up to 3 of ~6 points)
+                        if sweep_vol >= 5.0 or vol_ratio >= 5.0:
+                            rr_score += 3
+                        elif sweep_vol >= 3.0 or vol_ratio >= 3.0:
+                            rr_score += 2
+                        elif sweep_vol >= 2.0 or vol_ratio >= 2.0:
+                            rr_score += 1
+
+                        # BS pressure conviction on the reclaim candle
+                        l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+                        buy_ratio_rc = l_buy / l_vol if l_vol > 0 else 0.5
+                        if buy_ratio_rc >= 0.60:
+                            rr_score += 1
+
+                        # Daily trend — soft factor now, not a hard gate
+                        if not is_daily_downtrend(symbol, current_price):
+                            rr_score += 1
+
+                        # Multi-timeframe SMC/HL check (1H higher lows)
+                        klines_1h_rc = get_klines(symbol, interval="1h", limit=8)
+                        if klines_1h_rc and len(klines_1h_rc) >= 6:
+                            lows_1h_rc = [float(k[3]) for k in klines_1h_rc[:-1][-6:]]
+                            if sum(1 for j in range(1, len(lows_1h_rc)) if lows_1h_rc[j] > lows_1h_rc[j-1]) >= 3:
+                                rr_score += 1
+
+                        # Liquidity sweep+reclaim and zone confluence are
+                        # already guaranteed true here (that's what a
+                        # COMBINED SETUP is) — no extra points needed, they're
+                        # the baseline requirement, not differentiators.
+
+                        low_retest_risk = rr_score >= 4
+                        if low_retest_risk:
+                            send_to_topic(TOPIC_HIGH,
+                                f"🔥 <b>COMBINED SETUP (Low Retest Risk, score {rr_score}/6) — {symbol}</b>\n\n" + msg.split("\n\n", 1)[1]
+                            )
+                            print(f"🔥 Combined setup → High Priority (score {rr_score}/6): {symbol}")
+
                     # User clarification: LIQUIDATION SWEEP COMPLETE itself
                     # isn't the High Priority message — it feeds into the
                     # same confluence-scored Big Pump pipeline as everything
@@ -6169,7 +6586,26 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
     if nearest_eql:
         eql_pct = (current_price - nearest_eql["price"]) / current_price * 100
         touches = nearest_eql["touches"]
-        if touches >= 8 and eql_pct <= 15:
+
+        # Note #10 fix: check whether price has ALREADY dipped below this
+        # EQL and reclaimed back above it recently, instead of always
+        # framing it as a pending future risk.
+        already_swept = False
+        if klines_1h and len(klines_1h) >= 8 and current_price > nearest_eql["price"]:
+            recent_1h = klines_1h[:-1][-8:]  # last 8 closed 1H candles
+            for k in recent_1h:
+                k_low = float(k[3])
+                if k_low < nearest_eql["price"]:
+                    already_swept = True
+                    break
+
+        if already_swept and touches >= 5 and eql_pct <= 20:
+            liq_hunt_warning = (
+                f"✅ Liquidity already swept & reclaimed: EQL {format_price(nearest_eql['price'])} "
+                f"({touches}x tested) — price already reclaimed above this level\n"
+                f"   → Stops already cleared, this is a completed positive signal, not a pending risk"
+            )
+        elif touches >= 8 and eql_pct <= 15:
             liq_hunt_warning = (
                 f"⚠️ Liquidity Hunt Risk: EQL {format_price(nearest_eql['price'])} "
                 f"({touches}x tested, {eql_pct:.1f}% below)\n"
@@ -6269,11 +6705,11 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
     if klines_4h and len(klines_4h) >= 10:
         closed_4h = klines_4h[:-1]
         seen = set()
-        for i in range(2, len(closed_4h) - 2):
+        for i in range(1, len(closed_4h) - 1):
             h = float(closed_4h[i][2])
             if h <= current_price * 1.01:
                 continue
-            if all(h >= float(closed_4h[i+j][2]) for j in [-2,-1,1,2]):
+            if all(h >= float(closed_4h[i+j][2]) for j in [-1, 1]):
                 # Cluster: bucket by 2% of current price
                 bucket = int(h / (current_price * 0.02))
                 if bucket not in seen:
@@ -6341,13 +6777,27 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
         rr = tp_pct / risk_pct if risk_pct > 0 else 0
         tp_rr.append((tp_p, tp_pct, rr))
 
-    # Note #1 fix: TP2 minimum floor of 20%. Nearest-resistance-based TP2 was
-    # often much smaller than the coil "2nd pump potential" — user targets
-    # 20-30%+ coins, so TP2 shouldn't undersell that. If the 2nd nearest
-    # resistance gives less than 20%, look further out in tp_levels for one
-    # that clears 20%; otherwise fall back to a flat +20% synthetic target.
+    # Note #1/#5 fix: TP2 minimum floor of 20%. Nearest-resistance-based TP2
+    # was often much smaller than the coil "2nd pump potential" — user
+    # targets 20-30%+ coins, so TP2 shouldn't undersell that. Search WIDER
+    # before falling back to a flat percentage: (1) check the full
+    # tp_levels_clean list (not just the top-3 truncated tp_levels), (2) if
+    # still nothing, fetch a longer 1D history (120 days) and search again.
+    # Only use the flat +20% synthetic target as an absolute last resort —
+    # user wants a real % (17%, 23%, whatever it actually is) reported
+    # whenever a genuine resistance level exists.
     if len(tp_rr) >= 2 and tp_rr[1][1] < 20.0:
-        better_tp2 = next((lvl for lvl in tp_levels if lvl[1] >= 20.0), None)
+        better_tp2 = next((lvl for lvl in tp_levels_clean if lvl[1] >= 20.0), None)
+        if not better_tp2:
+            klines_1d_wide = get_klines(sym, interval="1d", limit=120)
+            if klines_1d_wide:
+                wide_highs = sorted(set(
+                    (float(k[2]), (float(k[2]) - current_price) / current_price * 100)
+                    for k in klines_1d_wide[-120:]
+                    if float(k[2]) > current_price * 1.20
+                ), key=lambda x: x[1])
+                if wide_highs:
+                    better_tp2 = wide_highs[0]
         if better_tp2:
             tp2_p, tp2_pct = better_tp2
         else:
@@ -6417,6 +6867,12 @@ def build_powerful_entry(sym, result, ob_data, daily_down_override=None):
         lines.append(f"   {al}")
     if liq_hunt_warning:
         lines.append(f"   {liq_hunt_warning}")
+
+    # Note #3 part 2: flag a resistance zone above with repeated rejection
+    # history, and compare this attempt's volume against past attempts.
+    rejection_note = check_resistance_rejection_history(sym, current_price, current_vol_ratio=avg_vol_ratio)
+    if rejection_note:
+        lines.append(f"   {rejection_note}")
 
     # Trade plan
     tp_str = ""
@@ -10577,6 +11033,16 @@ def main():
             time.sleep(300)  # every 5 minutes
 
     Thread(target=run_big_pump_watch_checker, daemon=True).start()
+
+    def run_retest_watch_checker():
+        while True:
+            try:
+                check_shared_retest_watches()
+            except Exception as e:
+                print(f"Retest watch check error: {e}")
+            time.sleep(180)  # every 3 minutes — fast enough for 5M timeframe checks
+
+    Thread(target=run_retest_watch_checker, daemon=True).start()
 
     def run_whale_trade_scanner():
         while True:
