@@ -478,6 +478,7 @@ def save_cooldown_trackers():
             "_dormant_coil_alerted": _dormant_coil_alerted,
             "_whale_trade_alerted": _whale_trade_alerted,
             "_btc_divergence_alerted": _btc_divergence_alerted,
+            "_known_bad_chat_ids": _known_bad_chat_ids,
         }
         with open(COOLDOWN_TRACKERS_FILE, "w") as f:
             _json.dump(bundle, f, indent=2)
@@ -511,6 +512,7 @@ def load_cooldown_trackers():
             _dormant_coil_alerted.update(bundle.get("_dormant_coil_alerted", {}))
             _whale_trade_alerted.update(bundle.get("_whale_trade_alerted", {}))
             _btc_divergence_alerted.update(bundle.get("_btc_divergence_alerted", {}))
+            _known_bad_chat_ids.update(bundle.get("_known_bad_chat_ids", {}))
             total = sum(len(v) if isinstance(v, dict) else 0 for v in bundle.values())
             print(f"✅ Cooldown trackers loaded: {total} entries across {len(bundle)} dicts")
         else:
@@ -643,7 +645,8 @@ _known_bad_chat_ids = {}  # {chat_id: reason} — any chat_id that's permanently
 
 def send_to(chat_id, message, thread_id=None):
     """Send a message. If thread_id is provided, sends to that topic thread."""
-    if chat_id in _known_bad_chat_ids:
+    chat_id_key = str(chat_id)  # normalize — different call sites pass int/str inconsistently
+    if chat_id_key in _known_bad_chat_ids:
         return  # already confirmed dead — skip silently, don't keep retrying forever
     try:
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
@@ -660,9 +663,13 @@ def send_to(chat_id, message, thread_id=None):
                 # not just the subscribers list, so it stops failing on
                 # EVERY send from any feature (watches, trades, etc), not
                 # just send_all()'s subscriber loop.
-                _known_bad_chat_ids[chat_id] = "chat not found"
+                _known_bad_chat_ids[chat_id_key] = "chat not found"
                 if chat_id in subscribers:
                     subscribers.remove(chat_id)
+                    subscribers_info.pop(str(chat_id), None)
+                    save_subscribers_file()
+                elif str(chat_id) in [str(s) for s in subscribers]:
+                    subscribers[:] = [s for s in subscribers if str(s) != str(chat_id)]
                     subscribers_info.pop(str(chat_id), None)
                     save_subscribers_file()
                 print(f"🧹 Blacklisted invalid chat_id {chat_id} (chat not found) — won't retry")
@@ -949,6 +956,26 @@ def _record_binance_call_result(success):
                 f"You'll get another message here once it's reachable again."
             )
             print(f"🔴 Binance connectivity alert sent ({_binance_failure_state['consecutive_failures']} failures, {duration_min:.0f}m)")
+
+def is_plausible_symbol(sym_raw):
+    """
+    Rejects obviously-invalid symbol input at the command-parsing stage —
+    catches cases like a price ("0.0874") getting typed/passed where a
+    ticker ("BTC") was expected, which would otherwise silently create a
+    persistent watch/entry that retries forever with HTTP 400 'Invalid
+    symbol' on every check cycle.
+    """
+    if not sym_raw:
+        return False
+    s = sym_raw.strip().upper()
+    if not s:
+        return False
+    if s[0].isdigit() or s[0] == ".":
+        return False  # looks like a price/number, not a ticker
+    if "." in s:
+        return False  # tickers don't contain decimal points
+    return True
+
 
 def get_klines(symbol, interval="5m", limit=50):
     cache_key = (symbol, interval, limit)
@@ -9896,6 +9923,8 @@ def handle_commands():
                     sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
                     if not sym_raw:
                         reply( "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
+                    elif not is_plausible_symbol(sym_raw):
+                        reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol. Use a ticker like BTC or BTCUSDT, not a price.")
                     else:
                         sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                         result = calc_entry_score(sym)
@@ -9998,6 +10027,8 @@ def handle_commands():
                     sym_raw = text.replace("/WATCH ", "").strip().split()[0] if text.replace("/WATCH ", "").strip() else ""
                     if not sym_raw:
                         reply( "⚠️ Format: /watch BTC  (or /watch BTCUSDT)")
+                    elif not is_plausible_symbol(sym_raw):
+                        reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol. Use a ticker like BTC or BTCUSDT, not a price.")
                     else:
                         sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                         watch_key = f"{sym}_{chat_id}"
@@ -10645,6 +10676,8 @@ def handle_commands():
                     sym_raw = text.replace("/SUGGEST ", "").strip().split()[0] if " " in text else ""
                     if not sym_raw:
                         reply("⚠️ Format: /suggest BTC  (or /s BTC)")
+                    elif not is_plausible_symbol(sym_raw):
+                        reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol. Use a ticker like BTC or BTCUSDT, not a price.")
                     else:
                         sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                         ticker = get_ticker(sym)
@@ -10787,6 +10820,9 @@ def handle_commands():
                         else:
                             try:
                                 sym_raw = parts[1].upper()
+                                if not is_plausible_symbol(sym_raw):
+                                    reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol. Use a ticker like BTC or BTCUSDT, not a price.")
+                                    continue
                                 sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
                                 kv = {}
                                 for p in parts[2:]:
