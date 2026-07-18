@@ -639,8 +639,12 @@ def load_from_telegram():
     load_manual_lines()
 
 # ─── TELEGRAM ─────────────────────────────────────────────
+_known_bad_chat_ids = {}  # {chat_id: reason} — any chat_id that's permanently failed, regardless of source
+
 def send_to(chat_id, message, thread_id=None):
     """Send a message. If thread_id is provided, sends to that topic thread."""
+    if chat_id in _known_bad_chat_ids:
+        return  # already confirmed dead — skip silently, don't keep retrying forever
     try:
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         if thread_id:
@@ -649,30 +653,67 @@ def send_to(chat_id, message, thread_id=None):
             json=payload, timeout=10)
         if r.status_code != 200:
             print(f"⚠️ send_to failed: HTTP {r.status_code} — {r.text[:300]} (len={len(message)})")
-            # Auto-cleanup: a permanently-invalid subscriber (blocked the bot,
-            # deleted account, never actually started a DM) causes this same
-            # 400 "chat not found" on EVERY single message forever. Remove it
-            # from subscribers so it doesn't keep failing on every send.
-            if r.status_code == 400 and "chat not found" in r.text.lower() and chat_id in subscribers:
-                subscribers.remove(chat_id)
-                subscribers_info.pop(str(chat_id), None)
-                save_subscribers_file()
-                print(f"🧹 Removed invalid subscriber chat_id {chat_id} (chat not found)")
+            body_lower = r.text.lower()
+            if r.status_code == 400 and "chat not found" in body_lower:
+                # Permanently invalid chat_id (blocked the bot, deleted
+                # account, never started a DM) — blacklist it everywhere,
+                # not just the subscribers list, so it stops failing on
+                # EVERY send from any feature (watches, trades, etc), not
+                # just send_all()'s subscriber loop.
+                _known_bad_chat_ids[chat_id] = "chat not found"
+                if chat_id in subscribers:
+                    subscribers.remove(chat_id)
+                    subscribers_info.pop(str(chat_id), None)
+                    save_subscribers_file()
+                print(f"🧹 Blacklisted invalid chat_id {chat_id} (chat not found) — won't retry")
+            elif r.status_code == 400 and "can't parse entities" in body_lower:
+                # Malformed HTML in the message (stray '<'/'>' somewhere) —
+                # retry once as plain text so the message still gets
+                # delivered instead of silently vanishing.
+                try:
+                    plain_payload = {"chat_id": chat_id, "text": message}
+                    if thread_id:
+                        plain_payload["message_thread_id"] = thread_id
+                    r2 = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json=plain_payload, timeout=10)
+                    if r2.status_code == 200:
+                        print(f"✅ send_to: resent as plain text after HTML parse error (len={len(message)})")
+                    else:
+                        print(f"⚠️ send_to plain-text retry also failed: HTTP {r2.status_code} — {r2.text[:200]}")
+                except Exception as e2:
+                    print(f"⚠️ send_to plain-text retry exception: {e2}")
     except Exception as e:
         print(f"⚠️ send_to exception: {e}")
 
 def send_to_topic(topic_id, message):
     """Send a message to a specific topic in the CryptoPing Alerts group"""
     try:
-        http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": ALERTS_GROUP_ID,
                 "message_thread_id": topic_id,
                 "text": message,
                 "parse_mode": "HTML"
             }, timeout=10)
-    except:
-        pass
+        if r.status_code != 200:
+            print(f"⚠️ send_to_topic failed: HTTP {r.status_code} — {r.text[:300]} (topic={topic_id}, len={len(message)})")
+            if r.status_code == 400 and "can't parse entities" in r.text.lower():
+                # Malformed HTML — retry once as plain text so it still gets delivered
+                try:
+                    r2 = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": ALERTS_GROUP_ID,
+                            "message_thread_id": topic_id,
+                            "text": message,
+                        }, timeout=10)
+                    if r2.status_code == 200:
+                        print(f"✅ send_to_topic: resent as plain text after HTML parse error (topic={topic_id})")
+                    else:
+                        print(f"⚠️ send_to_topic plain-text retry also failed: HTTP {r2.status_code} — {r2.text[:200]}")
+                except Exception as e2:
+                    print(f"⚠️ send_to_topic plain-text retry exception: {e2}")
+    except Exception as e:
+        print(f"⚠️ send_to_topic exception: {e}")
 
 def send_chunked(chat_id, lines, header=""):
     """
