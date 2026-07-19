@@ -3381,6 +3381,102 @@ def check_active_trades():
         save_active_trades()
 
 
+def check_scalp_trades():
+    """
+    Separate, fast, tight-SL monitor for scalp trades (_scalp_trades —
+    distinct from active_trades, checked more frequently for quick updates).
+
+    Also detects when a scalp setup looks like it could go much BIGGER than
+    the scalp TP1 (ALLOUSDT-style 20-50% moves in a few hours): if volume/
+    momentum stays strong after entry, removes the fixed TP (tells the user
+    to watch the chart manually for a higher exit) and switches to actively
+    monitoring for downside risk instead of a rigid scalp target — user is
+    fine waiting 4-12h for a bigger opportunity like this.
+    """
+    now = time.time()
+    to_remove = []
+    for trade_id, trade in list(_scalp_trades.items()):
+        if trade.get("closed"):
+            to_remove.append(trade_id)
+            continue
+        if now - trade["started"] > 16 * 3600:
+            to_remove.append(trade_id)
+            continue
+        symbol = trade["symbol"]
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            entry, sl, tp1 = trade["entry"], trade["sl"], trade["tp1"]
+            pnl_pct = (current_price - entry) / entry * 100 if entry > 0 else 0
+
+            if current_price <= sl:
+                send_to_topic(TOPIC_BIG_PUMP,
+                    f"🛑 <b>SCALP SL HIT — {symbol}</b>\n\n"
+                    f"💰 Entry: {format_price(entry)} → SL: {format_price(sl)} ({pnl_pct:+.1f}%)\n"
+                    f"<i>Removed from scalp monitor.</i>"
+                )
+                trade["closed"] = True
+                to_remove.append(trade_id)
+                continue
+
+            if not trade["tp_removed"] and not trade.get("tp1_hit") and current_price >= tp1:
+                trade["tp1_hit"] = True
+                send_to_topic(TOPIC_BIG_PUMP,
+                    f"✅ <b>SCALP TP1 HIT — {symbol}</b>\n\n"
+                    f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+                    f"<i>Target reached — consider taking profit.</i>"
+                )
+                trade["closed"] = True
+                to_remove.append(trade_id)
+                continue
+
+            # "Bigger opportunity" override — only checked before TP1 fills,
+            # only fires once per trade.
+            if not trade["tp_removed"] and pnl_pct >= 3.0:
+                klines_5m_bp = get_klines(symbol, interval="5m", limit=10)
+                if klines_5m_bp and len(klines_5m_bp) >= 8:
+                    closed_bp = klines_5m_bp[:-1]
+                    last_bp = closed_bp[-1]
+                    lv = float(last_bp[5])
+                    lb = float(last_bp[9]) if len(last_bp) > 9 else lv * 0.5
+                    buy_ratio_bp = lb / lv if lv > 0 else 0.5
+                    prior_vols_bp = [float(k[5]) for k in closed_bp[-7:-1]]
+                    avg_vol_bp = sum(prior_vols_bp) / len(prior_vols_bp) if prior_vols_bp else 1
+                    vol_ratio_bp = lv / avg_vol_bp if avg_vol_bp > 0 else 0
+
+                    if vol_ratio_bp >= 3.0 and buy_ratio_bp >= 0.60:
+                        trade["tp_removed"] = True
+                        send_to_topic(TOPIC_BIG_PUMP,
+                            f"🚀 <b>BIGGER OPPORTUNITY — {symbol}</b>\n\n"
+                            f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+                            f"⚡ Volume still strong: {vol_ratio_bp:.1f}x | Buy: {buy_ratio_bp*100:.0f}%\n\n"
+                            f"💡 This may run well past the scalp TP1 ({format_price(tp1)}) — "
+                            f"removed the fixed target. Watch the chart yourself for a higher exit.\n"
+                            f"🔍 Bot will keep monitoring and notify if this starts turning down.\n"
+                            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+                        )
+                        print(f"🚀 Scalp → bigger opportunity: {symbol}")
+
+            # After the TP is removed, actively watch for downside risk
+            if trade["tp_removed"]:
+                warning = check_2m_reversal_structure(symbol)
+                if warning and now - trade.get("last_downside_alert", 0) > 1800:
+                    trade["last_downside_alert"] = now
+                    send_to_topic(TOPIC_BIG_PUMP,
+                        f"⚠️ <b>Downside Risk — {symbol}</b>\n\n"
+                        f"💰 Now: {format_price(current_price)} ({pnl_pct:+.1f}% from entry)\n"
+                        f"   {warning}\n\n"
+                        f"💡 Consider securing profit — the bigger move may be losing steam.\n"
+                        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+                    )
+        except Exception as e:
+            print(f"Scalp trade check error {symbol}: {e}")
+    for t in to_remove:
+        _scalp_trades.pop(t, None)
+
+
 def check_2m_reversal_structure(symbol):
     """
     Note #8 (Trade Monitor 2M enhancement): watches SEVERAL 2M candles (not
@@ -3666,6 +3762,8 @@ def check_no_retest_pump_risk(symbol, tf="1h"):
     if l_close <= l_open:
         return  # must be a bullish breakout candle
 
+    if l_open <= 0:
+        return  # malformed candle data — avoid division by zero
     body_pct = (l_close - l_open) / l_open * 100
     body_min = 3.0 if tf == "1h" else 5.0  # 4H candles naturally have bigger bodies
     if body_pct < body_min:
@@ -4252,7 +4350,7 @@ def is_daily_downtrend(symbol, current_price, klines_1h=None, klines_daily=None)
         l_vol   = float(last_1h[5])
         avg_vol = sum(float(k[5]) for k in closed_1h[-8:-1]) / 7
         vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
-        if (vol_ratio >= 8.0 and l_close > l_open and
+        if (vol_ratio >= 8.0 and l_close > l_open and l_open > 0 and
                 (l_close - l_open) / l_open >= 0.03):
             return False  # bypass — reversal pump
 
@@ -4828,6 +4926,8 @@ def check_breakouts(symbol):
     prev_close = float(prev_c[4])
     prev_open  = float(prev_c[1])
     # At least current candle is strongly bullish
+    if l_open <= 0:
+        return
     body_pct = (l_close - l_open) / l_open * 100
     if body_pct < 1.5:
         return
@@ -8651,6 +8751,121 @@ _dormant_coil_alerted = {}  # {symbol: last_alert_time}
 
 _btc_divergence_alerted = {}  # {symbol: last_alert_time}
 
+_scalp_alerted = {}  # {symbol: last_alert_time}
+_scalp_trades = {}   # {trade_id: {...}} — SEPARATE from active_trades, tight/fast monitoring
+
+def check_scalp_opportunity(symbol):
+    """
+    Scalping Scanner: finds coins showing enough historical intraday
+    VOLATILITY (like XECUSDT — multiple 10%+ swings per day) to realistically
+    support repeat scalp entries, then watches 5M for a LOCAL liquidity
+    sweep + reclaim with above-average volume. Prefers liquid/established
+    coins (24h volume floor) over obscure micro-caps. Fires with SL + a
+    single TP1 (next local resistance, % shown), routed to the Big Pump
+    topic labeled "for scalping". Short cooldown — supports multiple
+    entries on the same coin in one day.
+    """
+    now = time.time()
+    if now - _scalp_alerted.get(symbol, 0) < 90 * 60:  # 1.5h — allows repeat entries per day
+        return
+
+    ticker = get_ticker(symbol)
+    if not ticker:
+        return
+    quote_vol_24h = float(ticker.get("quoteVolume", 0))
+    if quote_vol_24h < 500_000:
+        return  # too illiquid for reliable scalp fills
+    current_price = float(ticker["lastPrice"])
+
+    # Volatility filter — does this coin already show big intraday swings?
+    # Uses a cheaper ~8h window (100 x 5m candles) rather than a full 24h
+    # fetch to keep this affordable to run across the whole watchlist often.
+    klines_5m = get_klines(symbol, interval="5m", limit=100)
+    if not klines_5m or len(klines_5m) < 80:
+        return
+    closed_5m = klines_5m[:-1]
+
+    window_size = 24  # ~2 hours per window
+    windows = [closed_5m[i:i+window_size] for i in range(0, len(closed_5m) - window_size, window_size)]
+    big_swing_count = 0
+    for w in windows:
+        if not w:
+            continue
+        w_high = max(float(k[2]) for k in w)
+        w_low = min(float(k[3]) for k in w)
+        if w_low > 0 and (w_high - w_low) / w_low * 100 >= 8.0:
+            big_swing_count += 1
+    if big_swing_count < 2:
+        return  # not volatile enough historically — core filter per user's request
+
+    # Local liquidity sweep + reclaim on the most recent 5M candles
+    recent = closed_5m[-20:]
+    if len(recent) < 15:
+        return
+    local_lows = [float(k[3]) for k in recent[:-3]]
+    local_swing_low = min(local_lows) if local_lows else 0
+    if local_swing_low <= 0:
+        return
+
+    last = recent[-1]
+    l_open, l_close = float(last[1]), float(last[4])
+    l_vol = float(last[5])
+    l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+    buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+
+    swept = any(float(k[3]) <= local_swing_low * 1.005 for k in recent[-4:-1])
+    reclaimed = l_close > l_open and l_close > local_swing_low
+
+    prior_vols = [float(k[5]) for k in recent[-8:-1]]
+    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+    vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+    if not (swept and reclaimed and vol_ratio >= 2.5 and buy_ratio >= 0.58):
+        return
+
+    # Bonus SMC confluence — OB zone nearby (preferred, not required)
+    ob_note = ""
+    avg_v_ob = sum(float(k[5]) for k in recent[-10:]) / 10 or 1
+    for k in reversed(recent[-10:]):
+        ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+        if kc > ko and kv >= avg_v_ob * 1.3 and kl <= current_price <= kh * 1.05:
+            ob_note = f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}\n"
+            break
+
+    # TP1 = next local resistance from recent 5m highs
+    highs_above = [float(k[2]) for k in closed_5m[-60:] if float(k[2]) > current_price * 1.01]
+    tp1 = min(highs_above) if highs_above else current_price * 1.10
+    tp1 = max(tp1, current_price * 1.05)
+    tp1_pct = (tp1 - current_price) / current_price * 100
+    if tp1_pct < 5.0:
+        return  # not worth it — too little room to the next resistance
+
+    sl = local_swing_low * 0.995
+    sl_pct = (current_price - sl) / current_price * 100
+
+    _scalp_alerted[symbol] = now
+    send_to_topic(TOPIC_BIG_PUMP,
+        f"⚡ <b>SCALP SETUP — {symbol}</b> [for scalping]\n\n"
+        f"💰 Price: {format_price(current_price)}\n"
+        f"💧 Local liquidity swept & reclaimed: {format_price(local_swing_low)}\n"
+        f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
+        f"{ob_note}"
+        f"📊 24h volume: ${quote_vol_24h/1e6:.1f}M | Volatile: {big_swing_count}x 8%+ swings recently\n\n"
+        f"📐 Entry: {format_price(current_price)}\n"
+        f"🔴 SL: {format_price(sl)} (-{sl_pct:.1f}%)\n"
+        f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%) — next local resistance\n\n"
+        f"⚠️ <i>Fast/scalp setup — confirm on chart, use a tight stop-loss.</i>"
+    )
+    print(f"⚡ Scalp setup: {symbol} vol={vol_ratio:.1f}x tp1=+{tp1_pct:.1f}%")
+
+    # Auto-register for the dedicated scalp trade monitor (tight SL, fast checks)
+    trade_id = f"{symbol}_scalp_{int(now)}"
+    _scalp_trades[trade_id] = {
+        "symbol": symbol, "entry": current_price, "sl": sl, "tp1": tp1,
+        "started": now, "tp_removed": False, "closed": False,
+    }
+
+
 def scan_btc_divergence():
     """
     Relative strength scanner: when BTC is meaningfully red, finds coins
@@ -10865,6 +11080,51 @@ def handle_commands():
                             except (KeyError, ValueError) as e:
                                 reply( f"⚠️ Format is wrong. Example:\n<code>/trade GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
 
+                elif raw_text.upper().startswith("/ST "):
+                    if not is_admin:
+                        reply( "⚠️ Admin only.")
+                    else:
+                        # /st GPS entry=0.00762 sl=0.00700 tp1=0.00850
+                        # Separate, faster, tighter-SL scalp trade monitor —
+                        # distinct from /trade's active_trades.
+                        parts = raw_text.strip().split()
+                        if len(parts) < 4:
+                            reply("⚠️ Format:\n<code>/st GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
+                        else:
+                            try:
+                                sym_raw = parts[1].upper()
+                                if not is_plausible_symbol(sym_raw):
+                                    reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol. Use a ticker like BTC or BTCUSDT, not a price.")
+                                    continue
+                                sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                                kv = {}
+                                for p in parts[2:]:
+                                    if "=" in p:
+                                        k, v = p.split("=", 1)
+                                        kv[k.lower()] = v
+                                entry = float(kv["entry"])
+                                sl    = float(kv["sl"])
+                                tp1   = float(kv["tp1"])
+                                if sl >= entry:
+                                    reply("⚠️ SL must be below entry (assuming a long trade)")
+                                else:
+                                    trade_id = f"{sym}_scalp_{int(time.time())}"
+                                    _scalp_trades[trade_id] = {
+                                        "symbol": sym, "entry": entry, "sl": sl, "tp1": tp1,
+                                        "started": time.time(), "tp_removed": False, "closed": False,
+                                    }
+                                    reply(
+                                        f"⚡ <b>Scalp trade added!</b>\n\n"
+                                        f"🪙 {sym}\n"
+                                        f"💰 Entry: {format_price(entry)} | SL: {format_price(sl)} | TP1: {format_price(tp1)}\n"
+                                        f"🆔 <code>{trade_id}</code>\n\n"
+                                        f"Monitored separately — fast checks, tight SL, and will flag if this looks "
+                                        f"like a bigger opportunity than the TP1."
+                                    )
+                                    print(f"⚡ Scalp trade added: {trade_id}")
+                            except (KeyError, ValueError):
+                                reply("⚠️ Format is wrong. Example:\n<code>/st GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
+
                 elif text == "/TRADES":
                     if not is_admin:
                         reply( "⚠️ Admin only.")
@@ -11054,6 +11314,32 @@ def main():
             time.sleep(600)  # every 10 minutes, internal cooldown is 6h per coin
 
     Thread(target=run_btc_divergence_scanner, daemon=True).start()
+
+    def run_scalp_scanner():
+        while True:
+            try:
+                for _sym in list(watchlist):
+                    if _sym in removed_coins:
+                        continue
+                    try:
+                        check_scalp_opportunity(_sym)
+                    except Exception as e:
+                        print(f"Scalp opportunity check error {_sym}: {e}")
+            except Exception as e:
+                print(f"Scalp scanner error: {e}")
+            time.sleep(180)  # every 3 minutes — fast timeframe (2M-5M) needs frequent checks
+
+    Thread(target=run_scalp_scanner, daemon=True).start()
+
+    def run_scalp_trade_monitor():
+        while True:
+            try:
+                check_scalp_trades()
+            except Exception as e:
+                print(f"Scalp trade monitor error: {e}")
+            time.sleep(60)  # tight SL needs quick updates
+
+    Thread(target=run_scalp_trade_monitor, daemon=True).start()
 
     def run_valid_ob_scanner():
         while True:
