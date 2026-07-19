@@ -9510,14 +9510,28 @@ def auto_validate_watchlist():
     invalid = []
     for symbol in list(watchlist):
         try:
+            # Note: checking exchangeInfo instead of just ticker/price — a
+            # symbol can return valid price data even when it's not
+            # actually SPOT-tradeable (halted, margin/futures-only, etc).
+            # MBOXUSDT case: scalping scanner picked it up with real price/
+            # volume data, but it's not actually on Binance Spot.
             r = http_session.get(
-                f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+                f"https://api.binance.com/api/v3/exchangeInfo?symbol={symbol}",
                 timeout=5
             )
             if r.status_code in (400, 404):
                 invalid.append(symbol)
             elif r.status_code == 200:
-                pass  # valid
+                data = r.json()
+                symbols_info = data.get("symbols", [])
+                if not symbols_info:
+                    invalid.append(symbol)
+                else:
+                    info = symbols_info[0]
+                    is_trading = info.get("status") == "TRADING"
+                    is_spot = "SPOT" in info.get("permissions", []) or info.get("isSpotTradingAllowed", False)
+                    if not (is_trading and is_spot):
+                        invalid.append(symbol)
             # 418/429 = rate limited, skip — don't remove on transient errors
         except Exception:
             pass  # network error, skip this coin
