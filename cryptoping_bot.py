@@ -639,6 +639,7 @@ def load_from_telegram():
     load_cooldown_trackers()
     load_retest_watch()
     load_manual_lines()
+    sanitize_persisted_symbols()  # clean up any pre-existing bad-symbol entries (e.g. "0.0874USDT")
 
 # ─── TELEGRAM ─────────────────────────────────────────────
 _known_bad_chat_ids = {}  # {chat_id: reason} — any chat_id that's permanently failed, regardless of source
@@ -975,6 +976,50 @@ def is_plausible_symbol(sym_raw):
     if "." in s:
         return False  # tickers don't contain decimal points
     return True
+
+
+def sanitize_persisted_symbols():
+    """
+    One-time startup cleanup: removes any pre-existing persisted watch/trade
+    entries with an implausible symbol (e.g. "0.0874USDT" — a price that got
+    stored as a symbol before is_plausible_symbol() validation existed).
+    Without this, a bad entry saved before the fix keeps retrying forever
+    with HTTP 400 'Invalid symbol' since the validation only guards NEW
+    entries at creation time, not ones already on disk.
+    """
+    removed_count = 0
+
+    for sym in list(_liq_watch.keys()):
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            _liq_watch.pop(sym, None)
+            removed_count += 1
+
+    for sym in list(_entry_watch.keys()):
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            _entry_watch.pop(sym, None)
+            removed_count += 1
+
+    for key in list(retest_watch_list.keys()):
+        sym = retest_watch_list[key].get("symbol", "")
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            retest_watch_list.pop(key, None)
+            removed_count += 1
+
+    for tid in list(active_trades.keys()):
+        sym = active_trades[tid].get("symbol", "")
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            active_trades.pop(tid, None)
+            removed_count += 1
+
+    for tid in list(_scalp_trades.keys()):
+        sym = _scalp_trades[tid].get("symbol", "")
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            _scalp_trades.pop(tid, None)
+            removed_count += 1
+
+    if removed_count:
+        print(f"🧹 Sanitized {removed_count} pre-existing bad-symbol watch/trade entries")
+        save_active_trades()
 
 
 def get_klines(symbol, interval="5m", limit=50):
@@ -3431,6 +3476,34 @@ def check_scalp_trades():
                 trade["closed"] = True
                 to_remove.append(trade_id)
                 continue
+
+            # Extra-strong confirmation follow-up: right after the setup
+            # fires, keep observing volume/BS pressure closely — if it gets
+            # notably STRONGER than what triggered the original alert,
+            # send a distinct follow-up so the user knows conviction is
+            # building further. Checked early, fires once.
+            if not trade.get("strong_confirm_sent") and not trade.get("tp1_hit"):
+                klines_5m_sc = get_klines(symbol, interval="5m", limit=10)
+                if klines_5m_sc and len(klines_5m_sc) >= 8:
+                    closed_sc = klines_5m_sc[:-1]
+                    last_sc = closed_sc[-1]
+                    lv_sc = float(last_sc[5])
+                    lb_sc = float(last_sc[9]) if len(last_sc) > 9 else lv_sc * 0.5
+                    buy_ratio_sc = lb_sc / lv_sc if lv_sc > 0 else 0.5
+                    prior_vols_sc = [float(k[5]) for k in closed_sc[-7:-1]]
+                    avg_vol_sc = sum(prior_vols_sc) / len(prior_vols_sc) if prior_vols_sc else 1
+                    vol_ratio_sc = lv_sc / avg_vol_sc if avg_vol_sc > 0 else 0
+
+                    if vol_ratio_sc >= 4.0 and buy_ratio_sc >= 0.68:
+                        trade["strong_confirm_sent"] = True
+                        send_to_topic(TOPIC_BIG_PUMP,
+                            f"🔥 <b>SCALP CONFIRMED — Extra Strong — {symbol}</b>\n\n"
+                            f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
+                            f"⚡ Volume: {vol_ratio_sc:.1f}x | Buy: {buy_ratio_sc*100:.0f}% — stronger than the original setup\n\n"
+                            f"💡 Conviction building further — setup looks even better now.\n"
+                            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+                        )
+                        print(f"🔥 Scalp extra-strong confirm: {symbol} vol={vol_ratio_sc:.1f}x buy={buy_ratio_sc*100:.0f}%")
 
             # "Bigger opportunity" override — only checked before TP1 fills,
             # only fires once per trade.
@@ -8773,7 +8846,7 @@ def check_scalp_opportunity(symbol):
     if not ticker:
         return
     quote_vol_24h = float(ticker.get("quoteVolume", 0))
-    if quote_vol_24h < 500_000:
+    if quote_vol_24h < 300_000:
         return  # too illiquid for reliable scalp fills
     current_price = float(ticker["lastPrice"])
 
@@ -8793,9 +8866,9 @@ def check_scalp_opportunity(symbol):
             continue
         w_high = max(float(k[2]) for k in w)
         w_low = min(float(k[3]) for k in w)
-        if w_low > 0 and (w_high - w_low) / w_low * 100 >= 8.0:
+        if w_low > 0 and (w_high - w_low) / w_low * 100 >= 6.0:
             big_swing_count += 1
-    if big_swing_count < 2:
+    if big_swing_count < 1:
         return  # not volatile enough historically — core filter per user's request
 
     # Local liquidity sweep + reclaim on the most recent 5M candles
@@ -8813,14 +8886,14 @@ def check_scalp_opportunity(symbol):
     l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
     buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
 
-    swept = any(float(k[3]) <= local_swing_low * 1.005 for k in recent[-4:-1])
+    swept = any(float(k[3]) <= local_swing_low * 1.008 for k in recent[-4:-1])
     reclaimed = l_close > l_open and l_close > local_swing_low
 
     prior_vols = [float(k[5]) for k in recent[-8:-1]]
     avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
     vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
 
-    if not (swept and reclaimed and vol_ratio >= 2.5 and buy_ratio >= 0.58):
+    if not (swept and reclaimed and vol_ratio >= 2.0 and buy_ratio >= 0.55):
         return
 
     # Bonus SMC confluence — OB zone nearby (preferred, not required)
@@ -8837,7 +8910,7 @@ def check_scalp_opportunity(symbol):
     tp1 = min(highs_above) if highs_above else current_price * 1.10
     tp1 = max(tp1, current_price * 1.05)
     tp1_pct = (tp1 - current_price) / current_price * 100
-    if tp1_pct < 5.0:
+    if tp1_pct < 4.0:
         return  # not worth it — too little room to the next resistance
 
     sl = local_swing_low * 0.995
