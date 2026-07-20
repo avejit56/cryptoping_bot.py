@@ -739,12 +739,47 @@ def note_topic_signal(symbol):
     entry["timestamps"].append(now)
     entry["timestamps"] = [t for t in entry["timestamps"] if now - t < 24 * 3600]
 
+def _extract_price_from_message(message):
+    """Best-effort extraction of an entry/current price from a message's
+    text (e.g. 'Price: $0.1234', 'Entry: $0.1234', 'Now: $0.1234')."""
+    match = re.search(r'(?:Price|Entry|Now)[:\s]*\$?([0-9][0-9,]*\.?[0-9]*)', message)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+_milestone_watch = {}  # {symbol: {"alert_price": float, "milestones_hit": [...], "topic": id, "started": time}}
+
+def start_milestone_watch(symbol, alert_price, topic):
+    """
+    Progressive milestone tracking (user request, HEMIUSDT example): once a
+    coin gets an alert in My Setups or High Priority, keep watching it —
+    fire a follow-up at +5%, +10%, +15%, +20%... so an early-entry miss
+    doesn't become a FULL miss. Each milestone includes an opinion (based on
+    historical pump size / volume) and a caution (based on how close the
+    next resistance is) so the user can judge whether to chase or wait for
+    a retest.
+    """
+    if symbol in _milestone_watch or not alert_price or alert_price <= 0:
+        return
+    _milestone_watch[symbol] = {
+        "alert_price": alert_price, "milestones_hit": [], "topic": topic,
+        "started": time.time(), "retest_pending": False,
+    }
+
 def send_to_topic(topic_id, message):
     """Send a message to a specific topic in the CryptoPing Alerts group"""
     if topic_id in (TOPIC_TOP_PICKS, TOPIC_MY_SETUPS, TOPIC_BIG_PUMP):
         _sym = _extract_symbol_from_message(message)
         if _sym:
             note_topic_signal(_sym)
+    if topic_id in (TOPIC_MY_SETUPS, TOPIC_HIGH, TOPIC_SPIKES, TOPIC_BIG_PUMP):
+        _sym2 = _extract_symbol_from_message(message)
+        _price2 = _extract_price_from_message(message)
+        if _sym2 and _price2:
+            start_milestone_watch(_sym2, _price2, topic_id)
     try:
         r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
@@ -3812,7 +3847,9 @@ def check_2m_reversal_structure(symbol):
     and LH (Lower High) formation. Requires at least 2 of these 3 signals
     together to reduce noise. Returns a warning string or None.
     """
-    klines_2m = get_klines(symbol, interval="2m", limit=20)
+    # FIX: Binance has no "2m" kline interval (valid: 1m,3m,5m,15m,30m,1h...)
+    # — was causing repeated "Invalid interval" 400 errors. Use "1m" instead.
+    klines_2m = get_klines(symbol, interval="1m", limit=20)
     if not klines_2m or len(klines_2m) < 15:
         return None
     closed = klines_2m[:-1]
@@ -4545,6 +4582,117 @@ def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_seq
         "tf_index": 0, "fail_count": 0, "state": "waiting_dip",
         "started": time.time(), "silent": silent, "on_hold": on_hold,
     }
+
+def _build_milestone_commentary(symbol, current_price, gain_pct):
+    """
+    Builds an opinion (historical pump-size context) and a caution (how
+    close the next resistance is, i.e. retest risk) for a milestone update.
+    Returns (opinion_str_or_None, caution_str_or_None, retest_likely_bool).
+    """
+    opinion = None
+    caution = None
+    retest_likely = False
+    try:
+        klines_1d = get_klines(symbol, interval="1d", limit=60)
+        if klines_1d and len(klines_1d) >= 20:
+            closed_1d = klines_1d[:-1]
+            highs = [float(k[2]) for k in closed_1d]
+            lows = [float(k[3]) for k in closed_1d]
+            max_high = max(highs)
+            hi_idx = highs.index(max_high)
+            min_before_high = min(lows[:hi_idx + 1]) if hi_idx > 0 else min(lows)
+            if min_before_high > 0:
+                last_pump_pct = (max_high - min_before_high) / min_before_high * 100
+                if last_pump_pct > gain_pct + 5:
+                    opinion = (f"Volume still elevated — last big pump on this coin was ~{last_pump_pct:.0f}%, "
+                               f"so a move toward +{last_pump_pct:.0f}% is historically possible based on "
+                               f"liquidity/coiling/volume patterns.")
+
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        klines_1h = get_klines(symbol, interval="1h", limit=10)
+        if klines_4h and len(klines_4h) >= 10:
+            closed_4h = klines_4h[:-1]
+            highs_above = [float(k[2]) for k in closed_4h[-30:] if float(k[2]) > current_price * 1.005]
+            buy_ratio_now = 0.5
+            if klines_1h and len(klines_1h) >= 3:
+                last_1h = klines_1h[:-1][-1]
+                v1h = float(last_1h[5])
+                b1h = float(last_1h[9]) if len(last_1h) > 9 else v1h * 0.5
+                buy_ratio_now = b1h / v1h if v1h > 0 else 0.5
+
+            if highs_above:
+                nearest_res = min(highs_above)
+                res_pct = (nearest_res - current_price) / current_price * 100
+                if res_pct < 5.0 and gain_pct >= 15:
+                    caution = (f"Next resistance only +{res_pct:.1f}% away after already running +{gain_pct:.0f}% — "
+                               f"a 1H/4H retest is possible here. May be worth waiting for that retest instead of chasing.")
+                    retest_likely = True
+                elif buy_ratio_now >= 0.60:
+                    caution = "Buy pressure still strong and no clear resistance nearby — retest possibility looks low right now, momentum may continue."
+                    retest_likely = False
+    except Exception as e:
+        print(f"Milestone commentary error {symbol}: {e}")
+    return opinion, caution, retest_likely
+
+def check_milestone_watches():
+    """Runs periodically for up to 72h per watch. Fires ONE milestone per
+    check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
+    now = time.time()
+    to_remove = []
+    milestones = [5, 10, 15, 20, 25, 30, 40, 50, 75, 100]
+    for symbol, w in list(_milestone_watch.items()):
+        if now - w["started"] > 72 * 3600:
+            to_remove.append(symbol)
+            continue
+        try:
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+            gain_pct = (current_price - w["alert_price"]) / w["alert_price"] * 100
+            if gain_pct < 0:
+                continue
+
+            for m in milestones:
+                if gain_pct >= m and m not in w["milestones_hit"]:
+                    w["milestones_hit"].append(m)
+                    opinion, caution, retest_likely = _build_milestone_commentary(symbol, current_price, gain_pct)
+                    msg = (
+                        f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
+                        f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
+                        + (f"💡 {opinion}\n\n" if opinion else "")
+                        + (f"⚠️ {caution}\n" if caution else "")
+                    )
+                    send_to_topic(w["topic"], msg)
+                    print(f"📈 Milestone +{m}%: {symbol}")
+
+                    # If a retest looks likely, start a silent watch — when
+                    # it holds, send a "resumed" update; if price pumps
+                    # further without ever retesting, the next milestone
+                    # trigger above already covers that case naturally.
+                    if retest_likely and not w.get("retest_pending"):
+                        w["retest_pending"] = True
+                        def _on_milestone_retest_hold(sym, price, tf, _topic=w["topic"], _alert_price=w["alert_price"]):
+                            gain_now = (price - _alert_price) / _alert_price * 100
+                            send_to_topic(_topic,
+                                f"🔄 <b>Retest Held, Resuming — {sym}</b>\n\n"
+                                f"✅ Retest held on {tf.upper()} — pump may continue.\n"
+                                f"💰 Now: {format_price(price)} (+{gain_now:.1f}% from original alert)"
+                            )
+                            if sym in _milestone_watch:
+                                _milestone_watch[sym]["retest_pending"] = False
+                        start_shared_retest_watch(
+                            key=f"{symbol}_milestone_retest",
+                            symbol=symbol, level=current_price * 0.97, topic=w["topic"],
+                            header=f"🔄 <b>Milestone Retest — {symbol}</b>",
+                            context="", silent=True, on_hold=_on_milestone_retest_hold,
+                        )
+                    break
+        except Exception as e:
+            print(f"Milestone watch error {symbol}: {e}")
+    for s in to_remove:
+        _milestone_watch.pop(s, None)
+
 
 def check_shared_retest_watches():
     """Runs periodically for up to 24h per watch."""
@@ -12031,6 +12179,16 @@ def main():
             time.sleep(180)  # every 3 minutes — fast enough for 5M timeframe checks
 
     Thread(target=run_retest_watch_checker, daemon=True).start()
+
+    def run_milestone_watch_checker():
+        while True:
+            try:
+                check_milestone_watches()
+            except Exception as e:
+                print(f"Milestone watch check error: {e}")
+            time.sleep(180)  # every 3 minutes — catches milestones promptly
+
+    Thread(target=run_milestone_watch_checker, daemon=True).start()
 
     def run_whale_trade_scanner():
         while True:
