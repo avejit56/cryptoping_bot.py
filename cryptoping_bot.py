@@ -14,6 +14,7 @@ monitor module, and the /entry on-demand analysis command.
 """
 
 import os
+import re
 import requests
 from requests.adapters import HTTPAdapter
 import time
@@ -97,7 +98,7 @@ CHECK_INTERVAL = 5 * 60
 # CryptoPing Alerts Group — categorized topics
 ALERTS_GROUP_ID = "-1003765700295"
 TOPIC_HIGH        = 2     # 🎯 High Priority Signals
-TOPIC_SPIKES      = 3     # ⚡ Quick Spikes
+TOPIC_SPIKES      = 3     # ⚡ Scalping (renamed from Quick Spikes — user repurposed this topic)
 TOPIC_BUILDUPS    = 4     # 📈 Building Momentum
 TOPIC_RESULTS     = 5     # 📊 Signal Results
 TOPIC_TRADES      = 1463  # 💼 Trade Monitor (admin-only — Avejit's own trades)
@@ -244,6 +245,7 @@ SIGNAL_QUEUE_FILE = os.path.join(_BOT_DIR, "signal_queue.json")
 TRADES_FILE    = os.path.join(_BOT_DIR, "active_trades.json")
 ZONE_HISTORY_FILE = os.path.join(_BOT_DIR, "zone_history.json")
 SIGNAL_PERFORMANCE_FILE = os.path.join(_BOT_DIR, "signal_performance.json")
+BIGPUMP_QUALITY_FILE = os.path.join(_BOT_DIR, "bigpump_quality.json")
 PREPUMP_PHASES_FILE = os.path.join(_BOT_DIR, "prepump_phases.json")
 TRENDLINE_TRACKING_FILE = os.path.join(_BOT_DIR, "trendline_retest_tracking.json")
 COOLDOWN_TRACKERS_FILE = os.path.join(_BOT_DIR, "cooldown_trackers.json")
@@ -418,6 +420,27 @@ def load_signal_performance():
             print("📊 No signal performance file, starting fresh")
     except Exception as e:
         print(f"Signal performance load error: {e}")
+
+_bigpump_quality_log = {}  # {signal_id: {symbol, source, signal_time, signal_price, peak_price, peak_time, lowest_price, resolved, ...}}
+
+def save_bigpump_quality_log():
+    try:
+        with open(BIGPUMP_QUALITY_FILE, "w") as f:
+            _json.dump(_bigpump_quality_log, f, indent=2)
+    except Exception as e:
+        print(f"Big Pump quality log save error: {e}")
+
+def load_bigpump_quality_log():
+    global _bigpump_quality_log
+    try:
+        if os.path.exists(BIGPUMP_QUALITY_FILE):
+            with open(BIGPUMP_QUALITY_FILE) as f:
+                _bigpump_quality_log = _json.load(f)
+            print(f"✅ Big Pump quality log loaded: {len(_bigpump_quality_log)}")
+        else:
+            print("📊 No Big Pump quality log file, starting fresh")
+    except Exception as e:
+        print(f"Big Pump quality log load error: {e}")
 
 def save_prepump_phases():
     try:
@@ -639,6 +662,7 @@ def load_from_telegram():
     load_cooldown_trackers()
     load_retest_watch()
     load_manual_lines()
+    load_bigpump_quality_log()
     sanitize_persisted_symbols()  # clean up any pre-existing bad-symbol entries (e.g. "0.0874USDT")
 
 # ─── TELEGRAM ─────────────────────────────────────────────
@@ -693,8 +717,34 @@ def send_to(chat_id, message, thread_id=None):
     except Exception as e:
         print(f"⚠️ send_to exception: {e}")
 
+_topic_signal_frequency = {}  # {symbol: {"timestamps": [...]}}
+_freq_pipeline_alerted = {}   # {symbol: last_alert_time} — cooldown for the new High Priority pipeline
+
+def _extract_symbol_from_message(message):
+    """Best-effort extraction of a USDT ticker symbol from a message's text
+    (virtually every message in this bot includes one, e.g. '— BTCUSDT' or
+    '🪙 <b>BTCUSDT</b>')."""
+    match = re.search(r'\b([A-Z0-9]{2,15}USDT)\b', message)
+    return match.group(1) if match else None
+
+def note_topic_signal(symbol):
+    """
+    Note #1 (major redesign): tracks how often a symbol shows up across Top
+    Picks, My Setups, and Big Pump — a coin re-triggering repeatedly across
+    these topics is itself a strength signal (ALICEUSDT case: repeated Big
+    Pump Alerts before a genuine +20% pump), not noise.
+    """
+    now = time.time()
+    entry = _topic_signal_frequency.setdefault(symbol, {"timestamps": []})
+    entry["timestamps"].append(now)
+    entry["timestamps"] = [t for t in entry["timestamps"] if now - t < 24 * 3600]
+
 def send_to_topic(topic_id, message):
     """Send a message to a specific topic in the CryptoPing Alerts group"""
+    if topic_id in (TOPIC_TOP_PICKS, TOPIC_MY_SETUPS, TOPIC_BIG_PUMP):
+        _sym = _extract_symbol_from_message(message)
+        if _sym:
+            note_topic_signal(_sym)
     try:
         r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
@@ -749,13 +799,13 @@ def get_topic_for_message(message):
     elif any(x in message for x in ["EXPLOSIVE PUMP", "BUY PRESSURE", "BREAKOUT!"]):
         return TOPIC_BUILDUPS
     elif any(x in message for x in ["VOLUME SPIKE", "VOLUME SURGE", "EARLY SIGNAL CONFIRMED"]):
-        return TOPIC_SPIKES
+        return TOPIC_BUILDUPS
     elif any(x in message for x in ["BUILD-UP", "ACCUMULATION", "HIGHER LOW", "DIRECT MOMENTUM", "PHASE 1", "PHASE 2", "PHASE 3", "PRE-PUMP", "Breakout!"]):
         return TOPIC_BUILDUPS
     elif any(x in message for x in ["SIGNAL RESULT", "+5%", "+10%", "+20%"]):
         return TOPIC_RESULTS
     else:
-        return TOPIC_SPIKES
+        return TOPIC_BUILDUPS
 
 def get_category_for_signal_type(signal_type):
     """
@@ -838,6 +888,120 @@ def get_pattern_history_stats(pattern_name, min_samples=3):
     hit_15 = sum(1 for g in gains if g >= 15.0)
     hit_pct = hit_15 / len(gains) * 100
     return f"📊 Historical ({len(gains)} past signals): avg +{avg_gain:.0f}% peak, {hit_pct:.0f}% reached +15%+"
+
+
+def track_bigpump_quality(symbol, source, current_price):
+    """
+    Quality-tracking automation for Big Pump / High Priority messages.
+    Tags every signal that reaches these topics with its SOURCE (Extreme
+    Pump bypass, High Confidence score>=4, Manual Line Break, BTC
+    Divergence, PUMP CONFIRMED, etc), then tracks its actual outcome over
+    the next 3 days (peak gain, worst drawdown). A periodic report (see
+    generate_bigpump_quality_report) breaks performance down BY SOURCE so
+    consistently underperforming trigger types can be identified and
+    tightened — this is how quality gets improved gradually, based on real
+    outcomes rather than guessing.
+    """
+    try:
+        signal_id = f"{symbol}_{source}_{int(time.time())}"
+        _bigpump_quality_log[signal_id] = {
+            "symbol": symbol, "source": source,
+            "signal_time": time.time(), "signal_price": current_price,
+            "peak_price": current_price, "peak_time": time.time(),
+            "lowest_price": current_price,
+            "resolved": False,
+        }
+    except Exception as e:
+        print(f"Big Pump quality tracking error {symbol}: {e}")
+
+def check_bigpump_quality_tracking():
+    """
+    Runs periodically: updates peak/lowest price for each tracked signal,
+    and once 3 days have passed, resolves it with a final verdict — did it
+    hit +15%+ (real pump), did it dump 10%+ at any point (bad signal), or
+    neither (mediocre/flat).
+    """
+    now = time.time()
+    changed = False
+    for sid, data in list(_bigpump_quality_log.items()):
+        if data.get("resolved"):
+            continue
+        try:
+            ticker = get_ticker(data["symbol"])
+            if not ticker:
+                continue
+            price = float(ticker["lastPrice"])
+            if price > data["peak_price"]:
+                data["peak_price"] = price
+                data["peak_time"] = now
+                changed = True
+            if price < data["lowest_price"]:
+                data["lowest_price"] = price
+                changed = True
+
+            if now - data["signal_time"] >= 3 * 24 * 3600:
+                gain_pct = (data["peak_price"] - data["signal_price"]) / data["signal_price"] * 100
+                drawdown_pct = (data["lowest_price"] - data["signal_price"]) / data["signal_price"] * 100
+                data["final_gain_pct"] = gain_pct
+                data["final_drawdown_pct"] = drawdown_pct
+                data["hit_15pct"] = gain_pct >= 15.0
+                data["dumped"] = drawdown_pct <= -10.0
+                data["resolved"] = True
+                changed = True
+        except Exception as e:
+            print(f"Big Pump quality check error {sid}: {e}")
+
+    # Prune old resolved entries (>45 days) to keep the file small
+    to_remove = [sid for sid, d in _bigpump_quality_log.items()
+                 if d.get("resolved") and now - d["signal_time"] > 45 * 24 * 3600]
+    for sid in to_remove:
+        _bigpump_quality_log.pop(sid, None)
+        changed = True
+
+    if changed:
+        save_bigpump_quality_log()
+
+def generate_bigpump_quality_report():
+    """
+    Weekly quality report broken down by source type, sent to the admin —
+    flags underperforming sources (low hit-rate on +15%+, high dump-rate)
+    for manual review/threshold tightening. This is the "gradually upgrade
+    quality" mechanism: real outcome data by source, not guesswork.
+    """
+    now = time.time()
+    by_source = {}
+    for data in _bigpump_quality_log.values():
+        if not data.get("resolved"):
+            continue
+        if now - data["signal_time"] > 30 * 24 * 3600:
+            continue  # only last 30 days
+        src = data.get("source", "Unknown")
+        stats = by_source.setdefault(src, {"total": 0, "hit_15": 0, "dumped": 0, "gains": []})
+        stats["total"] += 1
+        if data.get("hit_15pct"):
+            stats["hit_15"] += 1
+        if data.get("dumped"):
+            stats["dumped"] += 1
+        stats["gains"].append(data.get("final_gain_pct", 0))
+
+    if not by_source:
+        return None
+
+    lines = ["📊 <b>Big Pump / High Priority Quality Report</b> (last 30 days)\n"]
+    for src, stats in sorted(by_source.items(), key=lambda x: -x[1]["total"]):
+        total = stats["total"]
+        hit_rate = stats["hit_15"] / total * 100 if total else 0
+        dump_rate = stats["dumped"] / total * 100 if total else 0
+        avg_gain = sum(stats["gains"]) / total if total else 0
+        flag = "⚠️ NEEDS REVIEW" if (hit_rate < 30 or dump_rate > 40) and total >= 5 else "✅"
+        lines.append(
+            f"\n<b>{src}</b> {flag}\n"
+            f"   {total} signals | {hit_rate:.0f}% hit +15%+ | {dump_rate:.0f}% dumped | avg peak +{avg_gain:.1f}%"
+        )
+    lines.append("\n💡 Sources flagged \"NEEDS REVIEW\" have a low hit-rate or high dump-rate — consider tightening their trigger conditions.")
+    return "\n".join(lines)
+
+
 
 def is_important_signal(message):
     """OB, zone, retest — these important signals have no cooldown"""
@@ -1016,6 +1180,25 @@ def sanitize_persisted_symbols():
         if not is_plausible_symbol(sym.replace("USDT", "")):
             _scalp_trades.pop(tid, None)
             removed_count += 1
+
+    # The actual root cause of the persistent "0.0874USDT" errors: it (and
+    # symbols like SECUSDT that Binance no longer recognizes at all) were
+    # sitting directly IN THE WATCHLIST, not in a watch/trade dict — every
+    # scan pass over the watchlist re-triggered the same "Invalid symbol"
+    # error. auto_validate_watchlist() would eventually catch this (every
+    # 24h) but that's too slow — sanitize both implausible-format symbols
+    # AND ones Binance's exchangeInfo doesn't recognize as SPOT/TRADING,
+    # right now at startup.
+    watchlist_removed = []
+    for sym in list(watchlist):
+        if not is_plausible_symbol(sym.replace("USDT", "")):
+            watchlist_removed.append(sym)
+    for sym in watchlist_removed:
+        watchlist.remove(sym)
+        removed_count += 1
+    if watchlist_removed:
+        save_watchlist_file()
+        print(f"🧹 Removed implausible symbols from watchlist: {watchlist_removed}")
 
     if removed_count:
         print(f"🧹 Sanitized {removed_count} pre-existing bad-symbol watch/trade entries")
@@ -2454,34 +2637,97 @@ def check_manual_zones():
         # ── waiting → in_zone ──
         if state == "waiting":
             if z_low * 0.99 <= current_price <= z_high * 1.02:
+                # User requirement: only notify on a GREEN BODY entry candle
+                # (not a wick poking into the zone), and only if
+                # volume/confluence score is already 4+ at entry.
+                klines_entry = get_klines(symbol, interval=tf, limit=3)
+                green_body_entry = False
+                if klines_entry and len(klines_entry) >= 2:
+                    e_open, e_close = float(klines_entry[-2][1]), float(klines_entry[-2][4])
+                    green_body_entry = e_close > e_open
+
                 manual_zones[zone_id]["state"] = "in_zone"
                 manual_zones[zone_id]["lowest_in_zone"] = current_price
                 manual_zones[zone_id]["confirmed"] = False
                 manual_zones[zone_id]["zone_high_below"] = False
+                manual_zones[zone_id]["entry_notified"] = False
+                manual_zones[zone_id]["green_body_entry"] = green_body_entry
                 save_zones()
 
-                # Note #6: on zone entry, do NOT message immediately —
-                # start a multi-timeframe retest watch (5M/15M/30M/1H) and
-                # only message My Setups once the retest completes/holds.
-                # Include the resistance-rejection-history comparison
-                # (note #3) if a repeatedly-rejected zone sits above.
-                rejection_note = check_resistance_rejection_history(symbol, current_price)
-                context_lines = [
-                    f"🔲 Zone: {format_price(z_low)}–{format_price(z_high)} [{tf.upper()}]",
-                    f"💰 Entered at: {format_price(current_price)}",
-                ]
-                if rejection_note:
-                    context_lines.append(rejection_note)
+                if green_body_entry:
+                    entry_score = get_quick_confluence_score(symbol, current_price)
+                    rejection_note = check_resistance_rejection_history(symbol, current_price)
+                    context_lines = [
+                        f"🔲 Zone: {format_price(z_low)}–{format_price(z_high)} [{tf.upper()}]",
+                        f"💰 Entered at: {format_price(current_price)} (green body candle)",
+                        f"📊 Score: {entry_score}/4",
+                    ]
+                    if rejection_note:
+                        context_lines.append(rejection_note)
+                    if entry_score >= 4:
+                        send_to_topic(TOPIC_MY_SETUPS,
+                            f"🟢 <b>Zone Entry — {symbol}</b>\n\n" + "\n".join(context_lines)
+                        )
+                        manual_zones[zone_id]["entry_notified"] = True
+                        save_zones()
+                    # else: score<4 — stays silent, checked again in the
+                    # "in_zone" block below until score reaches 4+ (while
+                    # still in/above the zone) or price falls below it.
+
+                # Retest watch — silent, only becomes a real message if
+                # score is 4+ at the moment the retest actually holds.
+                def _on_zone_retest_hold(sym, price, tf_held, _zid=zone_id, _zlow=z_low, _zhigh=z_high):
+                    score = get_quick_confluence_score(sym, price)
+                    if score >= 4:
+                        rej = check_resistance_rejection_history(sym, price)
+                        lines = [
+                            f"🔲 Zone: {format_price(_zlow)}–{format_price(_zhigh)}",
+                            f"✅ Retest held on {tf_held.upper()} — reclaimed with a green candle.",
+                            f"📊 Score: {score}/4",
+                            f"💰 Now: {format_price(price)}",
+                        ]
+                        if rej:
+                            lines.append(rej)
+                        send_to_topic(TOPIC_MY_SETUPS,
+                            f"🎯 <b>Zone Retest Confirmed — {sym}</b>\n\n" + "\n".join(lines)
+                        )
+
                 start_shared_retest_watch(
                     key=f"zone_{zone_id}_retest",
                     symbol=symbol, level=z_low, topic=TOPIC_MY_SETUPS,
                     header=f"🎯 <b>Zone Retest — {symbol}</b>",
-                    context="\n".join(context_lines),
+                    context=f"🔲 Zone: {format_price(z_low)}–{format_price(z_high)} [{tf.upper()}]",
+                    silent=True, on_hold=_on_zone_retest_hold,
                 )
             continue
 
         # ── in_zone ──
         if state == "in_zone":
+            # Deferred zone-entry notification: green-body entry candle
+            # existed, but score was <4 at that moment — keep checking
+            # silently. Send once score reaches 4+ ONLY while price is
+            # still in the zone or above it; if price fell below the zone,
+            # stop checking (the setup is no longer valid for this purpose).
+            if zone.get("green_body_entry") and not zone.get("entry_notified"):
+                if current_price < z_low * 0.98:
+                    manual_zones[zone_id]["entry_notified"] = True  # give up silently, zone failed
+                else:
+                    deferred_score = get_quick_confluence_score(symbol, current_price)
+                    if deferred_score >= 4:
+                        rejection_note = check_resistance_rejection_history(symbol, current_price)
+                        lines = [
+                            f"🔲 Zone: {format_price(z_low)}–{format_price(z_high)} [{tf.upper()}]",
+                            f"💰 Price: {format_price(current_price)} (in/above zone)",
+                            f"📊 Score reached: {deferred_score}/4",
+                        ]
+                        if rejection_note:
+                            lines.append(rejection_note)
+                        send_to_topic(TOPIC_MY_SETUPS,
+                            f"🟢 <b>Zone Entry — {symbol}</b>\n\n" + "\n".join(lines)
+                        )
+                        manual_zones[zone_id]["entry_notified"] = True
+                save_zones()
+
             # If price has moved far above the zone since we entered it,
             # this zone is no longer the relevant level — move to post_confirm
             # silently so we stop generating misleading alerts from a stale zone.
@@ -3457,7 +3703,7 @@ def check_scalp_trades():
             pnl_pct = (current_price - entry) / entry * 100 if entry > 0 else 0
 
             if current_price <= sl:
-                send_to_topic(TOPIC_BIG_PUMP,
+                send_to_topic(TOPIC_TRADES,
                     f"🛑 <b>SCALP SL HIT — {symbol}</b>\n\n"
                     f"💰 Entry: {format_price(entry)} → SL: {format_price(sl)} ({pnl_pct:+.1f}%)\n"
                     f"<i>Removed from scalp monitor.</i>"
@@ -3468,7 +3714,7 @@ def check_scalp_trades():
 
             if not trade["tp_removed"] and not trade.get("tp1_hit") and current_price >= tp1:
                 trade["tp1_hit"] = True
-                send_to_topic(TOPIC_BIG_PUMP,
+                send_to_topic(TOPIC_TRADES,
                     f"✅ <b>SCALP TP1 HIT — {symbol}</b>\n\n"
                     f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
                     f"<i>Target reached — consider taking profit.</i>"
@@ -3494,9 +3740,17 @@ def check_scalp_trades():
                     avg_vol_sc = sum(prior_vols_sc) / len(prior_vols_sc) if prior_vols_sc else 1
                     vol_ratio_sc = lv_sc / avg_vol_sc if avg_vol_sc > 0 else 0
 
-                    if vol_ratio_sc >= 4.0 and buy_ratio_sc >= 0.68:
+                    # Guard: high volume with a WEAK close (near the bottom
+                    # of its own candle range) often means distribution/
+                    # exhaustion rather than continuation — require the
+                    # close to be in the upper part of the candle's range too.
+                    h_sc, lo_sc, c_sc = float(last_sc[2]), float(last_sc[3]), float(last_sc[4])
+                    candle_range_sc = h_sc - lo_sc
+                    close_position_sc = (c_sc - lo_sc) / candle_range_sc if candle_range_sc > 0 else 0.5
+
+                    if vol_ratio_sc >= 4.0 and buy_ratio_sc >= 0.68 and close_position_sc >= 0.6:
                         trade["strong_confirm_sent"] = True
-                        send_to_topic(TOPIC_BIG_PUMP,
+                        send_to_topic(TOPIC_SPIKES,
                             f"🔥 <b>SCALP CONFIRMED — Extra Strong — {symbol}</b>\n\n"
                             f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
                             f"⚡ Volume: {vol_ratio_sc:.1f}x | Buy: {buy_ratio_sc*100:.0f}% — stronger than the original setup\n\n"
@@ -3521,7 +3775,7 @@ def check_scalp_trades():
 
                     if vol_ratio_bp >= 3.0 and buy_ratio_bp >= 0.60:
                         trade["tp_removed"] = True
-                        send_to_topic(TOPIC_BIG_PUMP,
+                        send_to_topic(TOPIC_SPIKES,
                             f"🚀 <b>BIGGER OPPORTUNITY — {symbol}</b>\n\n"
                             f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
                             f"⚡ Volume still strong: {vol_ratio_bp:.1f}x | Buy: {buy_ratio_bp*100:.0f}%\n\n"
@@ -3537,7 +3791,7 @@ def check_scalp_trades():
                 warning = check_2m_reversal_structure(symbol)
                 if warning and now - trade.get("last_downside_alert", 0) > 1800:
                     trade["last_downside_alert"] = now
-                    send_to_topic(TOPIC_BIG_PUMP,
+                    send_to_topic(TOPIC_SPIKES,
                         f"⚠️ <b>Downside Risk — {symbol}</b>\n\n"
                         f"💰 Now: {format_price(current_price)} ({pnl_pct:+.1f}% from entry)\n"
                         f"   {warning}\n\n"
@@ -4143,11 +4397,32 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
     tp2_pct = (tp2 - current_price) / current_price * 100
     hist_note = get_pattern_history_stats(source_signal, min_samples=3)
 
+    # User insight: low-volume/low-liquidity coins tend to repeatedly sweep
+    # and consolidate/chop sideways; HIGH-volume coins (1H candle quote
+    # volume in the millions+) tend to spend less time sideways and pump
+    # with cleaner structure once they move. Use recent 1H quote volume as
+    # a liquidity-tier signal shown in the alert.
+    liquidity_note = ""
+    try:
+        klines_1h_liq = get_klines(symbol, interval="1h", limit=5)
+        if klines_1h_liq and len(klines_1h_liq) >= 2:
+            last_1h = klines_1h_liq[-2]  # last closed
+            quote_vol_1h = float(last_1h[7]) if len(last_1h) > 7 else float(last_1h[5]) * current_price
+            if quote_vol_1h >= 5_000_000:
+                liquidity_note = f"💎 High liquidity (${quote_vol_1h/1e6:.1f}M/1H) — historically cleaner structure, less chop\n"
+            elif quote_vol_1h >= 1_000_000:
+                liquidity_note = f"💰 Solid liquidity (${quote_vol_1h/1e6:.1f}M/1H)\n"
+            else:
+                liquidity_note = f"⚠️ Lower liquidity (${quote_vol_1h/1e6:.2f}M/1H) — more prone to choppy consolidation\n"
+    except Exception:
+        pass
+
     _big_pump_alerted[symbol] = now
     send_to_topic(TOPIC_BIG_PUMP,
         f"🚀 <b>BIG PUMP ALERT — {symbol}</b>\n\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"📡 Source: {source_signal}\n"
+        f"{liquidity_note}"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
         f"📐 Entry: {format_price(current_price)}\n"
         f"🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
@@ -4158,6 +4433,18 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
     )
     print(f"🚀 Big Pump alert: {symbol} @ {format_price(current_price)} (TP2 +{tp2_pct:.1f}%)")
     start_big_pump_watch(symbol, current_price, source_signal)
+    # Broad category bucketing (not the raw dynamic source_signal string) so
+    # the quality report groups meaningfully instead of fragmenting into
+    # many one-off buckets.
+    if "Extreme Pump" in source_signal:
+        _qsrc = "Extreme Pump Bypass"
+    elif "Manual Line Break" in source_signal:
+        _qsrc = "Manual Line Break"
+    elif "BTC Divergence" in source_signal:
+        _qsrc = "BTC Divergence"
+    else:
+        _qsrc = "High Confidence (score-based)"
+    track_bigpump_quality(symbol, _qsrc, current_price)
 
 
 _big_pump_watch = {}  # {symbol: {"alert_price": float, "started": time, "source": str, "confirmed": bool}}
@@ -4176,6 +4463,32 @@ def start_big_pump_watch(symbol, alert_price, source_signal):
             "source": source_signal,
             "confirmed": False,
         }
+
+def _check_tf_retest_passed(symbol, tf):
+    """
+    Lightweight retest check for a single timeframe — did price break above
+    a recent local level, dip back to test it, and reclaim with a green
+    candle? Used to add a retest-confluence bonus point in
+    check_high_confidence_signal (checked across 5M/15M/1H/4H).
+    """
+    try:
+        klines = get_klines(symbol, interval=tf, limit=15)
+        if not klines or len(klines) < 10:
+            return False
+        closed = klines[:-1]
+        recent = closed[-10:]
+        highs = [float(k[2]) for k in recent[:-3]]
+        if not highs:
+            return False
+        local_level = max(highs)
+        last = recent[-1]
+        l_open, l_close = float(last[1]), float(last[4])
+        dipped = any(float(k[3]) <= local_level * 1.01 for k in recent[-4:-1])
+        reclaimed = l_close > l_open and l_close > local_level * 0.995
+        return dipped and reclaimed
+    except Exception:
+        return False
+
 
 def _check_tf_pump_signal(symbol, tf, limit=12):
     """
@@ -4206,7 +4519,7 @@ def _check_tf_pump_signal(symbol, tf, limit=12):
 
 _shared_retest_watch = {}  # {key: {...}} — shared multi-timeframe retest state machine
 
-def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_sequence=None, chat_id=None):
+def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_sequence=None, chat_id=None, silent=False, on_hold=None):
     """
     Shared multi-timeframe retest-monitoring watch (notes #1 and #6).
     Escalates 5M → 15M → 30M → 1H(→4H): watches for price to dip back to
@@ -4215,6 +4528,13 @@ def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_seq
     the sequence). If retest fails on 2 different timeframes, that's treated
     as a real warning sign and reported directly instead of silently retrying
     forever.
+
+    silent=True (note #2): suppresses the generic "retest held"/"failed
+    twice" status messages entirely — monitoring stays fully internal. If
+    the retest genuinely holds, on_hold(symbol, current_price, tf) is called
+    instead (e.g. to feed a real Big-Pump-style alert into the proper
+    pipeline) rather than posting a plain FYI. Failures just resolve with
+    no message at all in silent mode.
     """
     if key in _shared_retest_watch:
         return
@@ -4223,7 +4543,7 @@ def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_seq
         "context": context, "header": header,
         "tf_sequence": tf_sequence or ["5m", "15m", "30m", "1h"],
         "tf_index": 0, "fail_count": 0, "state": "waiting_dip",
-        "started": time.time(),
+        "started": time.time(), "silent": silent, "on_hold": on_hold,
     }
 
 def check_shared_retest_watches():
@@ -4251,14 +4571,21 @@ def check_shared_retest_watches():
                     w["state"] = "dipped"
             elif w["state"] == "dipped":
                 if l_close > level and l_close > l_open:
-                    # Retest held — notify and finish
-                    send_to_topic(w["topic"],
-                        f"{w['header']}\n\n{w['context']}\n\n"
-                        f"✅ Retest held on {tf.upper()} — reclaimed with a green candle.\n"
-                        f"💰 Now: {format_price(current_price)}"
-                    )
-                    if w.get("chat_id"):
-                        send_to(w["chat_id"], f"{w['header']} — retest held on {tf.upper()}, now {format_price(current_price)}")
+                    # Retest held
+                    if w.get("silent"):
+                        if w.get("on_hold"):
+                            try:
+                                w["on_hold"](symbol, current_price, tf)
+                            except Exception as e:
+                                print(f"Retest watch on_hold callback error {symbol}: {e}")
+                    else:
+                        send_to_topic(w["topic"],
+                            f"{w['header']}\n\n{w['context']}\n\n"
+                            f"✅ Retest held on {tf.upper()} — reclaimed with a green candle.\n"
+                            f"💰 Now: {format_price(current_price)}"
+                        )
+                        if w.get("chat_id"):
+                            send_to(w["chat_id"], f"{w['header']} — retest held on {tf.upper()}, now {format_price(current_price)}")
                     to_remove.append(key)
                     print(f"✅ Retest watch held: {symbol} [{tf.upper()}]")
                     continue
@@ -4268,15 +4595,16 @@ def check_shared_retest_watches():
                     w["tf_index"] += 1
                     w["state"] = "waiting_dip"
                     if w["fail_count"] >= 2:
-                        send_to_topic(w["topic"],
-                            f"⚠️ <b>Retest Failed Twice — {symbol}</b>\n\n"
-                            f"{w['context']}\n\n"
-                            f"Retest failed on 2 different timeframes — something's off with this move, "
-                            f"be cautious here.\n"
-                            f"💰 Now: {format_price(current_price)}"
-                        )
+                        if not w.get("silent"):
+                            send_to_topic(w["topic"],
+                                f"⚠️ <b>Retest Failed Twice — {symbol}</b>\n\n"
+                                f"{w['context']}\n\n"
+                                f"Retest failed on 2 different timeframes — something's off with this move, "
+                                f"be cautious here.\n"
+                                f"💰 Now: {format_price(current_price)}"
+                            )
                         to_remove.append(key)
-                        print(f"⚠️ Retest watch failed twice: {symbol}")
+                        print(f"⚠️ Retest watch failed twice: {symbol}{' [silent]' if w.get('silent') else ''}")
                         continue
                     if w["tf_index"] >= len(w["tf_sequence"]):
                         to_remove.append(key)  # exhausted the sequence quietly
@@ -4284,6 +4612,84 @@ def check_shared_retest_watches():
             print(f"Retest watch error {key}: {e}")
     for k in to_remove:
         _shared_retest_watch.pop(k, None)
+
+
+def check_high_priority_frequency_pipeline():
+    """
+    This is now the ONLY path into High Priority, replacing the old
+    score>=4/fast-pumper/extreme-pump-bypass triggers entirely. PRIMARY
+    trigger: live volume+price development right now (2+/3 timeframes
+    agreeing, same "developing" check used by check_big_pump_watches).
+    Repeat frequency across Top Picks/My Setups/Big Pump (how many times
+    a symbol has shown up in the last 24h) is a BONUS/confidence booster
+    shown in the message, not a hard requirement — the original 3+ minimum
+    was too strict and let almost nothing through.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        try:
+            if symbol in removed_coins:
+                continue
+            if now - _freq_pipeline_alerted.get(symbol, 0) < 6 * 3600:
+                continue
+
+            tf_results = {}
+            for tf in ("5m", "15m", "1h"):
+                tf_results[tf] = _check_tf_pump_signal(symbol, tf)
+            developing_count = sum(1 for d, _, _ in tf_results.values() if d)
+            if developing_count < 2:
+                continue  # primary gate: live cross-timeframe agreement
+
+            entry = _topic_signal_frequency.get(symbol, {"timestamps": []})
+            timestamps = [t for t in entry["timestamps"] if now - t < 24 * 3600]
+            entry["timestamps"] = timestamps
+
+            ticker = get_ticker(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker["lastPrice"])
+
+            display_vol_ratio, display_buy_ratio = 0, 0.5
+            for tf in ("5m", "15m", "1h"):
+                d, vr, br = tf_results[tf]
+                if d:
+                    display_vol_ratio, display_buy_ratio = vr, br
+                    break
+
+            # Lightweight confluence context (same cheap pattern used by
+            # check_big_pump_watches' PUMP CONFIRMED) — not the full heavy
+            # /entry analysis, to avoid delaying this time-sensitive alert.
+            extra_lines = []
+            klines_4h = get_klines(symbol, interval="4h", limit=30)
+            if klines_4h:
+                closed_4h = klines_4h[:-1]
+                extra_lines.append("✅ Daily trend bullish/neutral" if not is_daily_downtrend(symbol, current_price) else "❌ Daily trend bearish")
+                extra_lines.append(f"{'✅' if display_buy_ratio >= 0.55 else '🔴'} BS Pressure: {'Positive' if display_buy_ratio >= 0.55 else 'Negative'} ({display_buy_ratio*100:.0f}% buy)")
+                avg_v4h = sum(float(k[5]) for k in closed_4h[-10:]) / 10 or 1
+                for k in reversed(closed_4h[-15:]):
+                    ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+                    if kc > ko and kv >= avg_v4h * 1.3 and kl <= current_price <= kh * 1.05:
+                        extra_lines.append(f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}")
+                        break
+
+            freq_note = f"📊 Appeared {len(timestamps)}x across Top Picks/My Setups/Big Pump in 24h — bonus confidence\n" if timestamps else ""
+            extra_str = ("\n" + "\n".join(f"   {l}" for l in extra_lines) + "\n") if extra_lines else ""
+            confirmed_tfs = [tf.upper() for tf, (d, _, _) in tf_results.items() if d]
+
+            _freq_pipeline_alerted[symbol] = now
+            send_to_topic(TOPIC_HIGH,
+                f"🚀 <b>PUMP CONFIRMED — {symbol}</b> [{'+'.join(confirmed_tfs)}]\n\n"
+                + freq_note +
+                f"⚡ Volume: {display_vol_ratio:.1f}x | Buy: {display_buy_ratio*100:.0f}%\n"
+                f"💰 Price: {format_price(current_price)}\n"
+                + extra_str +
+                f"\n✅ Live volume/price confirmation — real pump likely starting.\n"
+                f"⚠️ <i>Confirm on chart before entry.</i>"
+            )
+            track_bigpump_quality(symbol, "Frequency Pipeline (High Priority)", current_price)
+            print(f"🚀 Frequency pipeline → High Priority: {symbol} ({len(timestamps)}x in 24h, {developing_count}/3 tf developing)")
+        except Exception as e:
+            print(f"Frequency pipeline error {symbol}: {e}")
 
 
 def check_big_pump_watches():
@@ -4377,7 +4783,7 @@ def check_big_pump_watches():
 
                 confirmed_tfs = [tf.upper() for tf, (d, _, _) in tf_results.items() if d]
                 tf_note = f" [{'+'.join(confirmed_tfs)}]" if confirmed_tfs else ""
-                send_to_topic(TOPIC_HIGH,
+                send_to_topic(TOPIC_TOP_PICKS,
                     f"🚀 <b>PUMP CONFIRMED — {symbol}</b>{tf_note}\n\n"
                     f"💰 Alert price: {format_price(watch['alert_price'])} → Now: {format_price(current_price)} "
                     f"({gain_from_alert:+.1f}%)\n"
@@ -4389,15 +4795,22 @@ def check_big_pump_watches():
                     f"⚠️ <i>Confirm on chart before entry.</i>"
                 )
                 print(f"🚀 Big Pump CONFIRMED: {symbol} {gain_from_alert:+.1f}% vol={vol_ratio:.1f}x")
+                track_bigpump_quality(symbol, "Pump Confirmed", current_price)
 
-                # Note #1: start the post-confirmation retest watch —
-                # if this coin retests instead of continuing straight up,
-                # monitor 5M→15M→30M→1H for the retest to hold or fail.
+                # Note #1/#2: silently monitor for a post-confirmation
+                # retest (5M→15M→30M→1H). No generic status pings — only if
+                # the retest genuinely HOLDS does it become a real alert
+                # (a proper Big-Pump-style message with SL/TP), not just an
+                # FYI. Failures resolve with no message at all.
+                def _on_retest_hold(sym, price, tf, _source=watch['source']):
+                    send_big_pump_alert(sym, price, f"Post-Pump Retest Held [{tf.upper()}] ({_source})")
+
                 start_shared_retest_watch(
                     key=f"{symbol}_pumpconfirm_retest",
-                    symbol=symbol, level=current_price, topic=TOPIC_HIGH,
+                    symbol=symbol, level=current_price, topic=TOPIC_BIG_PUMP,
                     header=f"🔄 <b>Post-Pump Retest — {symbol}</b>",
                     context=f"Following up on the PUMP CONFIRMED alert at {format_price(current_price)}.",
+                    silent=True, on_hold=_on_retest_hold,
                 )
         except Exception as e:
             print(f"Big pump watch error {symbol}: {e}")
@@ -6672,10 +7085,11 @@ def check_liq_watches():
 
                         low_retest_risk = rr_score >= 4
                         if low_retest_risk:
-                            send_to_topic(TOPIC_HIGH,
+                            send_to_topic(TOPIC_TOP_PICKS,
                                 f"🔥 <b>COMBINED SETUP (Low Retest Risk, score {rr_score}/6) — {symbol}</b>\n\n" + msg.split("\n\n", 1)[1]
                             )
-                            print(f"🔥 Combined setup → High Priority (score {rr_score}/6): {symbol}")
+                            print(f"🔥 Combined setup → Top Picks (score {rr_score}/6): {symbol}")
+                            track_bigpump_quality(symbol, "Combined Setup (Low Retest Risk)", current_price)
 
                     # User clarification: LIQUIDATION SWEEP COMPLETE itself
                     # isn't the High Priority message — it feeds into the
@@ -7220,14 +7634,18 @@ def start_confirm_watch(symbol, current_price, topic, label):
     }
 
 def check_confirm_watches():
-    """Runs periodically — if a watched symbol's confluence score has
-    improved since its confirmation alert fired, sends a follow-up to the
-    same topic. Expires after 48h."""
+    """Runs periodically. No more generic 'Confluence Improved' status
+    pings — stays fully internal/silent. Only when volume+price actually
+    start developing (live multi-timeframe check, same pattern used
+    elsewhere) does this escalate into a real Big Pump alert. Expires
+    after 48h."""
     now = time.time()
     to_remove = []
     for symbol, watch in list(_confirm_watch.items()):
         if now - watch["started"] > 48 * 3600:
             to_remove.append(symbol)
+            continue
+        if watch.get("escalated"):
             continue
         ticker = get_ticker(symbol)
         if not ticker:
@@ -7235,15 +7653,18 @@ def check_confirm_watches():
         current_price = float(ticker["lastPrice"])
         new_score = get_quick_confluence_score(symbol, current_price)
         if new_score > watch["score"]:
-            send_to_topic(watch["topic"],
-                f"📈 <b>Confluence Improved — {symbol}</b>\n\n"
-                f"Since the earlier {watch['label']} alert, confluence went "
-                f"{watch['score']}/4 → <b>{new_score}/4</b>.\n"
-                f"💰 Now: {format_price(current_price)}\n\n"
-                f"⚠️ <i>Confirm on chart before entry.</i>"
-            )
             watch["score"] = new_score
-            print(f"📈 Confirm watch improved: {symbol} {watch['score']}/4")
+            print(f"🔕 Confirm watch improved (silent): {symbol} {new_score}/4")
+
+        # Check for real volume+price development, not just confluence score
+        tf_results = {}
+        for tf in ("5m", "15m", "1h"):
+            tf_results[tf] = _check_tf_pump_signal(symbol, tf)
+        developing_count = sum(1 for d, _, _ in tf_results.values() if d)
+        if developing_count >= 2:
+            watch["escalated"] = True
+            send_big_pump_alert(symbol, current_price, f"Confirmed Setup Developing ({watch['label']})")
+            print(f"🚀 Confirm watch → Big Pump: {symbol}")
     for s in to_remove:
         _confirm_watch.pop(s, None)
 
@@ -7313,15 +7734,15 @@ def check_hc_followup_watches():
             current_price = float(ticker["lastPrice"])
             new_score = get_quick_confluence_score(symbol, current_price)
             if new_score > watch["score"]:
-                send_to_topic(TOPIC_TOP_PICKS,
-                    f"📈 <b>High Priority Setup Improved — {symbol}</b>\n\n"
-                    f"Confluence improved since the earlier High Priority alert: "
-                    f"{watch['score']}/4 → <b>{new_score}/4</b>\n"
-                    f"💰 Now: {format_price(current_price)}\n\n"
-                    f"⚠️ <i>Confirm on chart before entry.</i>"
-                )
+                old_score = watch["score"]
                 watch["score"] = new_score
-                print(f"📈 HC follow-up improved: {symbol} {new_score}/4")
+                # Note #2: no more generic "Setup Improved" status pings —
+                # stay silent unless this is now a genuinely strong setup
+                # (confluence maxed out), in which case feed it into the
+                # real Big Pump pipeline instead of a plain FYI.
+                if new_score >= 4:
+                    send_big_pump_alert(symbol, current_price, f"Confluence Improved {old_score}/4→{new_score}/4")
+                print(f"🔕 HC follow-up improved (silent unless maxed): {symbol} {old_score}/4→{new_score}/4")
         except Exception as e:
             print(f"HC follow-up watch error {symbol}: {e}")
     for s in to_remove:
@@ -8339,7 +8760,7 @@ def check_btc_market_condition():
     and a recovery DM when it stabilises. Checks every 4H candle.
     """
     now = time.time()
-    if now - _btc_condition["last_check"] < 3600:  # max once per hour
+    if now - _btc_condition["last_check"] < 1200:  # max once per 20 min (was 1h — too slow to catch fast drops)
         return
     _btc_condition["last_check"] = now
 
@@ -8378,10 +8799,24 @@ def check_btc_market_condition():
         ema20_1d   = calculate_ema(closes_1d, 20)
         below_ema_1d = ema20_1d and btc_price < ema20_1d
 
+    # Faster path (user reported missing a real BTC down move while waiting
+    # on 4H candles to close): check 15M candles for a rapid drop too, so a
+    # fast move doesn't have to wait up to 4 hours to be noticed.
+    fast_drop = False
+    fast_drop_pct = 0
+    klines_15m = get_klines("BTCUSDT", interval="15m", limit=6)
+    if klines_15m and len(klines_15m) >= 5:
+        closed_15m = klines_15m[:-1]
+        ref_price = float(closed_15m[0][1])
+        if ref_price > 0:
+            fast_drop_pct = (btc_price - ref_price) / ref_price * 100
+            if fast_drop_pct <= -2.5:
+                fast_drop = True
+
     # Trigger conditions
-    is_warning = consec_red >= 3 or last_4h_change <= -3.0 or below_ema_4h
+    is_warning = consec_red >= 3 or last_4h_change <= -3.0 or below_ema_4h or fast_drop
     is_bearish = (consec_red >= 4 or below_ema_1d or
-                  (below_ema_4h and consec_red >= 2))
+                  (below_ema_4h and consec_red >= 2) or fast_drop_pct <= -4.0)
 
     new_state = "bearish" if is_bearish else ("warning" if is_warning else "neutral")
     old_state = _btc_condition["state"]
@@ -8400,6 +8835,8 @@ def check_btc_market_condition():
             reasons.append(f"price below 4H 20EMA ({format_price(ema20_4h)})")
         if below_ema_1d:
             reasons.append("price below 1D 20EMA — serious")
+        if fast_drop:
+            reasons.append(f"fast drop: {fast_drop_pct:.1f}% in last ~75min (15M)")
         send_to(ADMIN_CHAT_ID,
             f"{emoji} <b>BTC TREND SHIFT — {'BEARISH' if new_state == 'bearish' else 'WARNING'}</b>\n\n"
             f"💰 BTC: {format_price(btc_price)} ({change_24h:+.2f}% 24h)\n"
@@ -8731,6 +9168,16 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
         if not sweep_found:
             details.append("— No liq sweep")
 
+        # ── Retest confirmed on 2+ timeframes (user request) — checks
+        # 5M/15M/1H/4H for a pullback-and-reclaim pattern; 2+ passing is
+        # treated as extra power/conviction.
+        retest_tfs_passed = [tf for tf in ("5m", "15m", "1h", "4h") if _check_tf_retest_passed(symbol, tf)]
+        if len(retest_tfs_passed) >= 2:
+            score += 1
+            details.append(f"✅ Retest confirmed on {len(retest_tfs_passed)}/4 timeframes ({'+'.join(t.upper() for t in retest_tfs_passed)})")
+        else:
+            details.append(f"⚠️ Retest confirmed on {len(retest_tfs_passed)}/4 timeframes")
+
         # Fire if score >= required_score (3 for high-winrate types, 2 otherwise)
         if score < required_score:
             # Note #12: don't just drop low-confluence signals — if volume is
@@ -8773,7 +9220,7 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
         hc_msg = (
             f"⭐ <b>HIGH CONFIDENCE — {symbol}</b>\n\n"
             f"{winrate_line}"
-            f"📊 Confluence Score: {score}/6\n\n"
+            f"📊 Confluence Score: {score}/7\n\n"
             f"{details_str}\n\n"
             f"📐 Entry: {format_price(current_price)}\n"
             f"🔴 SL: {format_price(sl)} (-{risk:.1f}%)\n"
@@ -8782,14 +9229,15 @@ def check_high_confidence_signal(symbol, signal_type, current_price):
             f"⚠️ <i>Confirm on chart before entry.</i>"
         )
         send_to_topic(TOPIC_BUILDUPS, hc_msg)
-        if score >= 6:
-            # Top Picks (note #11) is reserved exclusively for perfect 6/6
-            # confluence scores — the absolute best-scoring signals get a copy.
+        # User simplification: score>=4 → Top Picks (regardless of
+        # fast-pumper status), score<4 → internal monitoring only (still
+        # tracked via TOPIC_BUILDUPS above and the frequency pipeline, just
+        # no Top Picks copy).
+        if score >= 7:
             send_to_topic(TOPIC_TOP_PICKS, "🏆 <b>PERFECT SCORE</b>\n\n" + hc_msg)
-        elif fast_pumper and score >= 4:
-            # Note #3: fast-pumper coins get a lower Top Picks bar too (4+, not 6/6)
-            send_to_topic(TOPIC_TOP_PICKS, "⚡ <b>FAST PUMPER</b>\n\n" + hc_msg)
-        print(f"⭐ High confidence: {symbol} score={score}/6 signal={signal_type}")
+        elif score >= 4:
+            send_to_topic(TOPIC_TOP_PICKS, hc_msg)
+        print(f"⭐ High confidence: {symbol} score={score}/7 signal={signal_type}")
         start_prospect_watch(symbol, signal_type)
         start_hc_followup_watch(symbol, current_price)
 
@@ -8871,6 +9319,21 @@ def check_scalp_opportunity(symbol):
     if big_swing_count < 1:
         return  # not volatile enough historically — core filter per user's request
 
+    # Note (rework after poor real-world results — 100% SL hit rate incl.
+    # "Extra Strong" confirms): don't fight a clear higher-timeframe
+    # downtrend. A 5M local bounce inside an active 1H downtrend is very
+    # often a dead-cat bounce, not a genuine reversal — this alone was
+    # likely the biggest source of false positives.
+    if is_daily_downtrend(symbol, current_price):
+        klines_1h_trend = get_klines(symbol, interval="1h", limit=8)
+        if klines_1h_trend and len(klines_1h_trend) >= 6:
+            closed_1h_trend = klines_1h_trend[:-1]
+            recent_1h_closes = [float(k[4]) for k in closed_1h_trend[-5:]]
+            # If daily is bearish AND the last few 1H candles are also
+            # trending down (lower closes), skip — too likely a fakeout.
+            if recent_1h_closes[-1] < recent_1h_closes[0]:
+                return
+
     # Local liquidity sweep + reclaim on the most recent 5M candles
     recent = closed_5m[-20:]
     if len(recent) < 15:
@@ -8881,19 +9344,28 @@ def check_scalp_opportunity(symbol):
         return
 
     last = recent[-1]
+    prev = recent[-2]
     l_open, l_close = float(last[1]), float(last[4])
     l_vol = float(last[5])
     l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
     buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
 
-    swept = any(float(k[3]) <= local_swing_low * 1.008 for k in recent[-4:-1])
-    reclaimed = l_close > l_open and l_close > local_swing_low
+    swept = any(float(k[3]) <= local_swing_low * 1.008 for k in recent[-5:-1])
+    # Stronger confirmation: require the close to hold meaningfully above
+    # the swept level (not just a hair above it), AND the PRIOR candle to
+    # already be back above the level too — one candle alone can be a wick
+    # trap; two in a row holding is a more genuine reclaim.
+    reclaimed = (
+        l_close > l_open and
+        l_close > local_swing_low * 1.005 and
+        float(prev[4]) > local_swing_low
+    )
 
     prior_vols = [float(k[5]) for k in recent[-8:-1]]
     avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
     vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
 
-    if not (swept and reclaimed and vol_ratio >= 2.0 and buy_ratio >= 0.55):
+    if not (swept and reclaimed and vol_ratio >= 2.5 and buy_ratio >= 0.60):
         return
 
     # Bonus SMC confluence — OB zone nearby (preferred, not required)
@@ -8913,11 +9385,20 @@ def check_scalp_opportunity(symbol):
     if tp1_pct < 4.0:
         return  # not worth it — too little room to the next resistance
 
-    sl = local_swing_low * 0.995
+    # SL fix: was only 0.5% below local_swing_low, which is the PRE-sweep
+    # reference level — the actual sweep wick (recent[-4:-1]) can dip lower
+    # than that, and normal 5M noise easily re-tests the same wick area,
+    # causing premature stop-outs. Use the true lowest point of the sweep
+    # itself, with a wider buffer.
+    sweep_candle_lows = [float(k[3]) for k in recent[-4:-1]]
+    sweep_low = min(sweep_candle_lows + [local_swing_low])
+    sl = sweep_low * 0.985  # 1.5% buffer below the actual sweep low
     sl_pct = (current_price - sl) / current_price * 100
+    if sl_pct > 8.0:
+        return  # SL too far away for a scalp — not a clean setup
 
     _scalp_alerted[symbol] = now
-    send_to_topic(TOPIC_BIG_PUMP,
+    send_to_topic(TOPIC_SPIKES,
         f"⚡ <b>SCALP SETUP — {symbol}</b> [for scalping]\n\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"💧 Local liquidity swept & reclaimed: {format_price(local_swing_low)}\n"
@@ -9128,7 +9609,7 @@ def check_whale_trades(symbol):
     current_price = float(ticker["lastPrice"]) if ticker else float(latest["p"])
 
     _whale_trade_alerted[symbol] = now
-    send_to_topic(TOPIC_SPIKES,
+    send_to_topic(TOPIC_BUILDUPS,
         f"🐋 <b>Large trade detected — {symbol}</b>\n\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"💵 Trade size: ${latest_value:,.0f} ({ratio:.0f}x typical trade size)\n"
@@ -11212,6 +11693,16 @@ def handle_commands():
                             except (KeyError, ValueError):
                                 reply("⚠️ Format is wrong. Example:\n<code>/st GPS entry=0.00762 sl=0.00700 tp1=0.00850</code>")
 
+                elif text == "/QUALITY":
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        report = generate_bigpump_quality_report()
+                        if report:
+                            reply(report)
+                        else:
+                            reply("📊 Not enough resolved signals yet (each needs 3 days to resolve). Check back soon.")
+
                 elif text == "/TRADES":
                     if not is_admin:
                         reply( "⚠️ Admin only.")
@@ -11402,6 +11893,16 @@ def main():
 
     Thread(target=run_btc_divergence_scanner, daemon=True).start()
 
+    def run_btc_condition_checker():
+        while True:
+            try:
+                check_btc_market_condition()
+            except Exception as e:
+                print(f"BTC condition check error: {e}")
+            time.sleep(600)  # every 10 minutes, independent of the full watchlist scan
+
+    Thread(target=run_btc_condition_checker, daemon=True).start()
+
     def run_scalp_scanner():
         while True:
             try:
@@ -11427,6 +11928,33 @@ def main():
             time.sleep(60)  # tight SL needs quick updates
 
     Thread(target=run_scalp_trade_monitor, daemon=True).start()
+
+    def run_bigpump_quality_checker():
+        while True:
+            try:
+                check_bigpump_quality_tracking()
+            except Exception as e:
+                print(f"Big Pump quality tracking error: {e}")
+            time.sleep(3600)  # every hour — tracking peak/lowest price, not urgent
+
+    Thread(target=run_bigpump_quality_checker, daemon=True).start()
+
+    _last_quality_report = [0]
+    def run_bigpump_quality_report():
+        while True:
+            try:
+                now = time.time()
+                if now - _last_quality_report[0] >= 7 * 24 * 3600:
+                    report = generate_bigpump_quality_report()
+                    if report:
+                        send_to(ADMIN_CHAT_ID, report)
+                        print("📊 Sent weekly Big Pump quality report")
+                    _last_quality_report[0] = now
+            except Exception as e:
+                print(f"Big Pump quality report error: {e}")
+            time.sleep(3600)  # check hourly whether it's time for the weekly report
+
+    Thread(target=run_bigpump_quality_report, daemon=True).start()
 
     def run_valid_ob_scanner():
         while True:
@@ -11483,6 +12011,16 @@ def main():
             time.sleep(300)  # every 5 minutes
 
     Thread(target=run_big_pump_watch_checker, daemon=True).start()
+
+    def run_frequency_pipeline_checker():
+        while True:
+            try:
+                check_high_priority_frequency_pipeline()
+            except Exception as e:
+                print(f"Frequency pipeline check error: {e}")
+            time.sleep(300)  # every 5 minutes
+
+    Thread(target=run_frequency_pipeline_checker, daemon=True).start()
 
     def run_retest_watch_checker():
         while True:
