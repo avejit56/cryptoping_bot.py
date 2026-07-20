@@ -11895,6 +11895,65 @@ def handle_commands():
                             else:
                                 reply( f"⚠️ No active trade found for: {arg}\nUse /trades to see the list")
 
+                elif raw_text.upper().startswith("/SR "):
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        sym_raw = raw_text.strip().split(None, 1)[1].strip().upper()
+                        if not is_plausible_symbol(sym_raw):
+                            reply(f"⚠️ '{sym_raw}' doesn't look like a valid symbol.")
+                        else:
+                            sym_query = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                            removed = []
+
+                            if sym_query in _liq_watch:
+                                _liq_watch.pop(sym_query, None); removed.append("Liq watch")
+                            if sym_query in _entry_watch:
+                                _entry_watch.pop(sym_query, None); removed.append("Entry watch")
+                            if sym_query in _prospect_watch:
+                                _prospect_watch.pop(sym_query, None); removed.append("Prospect watch")
+                            if sym_query in _hc_followup_watch:
+                                _hc_followup_watch.pop(sym_query, None); removed.append("HC follow-up")
+                            if sym_query in _confirm_watch:
+                                _confirm_watch.pop(sym_query, None); removed.append("Confirm watch")
+                            if sym_query in _big_pump_watch:
+                                _big_pump_watch.pop(sym_query, None); removed.append("Big Pump watch")
+                            if sym_query in _milestone_watch:
+                                _milestone_watch.pop(sym_query, None); removed.append("Milestone watch")
+                            if sym_query in _topic_signal_frequency:
+                                _topic_signal_frequency.pop(sym_query, None); removed.append("Frequency tracking")
+
+                            retest_keys = [k for k, w in _shared_retest_watch.items() if w.get("symbol") == sym_query]
+                            for k in retest_keys:
+                                _shared_retest_watch.pop(k, None)
+                            if retest_keys:
+                                removed.append(f"Retest watch ({len(retest_keys)})")
+
+                            scalp_ids = [tid for tid, t in _scalp_trades.items() if t.get("symbol") == sym_query]
+                            for tid in scalp_ids:
+                                _scalp_trades.pop(tid, None)
+                            if scalp_ids:
+                                removed.append(f"Scalp trade ({len(scalp_ids)})")
+
+                            trade_ids = [tid for tid, t in active_trades.items() if t.get("symbol", "").upper() == sym_query]
+                            for tid in trade_ids:
+                                active_trades.pop(tid, None)
+                                trade_alert_cooldown.pop(tid, None)
+                            if trade_ids:
+                                removed.append(f"Active trade ({len(trade_ids)})")
+                                save_active_trades()
+
+                            old_watch_keys = [k for k, w in retest_watch_list.items() if w.get("symbol") == sym_query]
+                            for k in old_watch_keys:
+                                retest_watch_list.pop(k, None)
+                            if old_watch_keys:
+                                removed.append(f"/watch ({len(old_watch_keys)})")
+
+                            if removed:
+                                reply(f"🗑 Removed {sym_query} from monitoring:\n" + "\n".join(f"• {r}" for r in removed))
+                            else:
+                                reply(f"⚠️ {sym_query} wasn't found in any active monitoring.")
+
         except Exception as e:
             print(f"Command error: {e}")
         time.sleep(2)
@@ -11959,6 +12018,7 @@ def main():
         f"• ⚡ Re-pump detection for sideways→breakout moves with no retest\n"
         f"• 🔥 Follow-through score on Volume Spike/Explosive Pump\n"
         f"• 💼 Active Trade Monitor (/trade, /trades, /closetrade or /TR <symbol>)\n"
+        f"• 🗑 /SR <symbol> — remove a coin from ALL monitoring (watches, trades, tracking)\n"
         f"• 📊 EMA + candle/volume + structure combo trend score\n"
         f"• 📈 Dynamic SL trail suggestion (1R/2R)\n"
         f"• 🎯 4H↔Daily zone confluence tagging\n"
