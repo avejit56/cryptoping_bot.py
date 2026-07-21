@@ -4639,7 +4639,7 @@ def check_milestone_watches():
     check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
     now = time.time()
     to_remove = []
-    milestones = [4, 8, 15, 20, 25, 30, 40, 50, 75, 100]
+    milestones = [4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
     for symbol, w in list(_milestone_watch.items()):
         if now - w["started"] > 72 * 3600:
             to_remove.append(symbol)
@@ -4657,13 +4657,26 @@ def check_milestone_watches():
                 if gain_pct >= m and m not in w["milestones_hit"]:
                     w["milestones_hit"].append(m)
                     opinion, caution, retest_likely = _build_milestone_commentary(symbol, current_price, gain_pct)
+
+                    # Frequency-based confidence note (same data used by the
+                    # High Priority frequency pipeline) — extra context on
+                    # how often this coin has shown up recently.
+                    freq_entry = _topic_signal_frequency.get(symbol, {"timestamps": []})
+                    freq_count = len([t for t in freq_entry["timestamps"] if now - t < 24 * 3600])
+                    freq_note = f"📊 Appeared {freq_count}x across High Priority/Top Picks/My Setups/Big Pump in 24h — bonus confidence\n\n" if freq_count >= 2 else ""
+
                     msg = (
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
                         f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
+                        + freq_note
                         + (f"💡 {opinion}\n\n" if opinion else "")
                         + (f"⚠️ {caution}\n" if caution else "")
                     )
-                    send_to_topic(w["topic"], msg)
+                    # User request: all milestone messages go to Scalping
+                    # (TOPIC_SPIKES) specifically, regardless of the topic
+                    # the original alert came from — Scalping gets few
+                    # messages otherwise, so this adds more opportunities there.
+                    send_to_topic(TOPIC_SPIKES, msg)
                     print(f"📈 Milestone +{m}%: {symbol}")
 
                     # If a retest looks likely, start a silent watch — when
@@ -4672,9 +4685,9 @@ def check_milestone_watches():
                     # trigger above already covers that case naturally.
                     if retest_likely and not w.get("retest_pending"):
                         w["retest_pending"] = True
-                        def _on_milestone_retest_hold(sym, price, tf, _topic=w["topic"], _alert_price=w["alert_price"]):
+                        def _on_milestone_retest_hold(sym, price, tf, _alert_price=w["alert_price"]):
                             gain_now = (price - _alert_price) / _alert_price * 100
-                            send_to_topic(_topic,
+                            send_to_topic(TOPIC_SPIKES,
                                 f"🔄 <b>Retest Held, Resuming — {sym}</b>\n\n"
                                 f"✅ Retest held on {tf.upper()} — pump may continue.\n"
                                 f"💰 Now: {format_price(price)} (+{gain_now:.1f}% from original alert)"
@@ -4683,7 +4696,7 @@ def check_milestone_watches():
                                 _milestone_watch[sym]["retest_pending"] = False
                         start_shared_retest_watch(
                             key=f"{symbol}_milestone_retest",
-                            symbol=symbol, level=current_price * 0.97, topic=w["topic"],
+                            symbol=symbol, level=current_price * 0.97, topic=TOPIC_SPIKES,
                             header=f"🔄 <b>Milestone Retest — {symbol}</b>",
                             context="", silent=True, on_hold=_on_milestone_retest_hold,
                         )
@@ -4697,7 +4710,7 @@ def check_milestone_watches():
                 weak_warning = check_2m_reversal_structure(symbol)
                 if weak_warning:
                     w["last_weak_alert"] = now
-                    send_to_topic(w["topic"],
+                    send_to_topic(TOPIC_SPIKES,
                         f"⚠️ <b>Structure Weakening — {symbol}</b>\n\n"
                         f"💰 Now: {format_price(current_price)} (+{gain_pct:.1f}% from alert price {format_price(w['alert_price'])})\n"
                         f"   {weak_warning}\n\n"
