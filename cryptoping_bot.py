@@ -4710,6 +4710,8 @@ def check_milestone_watches():
                 weak_warning = check_2m_reversal_structure(symbol)
                 if weak_warning:
                     w["last_weak_alert"] = now
+                    w["weak_since_price"] = current_price
+                    w["weakening_active"] = True
                     send_to_topic(TOPIC_SPIKES,
                         f"⚠️ <b>Structure Weakening — {symbol}</b>\n\n"
                         f"💰 Now: {format_price(current_price)} (+{gain_pct:.1f}% from alert price {format_price(w['alert_price'])})\n"
@@ -4717,6 +4719,39 @@ def check_milestone_watches():
                         f"💡 Consider securing profit — momentum may be turning."
                     )
                     print(f"⚠️ Milestone structure weakening: {symbol}")
+
+            # FIX (ONDOUSDT case): after a Structure Weakening alert, there
+            # was no follow-up if the coin recovered and resumed growing —
+            # user got the warning but no notice when it turned back around.
+            # Track this: once weakening fired, if price later makes a new
+            # high above the weakening-alert price with decent volume/buy
+            # pressure, send a "Resumed Growth" notification.
+            if w.get("weakening_active"):
+                weak_since = w.get("weak_since_price", current_price)
+                if current_price > weak_since * 1.02:
+                    klines_5m_rec = get_klines(symbol, interval="5m", limit=8)
+                    resumed = False
+                    if klines_5m_rec and len(klines_5m_rec) >= 6:
+                        closed_rec = klines_5m_rec[:-1]
+                        last_rec = closed_rec[-1]
+                        lv_rec = float(last_rec[5])
+                        lb_rec = float(last_rec[9]) if len(last_rec) > 9 else lv_rec * 0.5
+                        buy_ratio_rec = lb_rec / lv_rec if lv_rec > 0 else 0.5
+                        prior_vols_rec = [float(k[5]) for k in closed_rec[-6:-1]]
+                        avg_vol_rec = sum(prior_vols_rec) / len(prior_vols_rec) if prior_vols_rec else 1
+                        vol_ratio_rec = lv_rec / avg_vol_rec if avg_vol_rec > 0 else 0
+                        if vol_ratio_rec >= 1.5 and buy_ratio_rec >= 0.55:
+                            resumed = True
+                    if resumed:
+                        w["weakening_active"] = False
+                        gain_from_alert = (current_price - w["alert_price"]) / w["alert_price"] * 100
+                        send_to_topic(TOPIC_SPIKES,
+                            f"🔄 <b>Resumed Growth — {symbol}</b>\n\n"
+                            f"Growth resumed after the earlier Structure Weakening warning.\n"
+                            f"💰 Now: {format_price(current_price)} (+{gain_from_alert:.1f}% from original alert)\n\n"
+                            f"⚠️ <i>Confirm on chart before entry.</i>"
+                        )
+                        print(f"🔄 Milestone resumed growth: {symbol}")
         except Exception as e:
             print(f"Milestone watch error {symbol}: {e}")
     for s in to_remove:
@@ -9465,6 +9500,14 @@ def check_scalp_opportunity(symbol):
     """
     now = time.time()
     if now - _scalp_alerted.get(symbol, 0) < 90 * 60:  # 1.5h — allows repeat entries per day
+        return
+
+    # FIX: don't fire a new SCALP SETUP while one is already active for this
+    # symbol (DGBUSDT case — a second setup fired at a higher price while
+    # the first trade was still open, creating confusing/conflicting
+    # signals and duplicate "Extra Strong" confirmations for what was really
+    # the same move).
+    if any(t.get("symbol") == symbol and not t.get("closed") for t in _scalp_trades.values()):
         return
 
     ticker = get_ticker(symbol)
