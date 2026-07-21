@@ -4639,7 +4639,7 @@ def check_milestone_watches():
     check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
     now = time.time()
     to_remove = []
-    milestones = [5, 10, 15, 20, 25, 30, 40, 50, 75, 100]
+    milestones = [4, 8, 15, 20, 25, 30, 40, 50, 75, 100]
     for symbol, w in list(_milestone_watch.items()):
         if now - w["started"] > 72 * 3600:
             to_remove.append(symbol)
