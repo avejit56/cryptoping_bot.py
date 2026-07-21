@@ -4688,6 +4688,22 @@ def check_milestone_watches():
                             context="", silent=True, on_hold=_on_milestone_retest_hold,
                         )
                     break
+
+            # Structure-weakening check (reuses the same CHoCH/LH + volume
+            # flow detection built for the Scalp Trade Monitor) — once a
+            # milestone coin has moved up meaningfully, warn if the
+            # structure starts breaking down, not just track upside.
+            if gain_pct >= 5 and now - w.get("last_weak_alert", 0) > 1800:
+                weak_warning = check_2m_reversal_structure(symbol)
+                if weak_warning:
+                    w["last_weak_alert"] = now
+                    send_to_topic(w["topic"],
+                        f"⚠️ <b>Structure Weakening — {symbol}</b>\n\n"
+                        f"💰 Now: {format_price(current_price)} (+{gain_pct:.1f}% from alert price {format_price(w['alert_price'])})\n"
+                        f"   {weak_warning}\n\n"
+                        f"💡 Consider securing profit — momentum may be turning."
+                    )
+                    print(f"⚠️ Milestone structure weakening: {symbol}")
         except Exception as e:
             print(f"Milestone watch error {symbol}: {e}")
     for s in to_remove:
