@@ -4634,6 +4634,86 @@ def _build_milestone_commentary(symbol, current_price, gain_pct):
         print(f"Milestone commentary error {symbol}: {e}")
     return opinion, caution, retest_likely
 
+_milestone_scan_alerted = {}  # {symbol: last_scan_time} — separate cooldown for the direct scanner
+
+def scan_for_milestone_candidates():
+    """
+    OPN case: milestone tracking only started once a message hit one of the
+    4 topics (My Setups/High Priority/Scalping/Big Pump) — a coin that
+    pumped without triggering ANY other detector never got picked up at
+    all. This scans the whole watchlist directly for a sudden good
+    volume+price move and registers it into milestone tracking on its own,
+    independent of every other signal type, so nothing with real
+    volume/price movement gets missed just because no other detector fired.
+    """
+    now = time.time()
+    for symbol in list(watchlist):
+        try:
+            if symbol in removed_coins or symbol in _milestone_watch:
+                continue
+            if now - _milestone_scan_alerted.get(symbol, 0) < 3 * 3600:
+                continue
+
+            klines_15m = get_klines(symbol, interval="15m", limit=20)
+            if not klines_15m or len(klines_15m) < 15:
+                continue
+            closed = klines_15m[:-1]
+            recent = closed[-12:]
+            baseline_price = float(recent[0][1])  # open of the earliest candle in this window
+            last_close = float(recent[-1][4])
+            if baseline_price <= 0:
+                continue
+            gain_pct = (last_close - baseline_price) / baseline_price * 100
+            if gain_pct < 4.0:
+                continue  # below the first milestone threshold — not worth tracking yet
+
+            last = recent[-1]
+            l_vol = float(last[5])
+            l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+            buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+            prior_vols = [float(k[5]) for k in recent[:-1]]
+            avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+            if vol_ratio < 2.0 or buy_ratio < 0.55:
+                continue  # needs real volume/buy conviction behind the move, not just drift
+
+            # Trend filter (same approach as the Scalping scanner): don't
+            # chase a move that's fighting a clear downtrend — likely a
+            # dead-cat bounce, not real continuation.
+            if is_daily_downtrend(symbol, last_close):
+                klines_1h_trend = get_klines(symbol, interval="1h", limit=8)
+                if klines_1h_trend and len(klines_1h_trend) >= 6:
+                    closed_1h_trend = klines_1h_trend[:-1]
+                    recent_1h_closes = [float(k[4]) for k in closed_1h_trend[-5:]]
+                    if recent_1h_closes[-1] < recent_1h_closes[0]:
+                        continue
+
+            # SMC check: require a real OB zone or liquidity sweep nearby —
+            # not just a raw volume/price move — to cut down false positives.
+            klines_4h_smc = get_klines(symbol, interval="4h", limit=30)
+            has_smc_confluence = False
+            if klines_4h_smc and len(klines_4h_smc) >= 15:
+                closed_4h_smc = klines_4h_smc[:-1]
+                avg_v4h_smc = sum(float(k[5]) for k in closed_4h_smc[-10:]) / 10 or 1
+                for k in reversed(closed_4h_smc[-15:]):
+                    ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+                    if kc > ko and kv >= avg_v4h_smc * 1.3 and kl <= last_close <= kh * 1.05:
+                        has_smc_confluence = True
+                        break
+                if not has_smc_confluence:
+                    eql_data_smc = detect_equal_highs_lows(klines_4h_smc, last_close)
+                    has_smc_confluence = bool(eql_data_smc.get("eq_lows"))
+            if not has_smc_confluence:
+                continue  # no OB zone or liquidity sweep structure nearby — skip
+
+            _milestone_scan_alerted[symbol] = now
+            start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES)
+            print(f"📈 Milestone candidate (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
+        except Exception as e:
+            print(f"Milestone candidate scan error {symbol}: {e}")
+
+
 def check_milestone_watches():
     """Runs periodically for up to 72h per watch. Fires ONE milestone per
     check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
@@ -12321,6 +12401,16 @@ def main():
             time.sleep(180)  # every 3 minutes — catches milestones promptly
 
     Thread(target=run_milestone_watch_checker, daemon=True).start()
+
+    def run_milestone_scan():
+        while True:
+            try:
+                scan_for_milestone_candidates()
+            except Exception as e:
+                print(f"Milestone candidate scan error: {e}")
+            time.sleep(300)  # every 5 minutes across the whole watchlist
+
+    Thread(target=run_milestone_scan, daemon=True).start()
 
     def run_whale_trade_scanner():
         while True:
