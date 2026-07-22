@@ -3379,6 +3379,48 @@ def check_manual_lines():
                 # so this specific setup can't be missed.
                 if tf == "1h":
                     send_big_pump_alert(symbol, current_price, "Manual Line Break [1H]")
+
+                    # User request: a SPECIAL flag in My Setups specifically
+                    # when this 1H line break has BOTH abnormal volume AND
+                    # proper SMC confluence (OB zone / liquidity sweep) —
+                    # this combination is what precedes the "hut hat" (sudden)
+                    # big pumps on some coins.
+                    try:
+                        klines_4h_smc = get_klines(symbol, interval="4h", limit=30)
+                        has_smc = False
+                        smc_note = ""
+                        if klines_4h_smc and len(klines_4h_smc) >= 15:
+                            closed_4h_smc = klines_4h_smc[:-1]
+                            avg_v4h_smc = sum(float(k[5]) for k in closed_4h_smc[-10:]) / 10 or 1
+                            for k in reversed(closed_4h_smc[-15:]):
+                                ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+                                if kc > ko and kv >= avg_v4h_smc * 1.3 and kl <= current_price <= kh * 1.05:
+                                    has_smc = True
+                                    smc_note = f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}"
+                                    break
+                            if not has_smc:
+                                eql_data_smc = detect_equal_highs_lows(klines_4h_smc, current_price)
+                                if eql_data_smc.get("eq_lows"):
+                                    eql = eql_data_smc["eq_lows"][0]
+                                    has_smc = True
+                                    smc_note = f"💧 Liquidity sweep zone: EQL {format_price(eql['price'])} ({eql['touches']}x tested)"
+
+                        if has_smc and vol_ratio >= 5.0:
+                            special_msg = (
+                                f"🚨 <b>ABNORMAL VOLUME LINE BREAK — {symbol}</b>\n\n"
+                                f"📍 Broke {format_price(level)} with {vol_ratio:.1f}x volume + proper SMC confluence\n"
+                                f"{smc_note}\n"
+                                f"💰 Price: {format_price(current_price)}\n\n"
+                                f"💡 This combination (abnormal volume + real structure) often precedes a sudden, "
+                                f"fast pump — worth watching closely.\n"
+                                f"⚠️ <i>Confirm on chart before entry.</i>"
+                            )
+                            send_to_topic(TOPIC_MY_SETUPS, special_msg)
+                            if chat_id:
+                                send_to(chat_id, special_msg)
+                            print(f"🚨 Abnormal volume line break: {symbol} vol={vol_ratio:.1f}x")
+                    except Exception as e:
+                        print(f"Abnormal volume line break check error {symbol}: {e}")
             continue
 
         # ── broken → retest confirmed / failed ──
