@@ -3839,17 +3839,22 @@ def check_scalp_trades():
         _scalp_trades.pop(t, None)
 
 
-def check_2m_reversal_structure(symbol):
+def check_2m_reversal_structure(symbol, interval="1m"):
     """
-    Note #8 (Trade Monitor 2M enhancement): watches SEVERAL 2M candles (not
-    a single one) for early reversal signs — volume in/out flow shifting
-    from buying to selling, plus SMC structure: CHoCH (Change of Character)
-    and LH (Lower High) formation. Requires at least 2 of these 3 signals
+    Note #8 (Trade Monitor enhancement): watches SEVERAL candles (not a
+    single one) for early reversal signs — volume in/out flow shifting from
+    buying to selling, plus SMC structure: CHoCH (Change of Character) and
+    LH (Lower High) formation. Requires at least 2 of these 3 signals
     together to reduce noise. Returns a warning string or None.
+
+    interval defaults to "1m" (fast reaction for tight-SL Scalp trades).
+    XECUSDT case: milestone-tracked moves span hours, not minutes — 1m
+    noise triggered a false "weakening" alert during a genuinely strong
+    uptrend. Pass interval="5m" (or slower) for moves tracked over a
+    longer horizon so normal 1-minute noise doesn't get mistaken for a
+    real reversal.
     """
-    # FIX: Binance has no "2m" kline interval (valid: 1m,3m,5m,15m,30m,1h...)
-    # — was causing repeated "Invalid interval" 400 errors. Use "1m" instead.
-    klines_2m = get_klines(symbol, interval="1m", limit=20)
+    klines_2m = get_klines(symbol, interval=interval, limit=20)
     if not klines_2m or len(klines_2m) < 15:
         return None
     closed = klines_2m[:-1]
@@ -4048,8 +4053,10 @@ def check_active_trades_fast():
                 if sell_spike_1h:
                     alerts.append(f"⚡ 1H sell spike ({vols_1h[-1]/avg_vol_1h:.1f}x) — distribution risk")
 
-            # Note #8: 2M multi-candle volume flow + SMC structure (CHoCH/LH)
-            two_m_warning = check_2m_reversal_structure(symbol)
+            # Note #8: multi-candle volume flow + SMC structure (CHoCH/LH).
+            # Uses 5m (not 1m) here — regular /trade positions aren't
+            # scalp-speed, so 1-minute noise was too sensitive.
+            two_m_warning = check_2m_reversal_structure(symbol, interval="5m")
             if two_m_warning:
                 alerts.append(two_m_warning)
 
@@ -4787,7 +4794,7 @@ def check_milestone_watches():
             # milestone coin has moved up meaningfully, warn if the
             # structure starts breaking down, not just track upside.
             if gain_pct >= 5 and now - w.get("last_weak_alert", 0) > 1800:
-                weak_warning = check_2m_reversal_structure(symbol)
+                weak_warning = check_2m_reversal_structure(symbol, interval="5m")
                 if weak_warning:
                     w["last_weak_alert"] = now
                     w["weak_since_price"] = current_price
