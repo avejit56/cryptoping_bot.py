@@ -4687,13 +4687,17 @@ _milestone_scan_alerted = {}  # {symbol: last_scan_time} — separate cooldown f
 
 def scan_for_milestone_candidates():
     """
-    OPN case: milestone tracking only started once a message hit one of the
-    4 topics (My Setups/High Priority/Scalping/Big Pump) — a coin that
+    OPN/XEC case: milestone tracking only started once a message hit one of
+    the 4 topics (My Setups/High Priority/Scalping/Big Pump) — a coin that
     pumped without triggering ANY other detector never got picked up at
-    all. This scans the whole watchlist directly for a sudden good
-    volume+price move and registers it into milestone tracking on its own,
-    independent of every other signal type, so nothing with real
-    volume/price movement gets missed just because no other detector fired.
+    all, and by the time other detectors fired, a chunk of the move (like
+    XEC's 25%+/67%+ runs) was often already gone. This scans the whole
+    watchlist directly for the EARLY signs of an abnormal move — price
+    already +2.5% above its own recent baseline AND volume clearly above
+    that same coin's own recent average (not a fixed number) — and sends
+    an early prospect alert to Scalping plus registers it for +4% Milestone
+    tracking, so the rest of the move (if it develops into a real pump)
+    gets followed automatically.
     """
     now = time.time()
     for symbol in list(watchlist):
@@ -4713,8 +4717,8 @@ def scan_for_milestone_candidates():
             if baseline_price <= 0:
                 continue
             gain_pct = (last_close - baseline_price) / baseline_price * 100
-            if gain_pct < 4.0:
-                continue  # below the first milestone threshold — not worth tracking yet
+            if gain_pct < 2.5:
+                continue  # catch it early — user wants +2-3% deviation, not waiting for +4%+
 
             last = recent[-1]
             l_vol = float(last[5])
@@ -4742,6 +4746,7 @@ def scan_for_milestone_candidates():
             # not just a raw volume/price move — to cut down false positives.
             klines_4h_smc = get_klines(symbol, interval="4h", limit=30)
             has_smc_confluence = False
+            smc_note = ""
             if klines_4h_smc and len(klines_4h_smc) >= 15:
                 closed_4h_smc = klines_4h_smc[:-1]
                 avg_v4h_smc = sum(float(k[5]) for k in closed_4h_smc[-10:]) / 10 or 1
@@ -4749,16 +4754,29 @@ def scan_for_milestone_candidates():
                     ko, kc, kh, kl, kv = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
                     if kc > ko and kv >= avg_v4h_smc * 1.3 and kl <= last_close <= kh * 1.05:
                         has_smc_confluence = True
+                        smc_note = f"🔲 OB zone: {format_price(kl)}–{format_price(kh)}"
                         break
                 if not has_smc_confluence:
                     eql_data_smc = detect_equal_highs_lows(klines_4h_smc, last_close)
-                    has_smc_confluence = bool(eql_data_smc.get("eq_lows"))
+                    if eql_data_smc.get("eq_lows"):
+                        eql = eql_data_smc["eq_lows"][0]
+                        has_smc_confluence = True
+                        smc_note = f"💧 Liquidity sweep zone: EQL {format_price(eql['price'])} ({eql['touches']}x tested)"
             if not has_smc_confluence:
                 continue  # no OB zone or liquidity sweep structure nearby — skip
 
             _milestone_scan_alerted[symbol] = now
+            send_to_topic(TOPIC_SPIKES,
+                f"🔍 <b>Early Prospect — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(last_close)} (+{gain_pct:.1f}% above its own recent baseline)\n"
+                f"⚡ Volume: {vol_ratio:.1f}x above this coin's own recent average | Buy: {buy_ratio*100:.0f}%\n"
+                f"{smc_note}\n\n"
+                f"💡 Early signs of an abnormal move — price and volume both breaking above normal "
+                f"levels together. Now tracking for +4%/+10%/+15%... milestones.\n"
+                f"⚠️ <i>Confirm on chart before entry.</i>"
+            )
             start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES)
-            print(f"📈 Milestone candidate (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
+            print(f"🔍 Early prospect (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
         except Exception as e:
             print(f"Milestone candidate scan error {symbol}: {e}")
 
