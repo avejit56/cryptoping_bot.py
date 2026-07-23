@@ -4868,25 +4868,25 @@ def scan_for_milestone_candidates():
     gets followed automatically.
     """
     now = time.time()
-    for symbol in list(watchlist):
+    def _check_one(symbol):
         try:
             if symbol in removed_coins or symbol in _milestone_watch:
-                continue
+                return
             if now - _milestone_scan_alerted.get(symbol, 0) < 3 * 3600:
-                continue
+                return
 
             klines_15m = get_klines(symbol, interval="15m", limit=20)
             if not klines_15m or len(klines_15m) < 15:
-                continue
+                return
             closed = klines_15m[:-1]
             recent = closed[-12:]
             baseline_price = float(recent[0][1])  # open of the earliest candle in this window
             last_close = float(recent[-1][4])
             if baseline_price <= 0:
-                continue
+                return
             gain_pct = (last_close - baseline_price) / baseline_price * 100
             if gain_pct < 1.0:
-                continue  # catch it early — user wants +1% deviation now for the First Entry feed
+                return  # catch it early — user wants +1% deviation now for the First Entry feed
 
             last = recent[-1]
             l_vol = float(last[5])
@@ -4897,7 +4897,7 @@ def scan_for_milestone_candidates():
             vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
 
             if vol_ratio < 2.0 or buy_ratio < 0.55:
-                continue  # needs real volume/buy conviction behind the move, not just drift
+                return  # needs real volume/buy conviction behind the move, not just drift
 
             # Trend filter (same approach as the Scalping scanner): don't
             # chase a move that's fighting a clear downtrend — likely a
@@ -4908,7 +4908,7 @@ def scan_for_milestone_candidates():
                     closed_1h_trend = klines_1h_trend[:-1]
                     recent_1h_closes = [float(k[4]) for k in closed_1h_trend[-5:]]
                     if recent_1h_closes[-1] < recent_1h_closes[0]:
-                        continue
+                        return
 
             # SMC check: require a real OB zone or liquidity sweep nearby —
             # not just a raw volume/price move — to cut down false positives.
@@ -4931,7 +4931,7 @@ def scan_for_milestone_candidates():
                         has_smc_confluence = True
                         smc_note = f"💧 Liquidity sweep zone: EQL {format_price(eql['price'])} ({eql['touches']}x tested)"
             if not has_smc_confluence:
-                continue  # no OB zone or liquidity sweep structure nearby — skip
+                return  # no OB zone or liquidity sweep structure nearby — skip
 
             # Historical/coiling-based opinion (reuses the same
             # last-pump-size logic used for Milestone updates) — gives a
@@ -4964,14 +4964,17 @@ def scan_for_milestone_candidates():
                 f"levels together. Now tracking for +1%/+2%/+4%/+10%/+15%... milestones.\n"
                 f"⚠️ <i>Confirm on chart before entry.</i>"
             )
-            send_to_topic(TOPIC_SPIKES, msg)
-            # User's dedicated "First Entry" group/topic — same abnormal-
-            # volume prospects, elevated importance in their own space.
+            # User request: this rich volume+fast-entry analysis now goes
+            # ONLY to the dedicated First Entry group, not Scalping anymore.
             send_to_first_entry_group(TOPIC_FIRST_ENTRY, msg)
             start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES, initial_gain_pct=gain_pct)
             print(f"🔍 Early prospect (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
         except Exception as e:
             print(f"Milestone candidate scan error {symbol}: {e}")
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        list(executor.map(_check_one, list(watchlist)))
+
 
 
 def check_milestone_watches():
@@ -5041,12 +5044,8 @@ def check_milestone_watches():
                         + (f"💡 {opinion}\n\n" if opinion else "")
                         + (f"⚠️ {caution}\n" if caution else "")
                     )
-                    # User request: all milestone messages go to Scalping
-                    # (TOPIC_SPIKES) specifically, regardless of the topic
-                    # the original alert came from — Scalping gets few
-                    # messages otherwise, so this adds more opportunities there.
-                    send_to_topic(TOPIC_SPIKES, msg)
-                    # Also feed the dedicated First Entry group/topic
+                    # User request: this volume+fast-entry analysis now goes
+                    # ONLY to the dedicated First Entry group, not Scalping.
                     send_to_first_entry_group(TOPIC_FIRST_ENTRY, msg)
                     print(f"📈 Milestone +{m}%: {symbol}")
 
@@ -5058,7 +5057,7 @@ def check_milestone_watches():
                         w["retest_pending"] = True
                         def _on_milestone_retest_hold(sym, price, tf, _alert_price=w["alert_price"]):
                             gain_now = (price - _alert_price) / _alert_price * 100
-                            send_to_topic(TOPIC_SPIKES,
+                            send_to_first_entry_group(TOPIC_FIRST_ENTRY,
                                 f"🔄 <b>Retest Held, Resuming — {sym}</b>\n\n"
                                 f"✅ Retest held on {tf.upper()} — pump may continue.\n"
                                 f"💰 Now: {format_price(price)} (+{gain_now:.1f}% from original alert)"
@@ -5083,7 +5082,7 @@ def check_milestone_watches():
                     w["last_weak_alert"] = now
                     w["weak_since_price"] = current_price
                     w["weakening_active"] = True
-                    send_to_topic(TOPIC_SPIKES,
+                    send_to_first_entry_group(TOPIC_FIRST_ENTRY,
                         f"⚠️ <b>Structure Weakening — {symbol}</b>\n\n"
                         f"💰 Now: {format_price(current_price)} (+{gain_pct:.1f}% from alert price {format_price(w['alert_price'])})\n"
                         f"   {weak_warning}\n\n"
@@ -5116,7 +5115,7 @@ def check_milestone_watches():
                     if resumed:
                         w["weakening_active"] = False
                         gain_from_alert = (current_price - w["alert_price"]) / w["alert_price"] * 100
-                        send_to_topic(TOPIC_SPIKES,
+                        send_to_first_entry_group(TOPIC_FIRST_ENTRY,
                             f"🔄 <b>Resumed Growth — {symbol}</b>\n\n"
                             f"Growth resumed after the earlier Structure Weakening warning.\n"
                             f"💰 Now: {format_price(current_price)} (+{gain_from_alert:.1f}% from original alert)\n\n"
@@ -12700,7 +12699,7 @@ def main():
                 scan_for_milestone_candidates()
             except Exception as e:
                 print(f"Milestone candidate scan error: {e}")
-            time.sleep(120)  # every 2 minutes — was 5min, too slow for very fast movers
+            time.sleep(60)  # every 1 minute — reduced further now that the scan is parallelized (10 workers), so a full pass is much faster than before
 
     Thread(target=run_milestone_scan, daemon=True).start()
 
