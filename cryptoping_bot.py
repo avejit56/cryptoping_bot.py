@@ -97,6 +97,11 @@ CHECK_INTERVAL = 5 * 60
 
 # CryptoPing Alerts Group — categorized topics
 ALERTS_GROUP_ID = "-1003765700295"
+# User's new dedicated group — elevated-importance feed, separate from the
+# main ROY Alerts group.
+FIRST_ENTRY_GROUP_ID = "-1004488607772"
+TOPIC_1H_LINE_CROSS = 2   # "1H line cross" — user's manual 1H line breaks only
+TOPIC_FIRST_ENTRY = 3     # "First entry" — sudden abnormal-volume prospects only
 TOPIC_HIGH        = 2     # 🎯 High Priority Signals
 TOPIC_SPIKES      = 3     # ⚡ Scalping (renamed from Quick Spikes — user repurposed this topic)
 TOPIC_BUILDUPS    = 4     # 📈 Building Momentum
@@ -771,7 +776,7 @@ def start_milestone_watch(symbol, alert_price, topic, initial_gain_pct=None):
         return
     milestones_hit = []
     if initial_gain_pct is not None:
-        for m in [2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]:
+        for m in [1, 2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]:
             if initial_gain_pct >= m:
                 milestones_hit.append(m)
     _milestone_watch[symbol] = {
@@ -817,6 +822,35 @@ def send_to_topic(topic_id, message):
                     print(f"⚠️ send_to_topic plain-text retry exception: {e2}")
     except Exception as e:
         print(f"⚠️ send_to_topic exception: {e}")
+
+def send_to_first_entry_group(topic_id, message):
+    """Send a message to the dedicated First Entry / 1H Line Cross group
+    (separate from the main ROY Alerts group) — same HTML-fallback pattern
+    as send_to_topic."""
+    try:
+        r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": FIRST_ENTRY_GROUP_ID,
+                "message_thread_id": topic_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ send_to_first_entry_group failed: HTTP {r.status_code} — {r.text[:300]} (topic={topic_id})")
+            if r.status_code == 400 and "can't parse entities" in r.text.lower():
+                try:
+                    r2 = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": FIRST_ENTRY_GROUP_ID,
+                            "message_thread_id": topic_id,
+                            "text": message,
+                        }, timeout=10)
+                    if r2.status_code != 200:
+                        print(f"⚠️ send_to_first_entry_group plain-text retry also failed: HTTP {r2.status_code} — {r2.text[:200]}")
+                except Exception as e2:
+                    print(f"⚠️ send_to_first_entry_group plain-text retry exception: {e2}")
+    except Exception as e:
+        print(f"⚠️ send_to_first_entry_group exception: {e}")
 
 def send_chunked(chat_id, lines, header=""):
     """
@@ -3420,13 +3454,14 @@ def check_manual_lines():
                 # into the Big Pump pipeline (with an approximate % target),
                 # so this specific setup can't be missed.
                 if tf == "1h":
-                    send_big_pump_alert(symbol, current_price, "Manual Line Break [1H]")
+                    send_big_pump_alert(symbol, current_price, "Manual Line Break [1H]", dest_override="first_entry_1h_line")
 
-                    # User request: a SPECIAL flag in My Setups specifically
-                    # when this 1H line break has BOTH abnormal volume AND
-                    # proper SMC confluence (OB zone / liquidity sweep) —
-                    # this combination is what precedes the "hut hat" (sudden)
-                    # big pumps on some coins.
+                    # User request: a SPECIAL flag specifically when this 1H
+                    # line break has BOTH abnormal volume AND proper SMC
+                    # confluence (OB zone / liquidity sweep) — this
+                    # combination is what precedes the "hut hat" (sudden)
+                    # big pumps on some coins. Now routes to the dedicated
+                    # "1H line cross" topic in the new group, not My Setups.
                     try:
                         klines_4h_smc = get_klines(symbol, interval="4h", limit=30)
                         has_smc = False
@@ -3457,7 +3492,7 @@ def check_manual_lines():
                                 f"fast pump — worth watching closely.\n"
                                 f"⚠️ <i>Confirm on chart before entry.</i>"
                             )
-                            send_to_topic(TOPIC_MY_SETUPS, special_msg)
+                            send_to_first_entry_group(TOPIC_1H_LINE_CROSS, special_msg)
                             if chat_id:
                                 send_to(chat_id, special_msg)
                             print(f"🚨 Abnormal volume line break: {symbol} vol={vol_ratio:.1f}x")
@@ -4472,7 +4507,7 @@ def send_extreme_pump_alert(symbol, current_price, gain_pct, vol_ratio, buy_rati
 
 _big_pump_alerted = {}  # {symbol: last_alert_time}
 
-def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
+def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None, dest_override=None):
     """
     Note #7: dedicated "last line of defense" alert for the user's Big Pump
     topic (TOPIC_BIG_PUMP). For coins showing strong signs of an actual big
@@ -4548,7 +4583,7 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
         pass
 
     _big_pump_alerted[symbol] = now
-    send_to_topic(TOPIC_BIG_PUMP,
+    msg_out = (
         f"🚀 <b>BIG PUMP ALERT — {symbol}</b>\n\n"
         f"💰 Price: {format_price(current_price)}\n"
         f"📡 Source: {source_signal}\n"
@@ -4561,6 +4596,10 @@ def send_big_pump_alert(symbol, current_price, source_signal, klines_4h=None):
         + (f"   {hist_note}\n" if hist_note else "") +
         f"\n⚠️ <i>Confirm on chart before entry. Use stop-loss.</i>"
     )
+    if dest_override == "first_entry_1h_line":
+        send_to_first_entry_group(TOPIC_1H_LINE_CROSS, msg_out)
+    else:
+        send_to_topic(TOPIC_BIG_PUMP, msg_out)
     print(f"🚀 Big Pump alert: {symbol} @ {format_price(current_price)} (TP2 +{tp2_pct:.1f}%)")
     start_big_pump_watch(symbol, current_price, source_signal)
     # Broad category bucketing (not the raw dynamic source_signal string) so
@@ -4790,6 +4829,30 @@ def _build_milestone_commentary(symbol, current_price, gain_pct):
 
 _milestone_scan_alerted = {}  # {symbol: last_scan_time} — separate cooldown for the direct scanner
 
+def _check_micro_volume_suggestion(symbol):
+    """
+    ZKCUSDT case (user request): before/alongside milestone messages,
+    analyze the PRECEDING several 1M candles' volume specifically — compare
+    recent 1M volume against this coin's own recent average at that micro
+    timeframe. A sudden 1M spike (even before the 15m-based detection fully
+    triggers) gives earlier lead time. Returns a suggestion string or "".
+    """
+    try:
+        klines_1m = get_klines(symbol, interval="1m", limit=15)
+        if not klines_1m or len(klines_1m) < 12:
+            return ""
+        closed_1m = klines_1m[:-1]
+        recent_1m = closed_1m[-8:]
+        vols_1m = [float(k[5]) for k in recent_1m]
+        avg_1m = sum(vols_1m[:-2]) / len(vols_1m[:-2]) if len(vols_1m) > 2 else 1
+        last_1m_vol = sum(vols_1m[-2:]) / 2
+        vol_ratio_1m = last_1m_vol / avg_1m if avg_1m > 0 else 0
+        if vol_ratio_1m >= 3.0:
+            return f"⚡ 1M volume spike: {vol_ratio_1m:.1f}x above this coin's own recent 1M average — early lead-time signal"
+    except Exception:
+        pass
+    return ""
+
 def scan_for_milestone_candidates():
     """
     OPN/XEC case: milestone tracking only started once a message hit one of
@@ -4822,8 +4885,8 @@ def scan_for_milestone_candidates():
             if baseline_price <= 0:
                 continue
             gain_pct = (last_close - baseline_price) / baseline_price * 100
-            if gain_pct < 2.0:
-                continue  # catch it early — user wants +2% deviation now, not waiting for +2.5%+
+            if gain_pct < 1.0:
+                continue  # catch it early — user wants +1% deviation now for the First Entry feed
 
             last = recent[-1]
             l_vol = float(last[5])
@@ -4884,18 +4947,27 @@ def scan_for_milestone_candidates():
                     breakout_tfs.append(tf_check.upper())
             breakout_note = f"🚀 Breakout developing on: {'+'.join(breakout_tfs)}\n" if breakout_tfs else ""
 
+            # Micro-timeframe (1M) volume-spike suggestion — earlier
+            # lead-time signal, checked at every stage per user's request.
+            micro_note = _check_micro_volume_suggestion(symbol)
+
             _milestone_scan_alerted[symbol] = now
-            send_to_topic(TOPIC_SPIKES,
+            msg = (
                 f"🔍 <b>Early Prospect — {symbol}</b>\n\n"
                 f"💰 Price: {format_price(last_close)} (+{gain_pct:.1f}% above its own recent baseline)\n"
                 f"⚡ Volume: {vol_ratio:.1f}x above this coin's own recent average | Buy: {buy_ratio*100:.0f}%\n"
                 f"{smc_note}\n"
-                f"{breakout_note}\n"
+                f"{breakout_note}"
+                + (f"{micro_note}\n" if micro_note else "") + "\n"
                 + (f"💡 {opinion}\n\n" if opinion else "")
                 + f"Early signs of an abnormal move — price and volume both breaking above normal "
-                f"levels together. Now tracking for +2%/+10%/+15%... milestones.\n"
+                f"levels together. Now tracking for +1%/+2%/+4%/+10%/+15%... milestones.\n"
                 f"⚠️ <i>Confirm on chart before entry.</i>"
             )
+            send_to_topic(TOPIC_SPIKES, msg)
+            # User's dedicated "First Entry" group/topic — same abnormal-
+            # volume prospects, elevated importance in their own space.
+            send_to_first_entry_group(TOPIC_FIRST_ENTRY, msg)
             start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES, initial_gain_pct=gain_pct)
             print(f"🔍 Early prospect (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
         except Exception as e:
@@ -4907,7 +4979,7 @@ def check_milestone_watches():
     check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
     now = time.time()
     to_remove = []
-    milestones = [2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
+    milestones = [1, 2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
     for symbol, w in list(_milestone_watch.items()):
         if now - w["started"] > 72 * 3600:
             to_remove.append(symbol)
@@ -4955,12 +5027,17 @@ def check_milestone_watches():
                     freq_count = len([t for t in freq_entry["timestamps"] if now - t < 24 * 3600])
                     freq_note = f"📊 Appeared {freq_count}x across High Priority/Top Picks/My Setups/Big Pump in 24h — bonus confidence\n\n" if freq_count >= 2 else ""
 
+                    # Micro-timeframe (1M) volume-spike suggestion — checked
+                    # at EVERY milestone stage per user's request, not just once.
+                    micro_note = _check_micro_volume_suggestion(symbol)
+
                     msg = (
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
                         f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
                         + freq_note
                         + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
                         + (special_4pct_note + "\n" if special_4pct_note else "")
+                        + (f"{micro_note}\n\n" if micro_note else "")
                         + (f"💡 {opinion}\n\n" if opinion else "")
                         + (f"⚠️ {caution}\n" if caution else "")
                     )
@@ -4969,6 +5046,8 @@ def check_milestone_watches():
                     # the original alert came from — Scalping gets few
                     # messages otherwise, so this adds more opportunities there.
                     send_to_topic(TOPIC_SPIKES, msg)
+                    # Also feed the dedicated First Entry group/topic
+                    send_to_first_entry_group(TOPIC_FIRST_ENTRY, msg)
                     print(f"📈 Milestone +{m}%: {symbol}")
 
                     # If a retest looks likely, start a silent watch — when
@@ -12611,7 +12690,7 @@ def main():
                 check_milestone_watches()
             except Exception as e:
                 print(f"Milestone watch check error: {e}")
-            time.sleep(180)  # every 3 minutes — catches milestones promptly
+            time.sleep(60)  # every 1 minute — fast movers (ZKCUSDT case) need quicker reaction
 
     Thread(target=run_milestone_watch_checker, daemon=True).start()
 
@@ -12621,7 +12700,7 @@ def main():
                 scan_for_milestone_candidates()
             except Exception as e:
                 print(f"Milestone candidate scan error: {e}")
-            time.sleep(300)  # every 5 minutes across the whole watchlist
+            time.sleep(120)  # every 2 minutes — was 5min, too slow for very fast movers
 
     Thread(target=run_milestone_scan, daemon=True).start()
 
