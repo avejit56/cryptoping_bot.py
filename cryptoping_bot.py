@@ -904,6 +904,38 @@ def build_report(window_seconds, window_label):
 
 _coil_pattern_tracked = {}  # {symbol: last_tracked_time} — 24h cooldown for signal_performance recording
 
+def check_fake_pump_risk(symbol, buy_ratio):
+    """
+    XNOUSDT case: multiple bullish confirmations fired (Scalp Confirmed
+    Extra Strong, Bigger Opportunity, +4%/+10% Milestones with 'retest
+    possibility looks low') but the move reversed hard into an SL hit —
+    a classic fake-pump/pump-and-dump signature that wasn't being flagged.
+
+    Two red flags checked together: (1) LOW 24h liquidity — thin order
+    books are easy for a single trader to push around and just as easy to
+    dump, and (2) an EXTREMELY lopsided buy ratio (95%+) — genuine broad-
+    based organic buying rarely gets this one-sided; a near-100% buy ratio
+    often means one aggressive large order is doing most of the work, not
+    real distributed demand. Neither alone is conclusive, but together
+    they're a meaningful manipulation-risk signal. Returns a caution string
+    or None.
+    """
+    try:
+        if buy_ratio < 0.95:
+            return None
+        ticker = get_ticker(symbol)
+        if not ticker:
+            return None
+        quote_vol_24h = float(ticker.get("quoteVolume", 0))
+        if quote_vol_24h < 2_000_000:
+            return (f"🚩 Manipulation risk: very lopsided buy ratio ({buy_ratio*100:.0f}%) combined with "
+                    f"low 24h liquidity (${quote_vol_24h/1e6:.1f}M) — this pattern can be one large trader "
+                    f"pushing price, not organic broad buying. Can reverse just as fast as it moved.")
+    except Exception:
+        pass
+    return None
+
+
 def get_pattern_history_stats(pattern_name, min_samples=3):
     """
     Looks up historical performance for a specific pattern/signal type (e.g.
@@ -3827,11 +3859,13 @@ def check_scalp_trades():
 
                     if vol_ratio_sc >= 4.0 and buy_ratio_sc >= 0.68 and close_position_sc >= 0.6:
                         trade["strong_confirm_sent"] = True
+                        fake_pump_note = check_fake_pump_risk(symbol, buy_ratio_sc)
                         send_to_topic(TOPIC_SPIKES,
                             f"🔥 <b>SCALP CONFIRMED — Extra Strong — {symbol}</b>\n\n"
                             f"💰 Entry: {format_price(entry)} → Now: {format_price(current_price)} ({pnl_pct:+.1f}%)\n"
                             f"⚡ Volume: {vol_ratio_sc:.1f}x | Buy: {buy_ratio_sc*100:.0f}% — stronger than the original setup\n\n"
-                            f"💡 Conviction building further — setup looks even better now.\n"
+                            + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
+                            + f"💡 Conviction building further — setup looks even better now.\n"
                             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                         )
                         print(f"🔥 Scalp extra-strong confirm: {symbol} vol={vol_ratio_sc:.1f}x buy={buy_ratio_sc*100:.0f}%")
@@ -4636,11 +4670,12 @@ def _build_milestone_commentary(symbol, current_price, gain_pct):
     """
     Builds an opinion (historical pump-size context) and a caution (how
     close the next resistance is, i.e. retest risk) for a milestone update.
-    Returns (opinion_str_or_None, caution_str_or_None, retest_likely_bool).
+    Returns (opinion_str_or_None, caution_str_or_None, retest_likely_bool, buy_ratio_now).
     """
     opinion = None
     caution = None
     retest_likely = False
+    buy_ratio_now = 0.5
     try:
         klines_1d = get_klines(symbol, interval="1d", limit=60)
         if klines_1d and len(klines_1d) >= 20:
@@ -4662,7 +4697,6 @@ def _build_milestone_commentary(symbol, current_price, gain_pct):
         if klines_4h and len(klines_4h) >= 10:
             closed_4h = klines_4h[:-1]
             highs_above = [float(k[2]) for k in closed_4h[-30:] if float(k[2]) > current_price * 1.005]
-            buy_ratio_now = 0.5
             if klines_1h and len(klines_1h) >= 3:
                 last_1h = klines_1h[:-1][-1]
                 v1h = float(last_1h[5])
@@ -4681,7 +4715,7 @@ def _build_milestone_commentary(symbol, current_price, gain_pct):
                     retest_likely = False
     except Exception as e:
         print(f"Milestone commentary error {symbol}: {e}")
-    return opinion, caution, retest_likely
+    return opinion, caution, retest_likely, buy_ratio_now
 
 _milestone_scan_alerted = {}  # {symbol: last_scan_time} — separate cooldown for the direct scanner
 
@@ -4717,8 +4751,8 @@ def scan_for_milestone_candidates():
             if baseline_price <= 0:
                 continue
             gain_pct = (last_close - baseline_price) / baseline_price * 100
-            if gain_pct < 2.5:
-                continue  # catch it early — user wants +2-3% deviation, not waiting for +4%+
+            if gain_pct < 2.0:
+                continue  # catch it early — user wants +2% deviation now, not waiting for +2.5%+
 
             last = recent[-1]
             l_vol = float(last[5])
@@ -4765,13 +4799,29 @@ def scan_for_milestone_candidates():
             if not has_smc_confluence:
                 continue  # no OB zone or liquidity sweep structure nearby — skip
 
+            # Historical/coiling-based opinion (reuses the same
+            # last-pump-size logic used for Milestone updates) — gives a
+            # sense of how big this could get if it develops.
+            opinion, _c, _r, _b = _build_milestone_commentary(symbol, last_close, gain_pct)
+
+            # Multi-timeframe breakout check — does any of 15M/1H/4H already
+            # show a developing breakout pattern (not just this one 15M window)?
+            breakout_tfs = []
+            for tf_check in ("15m", "1h", "4h"):
+                d, _, _ = _check_tf_pump_signal(symbol, tf_check)
+                if d:
+                    breakout_tfs.append(tf_check.upper())
+            breakout_note = f"🚀 Breakout developing on: {'+'.join(breakout_tfs)}\n" if breakout_tfs else ""
+
             _milestone_scan_alerted[symbol] = now
             send_to_topic(TOPIC_SPIKES,
                 f"🔍 <b>Early Prospect — {symbol}</b>\n\n"
                 f"💰 Price: {format_price(last_close)} (+{gain_pct:.1f}% above its own recent baseline)\n"
                 f"⚡ Volume: {vol_ratio:.1f}x above this coin's own recent average | Buy: {buy_ratio*100:.0f}%\n"
-                f"{smc_note}\n\n"
-                f"💡 Early signs of an abnormal move — price and volume both breaking above normal "
+                f"{smc_note}\n"
+                f"{breakout_note}\n"
+                + (f"💡 {opinion}\n\n" if opinion else "")
+                + f"Early signs of an abnormal move — price and volume both breaking above normal "
                 f"levels together. Now tracking for +4%/+10%/+15%... milestones.\n"
                 f"⚠️ <i>Confirm on chart before entry.</i>"
             )
@@ -4797,13 +4847,26 @@ def check_milestone_watches():
                 continue
             current_price = float(ticker["lastPrice"])
             gain_pct = (current_price - w["alert_price"]) / w["alert_price"] * 100
+
+            # FIX (DODOUSDT case): once a coin entered _milestone_watch it
+            # stayed there for up to 72h even if the move fully reversed —
+            # scan_for_milestone_candidates skips anything already in
+            # _milestone_watch, so a coin that pumped, dumped back down,
+            # then pumped AGAIN later never got a fresh alert for the
+            # second move. If price has fallen meaningfully below the
+            # original alert price, treat this watch as over and remove it
+            # so a genuinely new move on the same coin can be detected fresh.
+            if gain_pct < -3.0:
+                to_remove.append(symbol)
+                continue
             if gain_pct < 0:
                 continue
 
             for m in milestones:
                 if gain_pct >= m and m not in w["milestones_hit"]:
                     w["milestones_hit"].append(m)
-                    opinion, caution, retest_likely = _build_milestone_commentary(symbol, current_price, gain_pct)
+                    opinion, caution, retest_likely, milestone_buy_ratio = _build_milestone_commentary(symbol, current_price, gain_pct)
+                    fake_pump_note = check_fake_pump_risk(symbol, milestone_buy_ratio)
 
                     # Frequency-based confidence note (same data used by the
                     # High Priority frequency pipeline) — extra context on
@@ -4816,6 +4879,7 @@ def check_milestone_watches():
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
                         f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
                         + freq_note
+                        + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
                         + (f"💡 {opinion}\n\n" if opinion else "")
                         + (f"⚠️ {caution}\n" if caution else "")
                     )
@@ -9746,10 +9810,10 @@ def check_scalp_opportunity(symbol):
 
     # TP1 = next local resistance from recent 5m highs
     highs_above = [float(k[2]) for k in closed_5m[-60:] if float(k[2]) > current_price * 1.01]
-    tp1 = min(highs_above) if highs_above else current_price * 1.10
-    tp1 = max(tp1, current_price * 1.05)
+    tp1 = min(highs_above) if highs_above else current_price * 1.05
+    tp1 = max(tp1, current_price * 1.02)
     tp1_pct = (tp1 - current_price) / current_price * 100
-    if tp1_pct < 4.0:
+    if tp1_pct < 2.0:
         return  # not worth it — too little room to the next resistance
 
     # SL fix: was only 0.5% below local_swing_low, which is the PRE-sweep
@@ -9778,6 +9842,7 @@ def check_scalp_opportunity(symbol):
         f"⚠️ <i>Fast/scalp setup — confirm on chart, use a tight stop-loss.</i>"
     )
     print(f"⚡ Scalp setup: {symbol} vol={vol_ratio:.1f}x tp1=+{tp1_pct:.1f}%")
+    track_bigpump_quality(symbol, "Scalp Setup", current_price)
 
     # Auto-register for the dedicated scalp trade monitor (tight SL, fast checks)
     trade_id = f"{symbol}_scalp_{int(now)}"
