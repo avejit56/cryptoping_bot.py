@@ -752,20 +752,30 @@ def _extract_price_from_message(message):
 
 _milestone_watch = {}  # {symbol: {"alert_price": float, "milestones_hit": [...], "topic": id, "started": time}}
 
-def start_milestone_watch(symbol, alert_price, topic):
+def start_milestone_watch(symbol, alert_price, topic, initial_gain_pct=None):
     """
     Progressive milestone tracking (user request, HEMIUSDT example): once a
     coin gets an alert in My Setups or High Priority, keep watching it —
-    fire a follow-up at +5%, +10%, +15%, +20%... so an early-entry miss
+    fire a follow-up at +2%, +10%, +15%, +20%... so an early-entry miss
     doesn't become a FULL miss. Each milestone includes an opinion (based on
     historical pump size / volume) and a caution (based on how close the
     next resistance is) so the user can judge whether to chase or wait for
     a retest.
+
+    initial_gain_pct (optional): if the registering alert (e.g. "Early
+    Prospect") already announced the coin at some % gain, pass that here so
+    the SAME threshold doesn't immediately re-fire as a redundant milestone
+    message right after.
     """
     if symbol in _milestone_watch or not alert_price or alert_price <= 0:
         return
+    milestones_hit = []
+    if initial_gain_pct is not None:
+        for m in [2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]:
+            if initial_gain_pct >= m:
+                milestones_hit.append(m)
     _milestone_watch[symbol] = {
-        "alert_price": alert_price, "milestones_hit": [], "topic": topic,
+        "alert_price": alert_price, "milestones_hit": milestones_hit, "topic": topic,
         "started": time.time(), "retest_pending": False,
     }
 
@@ -4666,6 +4676,67 @@ def start_shared_retest_watch(key, symbol, level, topic, context, header, tf_seq
         "started": time.time(), "silent": silent, "on_hold": on_hold,
     }
 
+def _build_4pct_special_commentary(symbol, current_price):
+    """
+    Special richer opinion for the +4% milestone specifically (user
+    request): checks volume strength, liquidity/reclaim quality, whether
+    the recent structure is clean ("less chop") vs choppy, and whether the
+    path up to +10-20% is free of strong resistance — if so, gives a
+    realistic pump-potential range estimate (e.g. "40-80%") based on that
+    clear path plus historical pump size. Returns a formatted string or "".
+    """
+    lines = []
+    try:
+        klines_15m = get_klines(symbol, interval="15m", limit=20)
+        if klines_15m and len(klines_15m) >= 15:
+            closed_15m = klines_15m[:-1]
+            recent = closed_15m[-12:]
+
+            # Volume strength
+            vols = [float(k[5]) for k in recent]
+            avg_vol_recent = sum(vols[:-3]) / len(vols[:-3]) if len(vols) > 3 else 1
+            recent_vol = sum(vols[-3:]) / 3
+            vol_strong = recent_vol >= avg_vol_recent * 1.5
+            lines.append("✅ Volume still strong" if vol_strong else "⚠️ Volume cooling off a bit")
+
+            # Liquidity/reclaim quality — was there a genuine sweep+reclaim
+            # (not just straight-line climb)?
+            lows = [float(k[3]) for k in recent]
+            closes = [float(k[4]) for k in recent]
+            had_pullback = min(lows) < max(closes[:len(closes)//2] or closes) * 0.99
+            lines.append("✅ Liquidity swept + reclaimed cleanly" if had_pullback else "ℹ️ Straight-line move, no real pullback yet")
+
+            # "Less chop" — how many direction reversals in the recent candles?
+            directions = [1 if closes[i] > closes[i-1] else -1 for i in range(1, len(closes))]
+            reversals = sum(1 for i in range(1, len(directions)) if directions[i] != directions[i-1])
+            lines.append("✅ Clean structure, less chop" if reversals <= 4 else "⚠️ Choppier structure than ideal")
+
+        # Resistance-free zone check up to +10-20%
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        if klines_4h and len(klines_4h) >= 15:
+            closed_4h = klines_4h[:-1]
+            zone_top = current_price * 1.20
+            highs_in_zone = [float(k[2]) for k in closed_4h[-30:] if current_price * 1.03 < float(k[2]) < zone_top]
+            if not highs_in_zone:
+                klines_1d = get_klines(symbol, interval="1d", limit=60)
+                pump_est = ""
+                if klines_1d and len(klines_1d) >= 20:
+                    closed_1d = klines_1d[:-1]
+                    highs_1d = [float(k[2]) for k in closed_1d]
+                    lows_1d = [float(k[3]) for k in closed_1d]
+                    max_high = max(highs_1d)
+                    hi_idx = highs_1d.index(max_high)
+                    min_before = min(lows_1d[:hi_idx + 1]) if hi_idx > 0 else min(lows_1d)
+                    if min_before > 0:
+                        last_pump_pct = (max_high - min_before) / min_before * 100
+                        if last_pump_pct >= 30:
+                            pump_est = f" — historically this coin has run as high as +{last_pump_pct:.0f}%, so +40-80% isn't unreasonable if this continues"
+                lines.append(f"🎯 No strong resistance found before +10-20%{pump_est}")
+    except Exception as e:
+        print(f"4pct special commentary error {symbol}: {e}")
+    return "\n".join(f"   {l}" for l in lines) if lines else ""
+
+
 def _build_milestone_commentary(symbol, current_price, gain_pct):
     """
     Builds an opinion (historical pump-size context) and a caution (how
@@ -4822,10 +4893,10 @@ def scan_for_milestone_candidates():
                 f"{breakout_note}\n"
                 + (f"💡 {opinion}\n\n" if opinion else "")
                 + f"Early signs of an abnormal move — price and volume both breaking above normal "
-                f"levels together. Now tracking for +4%/+10%/+15%... milestones.\n"
+                f"levels together. Now tracking for +2%/+10%/+15%... milestones.\n"
                 f"⚠️ <i>Confirm on chart before entry.</i>"
             )
-            start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES)
+            start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES, initial_gain_pct=gain_pct)
             print(f"🔍 Early prospect (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
         except Exception as e:
             print(f"Milestone candidate scan error {symbol}: {e}")
@@ -4836,7 +4907,7 @@ def check_milestone_watches():
     check cycle (5%, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75%, 100%)."""
     now = time.time()
     to_remove = []
-    milestones = [4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
+    milestones = [2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
     for symbol, w in list(_milestone_watch.items()):
         if now - w["started"] > 72 * 3600:
             to_remove.append(symbol)
@@ -4868,6 +4939,15 @@ def check_milestone_watches():
                     opinion, caution, retest_likely, milestone_buy_ratio = _build_milestone_commentary(symbol, current_price, gain_pct)
                     fake_pump_note = check_fake_pump_risk(symbol, milestone_buy_ratio)
 
+                    # Special richer opinion specifically at the +4%
+                    # milestone (user request): volume strength, liquidity/
+                    # reclaim quality, "less chop" structure check, and
+                    # whether the path up to +10-20% is clear of strong
+                    # resistance — if so, estimate a realistic pump range.
+                    special_4pct_note = ""
+                    if m == 4:
+                        special_4pct_note = _build_4pct_special_commentary(symbol, current_price)
+
                     # Frequency-based confidence note (same data used by the
                     # High Priority frequency pipeline) — extra context on
                     # how often this coin has shown up recently.
@@ -4880,6 +4960,7 @@ def check_milestone_watches():
                         f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
                         + freq_note
                         + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
+                        + (special_4pct_note + "\n" if special_4pct_note else "")
                         + (f"💡 {opinion}\n\n" if opinion else "")
                         + (f"⚠️ {caution}\n" if caution else "")
                     )
