@@ -4776,6 +4776,119 @@ def _build_4pct_special_commentary(symbol, current_price):
     return "\n".join(f"   {l}" for l in lines) if lines else ""
 
 
+def _check_staircase_pattern(symbol, tf="1h"):
+    """
+    RIF/EPIC case (user-shared charts): both showed a "staircase"
+    continuation pattern — breakout, brief consolidation that HOLDS above
+    the prior breakout level (not a full retrace), then breakout again —
+    each leg building on the last. Detected here as ASCENDING swing lows
+    over the recent lookback (each pullback low higher than the one
+    before), which is a stronger continuation signal than simple chop
+    counting. Returns True/False.
+    """
+    try:
+        klines = get_klines(symbol, interval=tf, limit=30)
+        if not klines or len(klines) < 20:
+            return False
+        closed = klines[:-1]
+        recent = closed[-20:]
+        lows = [float(k[3]) for k in recent]
+        swing_lows = []
+        for i in range(1, len(lows) - 1):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                swing_lows.append(lows[i])
+        if len(swing_lows) < 2:
+            return False
+        return all(swing_lows[i] > swing_lows[i-1] * 0.98 for i in range(1, len(swing_lows)))
+    except Exception:
+        return False
+
+
+def _compute_power_score(symbol, current_price, buy_ratio=None):
+    """
+    Composite quality score (0-10) so the user can quickly triage which
+    milestone/prospect coins are worth real attention vs likely noise —
+    built after user feedback that most milestone messages dump shortly
+    after firing, with only a few (like RIFUSDT) actually running.
+    Combines: 24h liquidity tier, daily trend, structure/chop quality,
+    resistance-room, and fake-pump-risk. Returns (score 0-10, tier label,
+    short reason string).
+    """
+    score = 5
+    reasons = []
+    try:
+        ticker = get_ticker(symbol)
+        quote_vol_24h = float(ticker.get("quoteVolume", 0)) if ticker else 0
+
+        if quote_vol_24h >= 5_000_000:
+            score += 2
+        elif quote_vol_24h >= 1_000_000:
+            score += 1
+        elif quote_vol_24h < 500_000:
+            score -= 2
+            reasons.append("low liquidity")
+
+        if not is_daily_downtrend(symbol, current_price):
+            score += 1
+        else:
+            score -= 1
+            reasons.append("daily bearish")
+
+        klines_15m = get_klines(symbol, interval="15m", limit=20)
+        if klines_15m and len(klines_15m) >= 15:
+            closed_15m = klines_15m[:-1]
+            recent = closed_15m[-12:]
+            closes = [float(k[4]) for k in recent]
+            directions = [1 if closes[i] > closes[i-1] else -1 for i in range(1, len(closes))]
+            reversals = sum(1 for i in range(1, len(directions)) if directions[i] != directions[i-1])
+            if reversals <= 4:
+                score += 1
+            else:
+                score -= 1
+                reasons.append("choppy structure")
+
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        if klines_4h and len(klines_4h) >= 15:
+            closed_4h = klines_4h[:-1]
+            highs_above = [float(k[2]) for k in closed_4h[-30:] if float(k[2]) > current_price * 1.02]
+            if highs_above:
+                nearest_res_pct = (min(highs_above) - current_price) / current_price * 100
+                if nearest_res_pct < 3.0:
+                    score -= 1
+                    reasons.append(f"resistance only {nearest_res_pct:.1f}% away")
+                elif nearest_res_pct > 15.0:
+                    score += 1
+
+        if buy_ratio is not None:
+            fake_risk = check_fake_pump_risk(symbol, buy_ratio)
+            if fake_risk:
+                score -= 2
+                reasons.append("manipulation risk")
+
+        # RIF/EPIC case (user-shared charts): both showed a "staircase"
+        # continuation pattern — breakout, brief consolidation HOLDING
+        # above the prior level (ascending swing lows), breakout again —
+        # rather than a single spike or pure chop. This is a stronger
+        # continuation signal than the simple reversal-count chop check
+        # above, so it's checked as its own bonus factor.
+        if _check_staircase_pattern(symbol):
+            score += 2
+            reasons.append("staircase continuation structure (strong)")
+
+        score = max(0, min(10, score))
+        if score >= 8:
+            tier = "🔥 STRONG"
+        elif score >= 5:
+            tier = "⚡ MODERATE"
+        else:
+            tier = "⚠️ WEAK"
+        reason_str = ", ".join(reasons) if reasons else "clean setup, no red flags"
+    except Exception as e:
+        print(f"Power score error {symbol}: {e}")
+        score, tier, reason_str = 5, "⚡ MODERATE", "insufficient data"
+    return score, tier, reason_str
+
+
 def _build_milestone_commentary(symbol, current_price, gain_pct):
     """
     Builds an opinion (historical pump-size context) and a caution (how
@@ -4933,6 +5046,14 @@ def scan_for_milestone_candidates():
             if not has_smc_confluence:
                 return  # no OB zone or liquidity sweep structure nearby — skip
 
+            # Power Score (user request): differentiate strong vs likely-
+            # noise prospects up front. WEAK-tier (score<4, e.g. very low
+            # liquidity) gets filtered out entirely rather than adding to
+            # the message flood.
+            power_score, power_tier, power_reason = _compute_power_score(symbol, last_close, buy_ratio)
+            if power_score < 4:
+                return
+
             # Historical/coiling-based opinion (reuses the same
             # last-pump-size logic used for Milestone updates) — gives a
             # sense of how big this could get if it develops.
@@ -4954,6 +5075,7 @@ def scan_for_milestone_candidates():
             _milestone_scan_alerted[symbol] = now
             msg = (
                 f"🔍 <b>Early Prospect — {symbol}</b>\n\n"
+                f"{power_tier} (Power Score: {power_score}/10 — {power_reason})\n\n"
                 f"💰 Price: {format_price(last_close)} (+{gain_pct:.1f}% above its own recent baseline)\n"
                 f"⚡ Volume: {vol_ratio:.1f}x above this coin's own recent average | Buy: {buy_ratio*100:.0f}%\n"
                 f"{smc_note}\n"
@@ -5034,8 +5156,24 @@ def check_milestone_watches():
                     # at EVERY milestone stage per user's request, not just once.
                     micro_note = _check_micro_volume_suggestion(symbol)
 
+                    # Power Score + explicit HOLD/EXIT verdict (user
+                    # request): differentiate strong vs likely-noise
+                    # coins, and give a decisive read at each stage instead
+                    # of just passive info — reuses retest_likely/caution
+                    # plus a live structure-weakening check.
+                    power_score, power_tier, power_reason = _compute_power_score(symbol, current_price, milestone_buy_ratio)
+                    weak_check = check_2m_reversal_structure(symbol, interval="5m")
+                    if retest_likely or weak_check:
+                        verdict = "⚠️ <b>CONSIDER EXIT</b> — near resistance or structure weakening, secure profit"
+                    elif power_score >= 7:
+                        verdict = "✅ <b>HOLD</b> — strong structure, room to run"
+                    else:
+                        verdict = "⚡ <b>HOLD WITH CAUTION</b> — monitor closely, not a clean strong setup"
+
                     msg = (
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
+                        f"{power_tier} (Power Score: {power_score}/10 — {power_reason})\n"
+                        f"{verdict}\n\n"
                         f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
                         + freq_note
                         + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
