@@ -102,6 +102,7 @@ ALERTS_GROUP_ID = "-1003765700295"
 FIRST_ENTRY_GROUP_ID = "-1004488607772"
 TOPIC_1H_LINE_CROSS = 2   # "1H line cross" — user's manual 1H line breaks only
 TOPIC_FIRST_ENTRY = 3     # "First entry" — sudden abnormal-volume prospects only
+TOPIC_MONITORING = 190    # "Monitoring" — all follow-up tracking (Structure Weakening, Breakout Failed, Resumed Growth, Retest Held) for coins from this group
 TOPIC_HIGH        = 2     # 🎯 High Priority Signals
 TOPIC_SPIKES      = 3     # ⚡ Scalping (renamed from Quick Spikes — user repurposed this topic)
 TOPIC_BUILDUPS    = 4     # 📈 Building Momentum
@@ -826,7 +827,21 @@ def send_to_topic(topic_id, message):
 def send_to_first_entry_group(topic_id, message):
     """Send a message to the dedicated First Entry / 1H Line Cross group
     (separate from the main ROY Alerts group) — same HTML-fallback pattern
-    as send_to_topic."""
+    as send_to_topic.
+
+    BUG FIX (KAITOUSDT case): this function was missing the frequency-
+    tracking + milestone-watch registration hooks that send_to_topic() has
+    — meaning coins alerted here (Abnormal Volume Line Break, Manual Line
+    Break, First Entry prospects) never got followed up on. No Structure
+    Weakening or failed-breakout notification could ever fire because
+    monitoring was never even started. Now registered the same way.
+    """
+    _sym = _extract_symbol_from_message(message)
+    _price = _extract_price_from_message(message)
+    if _sym:
+        note_topic_signal(_sym)
+        if _price:
+            start_milestone_watch(_sym, _price, topic_id, initial_gain_pct=0)
     try:
         r = http_session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
@@ -3339,6 +3354,54 @@ cleanly (i.e. drops well under it), the line is marked failed and removed
 on the next check, so a single bad level doesn't sit around forever.
 """
 
+_line_early_warned = {}  # {line_id: last_warn_time}
+
+def scan_1h_line_early_warning():
+    """
+    User's hybrid request: instead of only waiting for the full 1H candle
+    to close (up to 60 min lag) before confirming a manual 1H line cross,
+    check a SHORTER timeframe (15M) for an early body-close-above-the-line
+    signal with decent volume, and send an early WARNING to the Monitoring
+    topic. This does NOT replace the full 1H confirmation (still the
+    definitive/reliable alert) — it's an earlier heads-up so the user isn't
+    left waiting an hour with zero signal. If price later falls back below
+    the line before the 1H confirms, or the 1H does confirm, either
+    outcome naturally gets covered by the existing follow-up systems.
+    """
+    now = time.time()
+    for line_id, line in list(manual_lines.items()):
+        try:
+            if line.get("tf") != "1h" or line.get("state") != "waiting":
+                continue
+            if now - _line_early_warned.get(line_id, 0) < 3 * 3600:
+                continue
+            symbol = line["symbol"]
+            level = line["price"]
+            klines_15m = get_klines(symbol, interval="15m", limit=5)
+            if not klines_15m or len(klines_15m) < 3:
+                continue
+            closed_15m = klines_15m[:-1]
+            last_15m = closed_15m[-1]
+            l_open, l_close = float(last_15m[1]), float(last_15m[4])
+            l_vol = float(last_15m[5])
+            prior_vols = [float(k[5]) for k in closed_15m[:-1]]
+            avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+            vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+
+            if l_close > l_open and l_close > level and vol_ratio >= 1.5:
+                _line_early_warned[line_id] = now
+                send_to_first_entry_group(TOPIC_MONITORING,
+                    f"⚠️ <b>Possible 1H Line Cross Forming — {symbol}</b>\n\n"
+                    f"15M candle already closed above {format_price(level)} with {vol_ratio:.1f}x volume.\n"
+                    f"💰 Now: {format_price(l_close)}\n\n"
+                    f"Early signal — faster than waiting for the full 1H close. Watching for full "
+                    f"confirmation or reversal from here."
+                )
+                print(f"⚠️ Early 1H line warning: {symbol} @ {format_price(level)}")
+        except Exception as e:
+            print(f"1H line early warning error {line_id}: {e}")
+
+
 def check_manual_lines():
     now = time.time()
     to_remove = []
@@ -5125,6 +5188,19 @@ def check_milestone_watches():
             # original alert price, treat this watch as over and remove it
             # so a genuinely new move on the same coin can be detected fresh.
             if gain_pct < -3.0:
+                # KAITOUSDT case: don't just silently drop this — if the
+                # coin had already progressed through at least one
+                # milestone (a real move was tracked), tell the user it
+                # failed/reversed instead of leaving them without any
+                # closing signal.
+                if w["milestones_hit"]:
+                    send_to_first_entry_group(TOPIC_MONITORING,
+                        f"❌ <b>Breakout Failed — {symbol}</b>\n\n"
+                        f"Price fell back below the original alert level.\n"
+                        f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} ({gain_pct:+.1f}%)\n\n"
+                        f"This setup didn't hold — treat as invalidated."
+                    )
+                    print(f"❌ Milestone breakout failed: {symbol} ({gain_pct:+.1f}%)")
                 to_remove.append(symbol)
                 continue
             if gain_pct < 0:
@@ -5195,7 +5271,7 @@ def check_milestone_watches():
                         w["retest_pending"] = True
                         def _on_milestone_retest_hold(sym, price, tf, _alert_price=w["alert_price"]):
                             gain_now = (price - _alert_price) / _alert_price * 100
-                            send_to_first_entry_group(TOPIC_FIRST_ENTRY,
+                            send_to_first_entry_group(TOPIC_MONITORING,
                                 f"🔄 <b>Retest Held, Resuming — {sym}</b>\n\n"
                                 f"✅ Retest held on {tf.upper()} — pump may continue.\n"
                                 f"💰 Now: {format_price(price)} (+{gain_now:.1f}% from original alert)"
@@ -5220,7 +5296,7 @@ def check_milestone_watches():
                     w["last_weak_alert"] = now
                     w["weak_since_price"] = current_price
                     w["weakening_active"] = True
-                    send_to_first_entry_group(TOPIC_FIRST_ENTRY,
+                    send_to_first_entry_group(TOPIC_MONITORING,
                         f"⚠️ <b>Structure Weakening — {symbol}</b>\n\n"
                         f"💰 Now: {format_price(current_price)} (+{gain_pct:.1f}% from alert price {format_price(w['alert_price'])})\n"
                         f"   {weak_warning}\n\n"
@@ -5253,7 +5329,7 @@ def check_milestone_watches():
                     if resumed:
                         w["weakening_active"] = False
                         gain_from_alert = (current_price - w["alert_price"]) / w["alert_price"] * 100
-                        send_to_first_entry_group(TOPIC_FIRST_ENTRY,
+                        send_to_first_entry_group(TOPIC_MONITORING,
                             f"🔄 <b>Resumed Growth — {symbol}</b>\n\n"
                             f"Growth resumed after the earlier Structure Weakening warning.\n"
                             f"💰 Now: {format_price(current_price)} (+{gain_from_alert:.1f}% from original alert)\n\n"
@@ -12649,6 +12725,16 @@ def main():
             time.sleep(15)  # check every 15s for faster live cross detection
 
     Thread(target=run_manual_lines, daemon=True).start()
+
+    def run_1h_line_early_warning():
+        while True:
+            try:
+                scan_1h_line_early_warning()
+            except Exception as e:
+                print(f"1H line early warning error: {e}")
+            time.sleep(180)  # every 3 minutes
+
+    Thread(target=run_1h_line_early_warning, daemon=True).start()
 
     def run_vol_accum_scanner():
         while True:
