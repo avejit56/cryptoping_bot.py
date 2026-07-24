@@ -5211,6 +5211,21 @@ def run_backtest_symbol(symbol, days=30):
         if vol_ratio < 2.0 or buy_ratio < 0.55:
             continue
 
+        # Condition metadata (user request — need to know WHICH factors
+        # actually predict success, not just an aggregate number) — bucket
+        # each signal by its own volume/buy-pressure strength, whether
+        # price was above its own 1-day moving average (simple trend
+        # proxy), and the local liquidity level at that point in time.
+        vol_bucket = "5x+" if vol_ratio >= 5.0 else ("3-5x" if vol_ratio >= 3.0 else "2-3x")
+        buy_bucket = "75%+" if buy_ratio >= 0.75 else ("65-75%" if buy_ratio >= 0.65 else "55-65%")
+        ma_window = klines[max(0, i - 95):i + 1]
+        ma_closes = [float(k[4]) for k in ma_window]
+        day_ma = sum(ma_closes) / len(ma_closes) if ma_closes else last_close
+        above_ma = last_close > day_ma
+        local_quote_vols = [float(k[5]) * float(k[4]) for k in window]
+        avg_quote_vol_per_candle = sum(local_quote_vols) / len(local_quote_vols) if local_quote_vols else 0
+        liquidity_bucket = "high" if avg_quote_vol_per_candle >= 50_000 else "low"
+
         # Signal "fires" here in the simulation — check REAL subsequent
         # price action already present in the historical data.
         future = klines[i + 1:i + 1 + lookahead]
@@ -5225,6 +5240,8 @@ def run_backtest_symbol(symbol, days=30):
             "peak_gain": peak_gain, "max_drawdown": max_drawdown,
             "hit_10": peak_gain >= 10, "hit_30": peak_gain >= 30,
             "dumped": max_drawdown <= -10,
+            "vol_bucket": vol_bucket, "buy_bucket": buy_bucket,
+            "above_ma": above_ma, "liquidity_bucket": liquidity_bucket,
         })
 
     if not results:
@@ -5237,6 +5254,7 @@ def run_backtest_symbol(symbol, days=30):
         "hit_30": sum(1 for r in results if r["hit_30"]),
         "dumped": sum(1 for r in results if r["dumped"]),
         "avg_peak": sum(r["peak_gain"] for r in results) / total,
+        "raw_results": results,
     }
 
 
@@ -5276,6 +5294,53 @@ def run_backtest_batch(symbols, days=30):
         if r["total"] < 3:
             continue
         lines.append(f"   {r['symbol']}: {r['total']} signals, {r['hit_10']/r['total']*100:.0f}% hit +10%+, avg peak +{r['avg_peak']:.1f}%")
+
+    # Correlation analysis (user's core question — WHICH factors actually
+    # predict success vs failure, not just an aggregate number). Pools the
+    # raw per-signal condition metadata across ALL coins and breaks down
+    # hit-rate by each factor bucket.
+    all_raw = [rr for r in all_results for rr in r.get("raw_results", [])]
+    if all_raw:
+        def _bucket_stats(key, buckets):
+            out = {}
+            for b in buckets:
+                sub = [rr for rr in all_raw if rr[key] == b]
+                if sub:
+                    out[b] = (len(sub), sum(1 for rr in sub if rr["hit_10"]) / len(sub) * 100,
+                               sum(1 for rr in sub if rr["dumped"]) / len(sub) * 100)
+            return out
+
+        lines.append("\n🔬 <b>Which factors actually predict success:</b>")
+
+        vol_stats = _bucket_stats("vol_bucket", ["2-3x", "3-5x", "5x+"])
+        lines.append("\n<b>Volume strength:</b>")
+        for b, (n, hit, dump) in vol_stats.items():
+            lines.append(f"   {b}: {n} signals, {hit:.0f}% hit +10%+, {dump:.0f}% dumped")
+
+        buy_stats = _bucket_stats("buy_bucket", ["55-65%", "65-75%", "75%+"])
+        lines.append("\n<b>Buy pressure:</b>")
+        for b, (n, hit, dump) in buy_stats.items():
+            lines.append(f"   {b}: {n} signals, {hit:.0f}% hit +10%+, {dump:.0f}% dumped")
+
+        above_ma_signals = [rr for rr in all_raw if rr["above_ma"]]
+        below_ma_signals = [rr for rr in all_raw if not rr["above_ma"]]
+        lines.append("\n<b>Trend (price vs 1D moving average):</b>")
+        if above_ma_signals:
+            hit = sum(1 for rr in above_ma_signals if rr["hit_10"]) / len(above_ma_signals) * 100
+            dump = sum(1 for rr in above_ma_signals if rr["dumped"]) / len(above_ma_signals) * 100
+            lines.append(f"   Above 1D MA: {len(above_ma_signals)} signals, {hit:.0f}% hit +10%+, {dump:.0f}% dumped")
+        if below_ma_signals:
+            hit = sum(1 for rr in below_ma_signals if rr["hit_10"]) / len(below_ma_signals) * 100
+            dump = sum(1 for rr in below_ma_signals if rr["dumped"]) / len(below_ma_signals) * 100
+            lines.append(f"   Below 1D MA: {len(below_ma_signals)} signals, {hit:.0f}% hit +10%+, {dump:.0f}% dumped")
+
+        liq_stats = _bucket_stats("liquidity_bucket", ["high", "low"])
+        lines.append("\n<b>Local liquidity:</b>")
+        for b, (n, hit, dump) in liq_stats.items():
+            lines.append(f"   {b}: {n} signals, {hit:.0f}% hit +10%+, {dump:.0f}% dumped")
+
+        lines.append("\n💡 Whichever bucket shows the clearly higher hit-rate/lower dump-rate is the threshold worth "
+                      "tightening toward (e.g. if '5x+' volume clearly outperforms '2-3x', raise the minimum volume requirement).")
 
     return "\n".join(lines)
 
@@ -13035,11 +13100,28 @@ def handle_commands():
                                     send_to(_chat, f"📊 Not enough historical signal points found for {_sym} in {_days} days.", thread_id=_thread)
                                     return
                                 msg_bt = (
-                                    f"📊 <b>Backtest — {_sym}</b> ({_days} days, {r['total']} simulated signals)\n\n"
+                                    f"📊 <b>Backtest — {_sym}</b> ({_days} days, {r['total']} simulated signals)\n"
+                                    f"<i>(simulation only — replays the core detection logic against history, not live topic data)</i>\n\n"
                                     f"✅ Hit +10%+: {r['hit_10']} ({r['hit_10']/r['total']*100:.0f}%)\n"
                                     f"🚀 Hit +30%+: {r['hit_30']} ({r['hit_30']/r['total']*100:.0f}%)\n"
                                     f"❌ Dumped 10%+: {r['dumped']} ({r['dumped']/r['total']*100:.0f}%)\n"
                                     f"📈 Avg peak gain: +{r['avg_peak']:.1f}%"
+                                )
+                                raw = r.get("raw_results", [])
+                                if raw:
+                                    above_ma = [rr for rr in raw if rr["above_ma"]]
+                                    vol5x = [rr for rr in raw if rr["vol_bucket"] == "5x+"]
+                                    high_liq = [rr for rr in raw if rr["liquidity_bucket"] == "high"]
+                                    msg_bt += (
+                                        f"\n\n🔬 <b>Why this coin's signals performed this way:</b>\n"
+                                        f"   {len(above_ma)}/{len(raw)} signals fired while price was above its 1D MA\n"
+                                        f"   {len(vol5x)}/{len(raw)} signals had 5x+ volume (strongest tier)\n"
+                                        f"   {len(high_liq)}/{len(raw)} signals had high local liquidity"
+                                    )
+                                msg_bt += (
+                                    "\n\n⚠️ This only tests INITIAL detection accuracy — it does NOT simulate the live "
+                                    "monitoring/follow-up system (Structure Weakening, Resumed Growth). For that, use "
+                                    "/monitoringquality (live data, not backtest)."
                                 )
                                 send_to(_chat, msg_bt, thread_id=_thread)
                             Thread(target=_run_single_backtest, daemon=True).start()
