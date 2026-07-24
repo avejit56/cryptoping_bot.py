@@ -5622,7 +5622,17 @@ def scan_for_milestone_candidates():
             recent_lows_sl = [float(k[3]) for k in recent[-8:]]
             suggested_sl = min(recent_lows_sl) * 0.98 if recent_lows_sl else last_close * 0.95
             sl_pct_sugg = (last_close - suggested_sl) / last_close * 100
-            sl_note = f"🔴 If entering, consider SL below {format_price(suggested_sl)} (-{sl_pct_sugg:.1f}%) — below the recent local swing low, not a fixed %\n"
+
+            # TP suggestion (nearest resistance) + R/R ratio (user request)
+            highs_above_ep = [float(k[2]) for k in closed[-60:] if float(k[2]) > last_close * 1.02]
+            suggested_tp = min(highs_above_ep) if highs_above_ep else last_close * 1.10
+            tp_pct_sugg = (suggested_tp - last_close) / last_close * 100
+            rr_sugg = tp_pct_sugg / sl_pct_sugg if sl_pct_sugg > 0 else 0
+            sl_note = (
+                f"🔴 If entering, consider SL below {format_price(suggested_sl)} (-{sl_pct_sugg:.1f}%) — below the recent local swing low, not a fixed %\n"
+                f"🟢 Nearest resistance (rough TP ref): {format_price(suggested_tp)} (+{tp_pct_sugg:.1f}%)\n"
+                f"⚖️ R/R: {rr_sugg:.1f}x (risk {sl_pct_sugg:.1f}% to make {tp_pct_sugg:.1f}%)\n"
+            )
 
             _milestone_scan_alerted[symbol] = now
             msg = (
@@ -5786,15 +5796,24 @@ def check_milestone_watches():
                     # not an arbitrary fixed %. Recalculated at each
                     # milestone since the "recent" structure shifts as
                     # price moves.
-                    klines_15m_sl = get_klines(symbol, interval="15m", limit=10)
+                    klines_15m_sl = get_klines(symbol, interval="15m", limit=40)
                     sl_note_m = ""
                     if klines_15m_sl and len(klines_15m_sl) >= 8:
-                        recent_lows_sl_m = [float(k[3]) for k in klines_15m_sl[:-1][-8:]]
+                        closed_15m_sl = klines_15m_sl[:-1]
+                        recent_lows_sl_m = [float(k[3]) for k in closed_15m_sl[-8:]]
                         if recent_lows_sl_m:
                             suggested_sl_m = min(recent_lows_sl_m) * 0.98
                             sl_pct_sugg_m = (current_price - suggested_sl_m) / current_price * 100
                             if sl_pct_sugg_m > 0:
-                                sl_note_m = f"🔴 SL reference: below {format_price(suggested_sl_m)} (-{sl_pct_sugg_m:.1f}%) — below recent local swing low\n"
+                                highs_above_m = [float(k[2]) for k in closed_15m_sl[-30:] if float(k[2]) > current_price * 1.02]
+                                suggested_tp_m = min(highs_above_m) if highs_above_m else current_price * 1.10
+                                tp_pct_sugg_m = (suggested_tp_m - current_price) / current_price * 100
+                                rr_sugg_m = tp_pct_sugg_m / sl_pct_sugg_m if sl_pct_sugg_m > 0 else 0
+                                sl_note_m = (
+                                    f"🔴 SL reference: below {format_price(suggested_sl_m)} (-{sl_pct_sugg_m:.1f}%) — below recent local swing low\n"
+                                    f"🟢 Nearest resistance (rough TP ref): {format_price(suggested_tp_m)} (+{tp_pct_sugg_m:.1f}%)\n"
+                                    f"⚖️ R/R: {rr_sugg_m:.1f}x\n"
+                                )
 
                     msg = (
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
@@ -10754,6 +10773,7 @@ def check_scalp_opportunity(symbol):
     if sl_pct > 8.0:
         return  # SL too far away for a scalp — not a clean setup
 
+    rr_ratio = tp1_pct / sl_pct if sl_pct > 0 else 0
     _scalp_alerted[symbol] = now
     send_to_topic(TOPIC_SPIKES,
         f"⚡ <b>SCALP SETUP — {symbol}</b> [for scalping]\n\n"
@@ -10764,7 +10784,8 @@ def check_scalp_opportunity(symbol):
         f"📊 24h volume: ${quote_vol_24h/1e6:.1f}M | Volatile: {big_swing_count}x 8%+ swings recently\n\n"
         f"📐 Entry: {format_price(current_price)}\n"
         f"🔴 SL: {format_price(sl)} (-{sl_pct:.1f}%)\n"
-        f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%) — next local resistance\n\n"
+        f"🟢 TP1: {format_price(tp1)} (+{tp1_pct:.1f}%) — next local resistance\n"
+        f"⚖️ R/R: {rr_ratio:.1f}x (risk {sl_pct:.1f}% to make {tp1_pct:.1f}%)\n\n"
         f"⚠️ <i>Fast/scalp setup — confirm on chart, use a tight stop-loss.</i>"
     )
     print(f"⚡ Scalp setup: {symbol} vol={vol_ratio:.1f}x tp1=+{tp1_pct:.1f}%")
