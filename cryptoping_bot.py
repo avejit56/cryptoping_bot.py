@@ -669,6 +669,8 @@ def load_from_telegram():
     load_retest_watch()
     load_manual_lines()
     load_bigpump_quality_log()
+    load_milestone_outcome_log()
+    load_monitoring_quality_log()
     sanitize_persisted_symbols()  # clean up any pre-existing bad-symbol entries (e.g. "0.0874USDT")
 
 # ─── TELEGRAM ─────────────────────────────────────────────
@@ -1016,26 +1018,174 @@ def get_pattern_history_stats(pattern_name, min_samples=3):
     return f"📊 Historical ({len(gains)} past signals): avg +{avg_gain:.0f}% peak, {hit_pct:.0f}% reached +15%+"
 
 
+_monitoring_quality_log = {}  # {signal_id: {symbol, event_type, signal_time, signal_price, peak_price, lowest_price, resolved, ...}}
+MONITORING_QUALITY_FILE = os.path.join(_BOT_DIR, "monitoring_quality.json")
+
+def save_monitoring_quality_log():
+    try:
+        with open(MONITORING_QUALITY_FILE, "w") as f:
+            _json.dump(_monitoring_quality_log, f, indent=2)
+    except Exception as e:
+        print(f"Monitoring quality log save error: {e}")
+
+def load_monitoring_quality_log():
+    global _monitoring_quality_log
+    try:
+        if os.path.exists(MONITORING_QUALITY_FILE):
+            with open(MONITORING_QUALITY_FILE) as f:
+                _monitoring_quality_log = _json.load(f)
+            print(f"✅ Monitoring quality log loaded: {len(_monitoring_quality_log)}")
+    except Exception as e:
+        print(f"Monitoring quality log load error: {e}")
+
+def track_monitoring_quality(symbol, event_type, current_price):
+    """
+    Quality tracking for follow-up/monitoring messages specifically (not
+    the original signal) — catches false positives like:
+    - "Resumed Growth" announced, but the coin dumped right after anyway
+      (false "all clear")
+    - "Structure Weakening" announced (implying exit), but the coin then
+      had a big pump afterward (false alarm — premature exit warning cost
+      the user a real move, per user's exact concern)
+    Uses a shorter 24h resolution window since these are meant to be
+    immediate/reactive calls, not long-horizon setups.
+    """
+    try:
+        signal_id = f"{symbol}_{event_type}_{int(time.time())}"
+        _monitoring_quality_log[signal_id] = {
+            "symbol": symbol, "event_type": event_type,
+            "signal_time": time.time(), "signal_price": current_price,
+            "peak_price": current_price, "lowest_price": current_price,
+            "resolved": False,
+        }
+    except Exception as e:
+        print(f"Monitoring quality tracking error {symbol}: {e}")
+
+def check_monitoring_quality_tracking():
+    """Runs periodically: resolves each tracked follow-up event after 24h
+    and classifies it as correct or a false positive."""
+    now = time.time()
+    changed = False
+    for sid, data in list(_monitoring_quality_log.items()):
+        if data.get("resolved"):
+            continue
+        try:
+            ticker = get_ticker(data["symbol"])
+            if not ticker:
+                continue
+            price = float(ticker["lastPrice"])
+            if price > data["peak_price"]:
+                data["peak_price"] = price
+                changed = True
+            if price < data["lowest_price"]:
+                data["lowest_price"] = price
+                changed = True
+
+            if now - data["signal_time"] >= 24 * 3600:
+                gain_pct = (data["peak_price"] - data["signal_price"]) / data["signal_price"] * 100
+                drawdown_pct = (data["lowest_price"] - data["signal_price"]) / data["signal_price"] * 100
+                data["final_gain_pct"] = gain_pct
+                data["final_drawdown_pct"] = drawdown_pct
+
+                if data["event_type"] == "resumed_growth":
+                    # Correct if it actually kept growing (5%+ further);
+                    # false positive if it dumped right after being told
+                    # growth had "resumed"
+                    data["correct"] = gain_pct >= 5.0 and drawdown_pct > -5.0
+                    data["false_positive"] = drawdown_pct <= -7.0
+                elif data["event_type"] == "structure_weakening":
+                    # Correct if it actually declined (justified the exit
+                    # warning); false positive (premature exit call) if it
+                    # instead pumped 15%+ afterward
+                    data["correct"] = drawdown_pct <= -5.0
+                    data["false_positive"] = gain_pct >= 15.0
+
+                data["resolved"] = True
+                changed = True
+        except Exception as e:
+            print(f"Monitoring quality check error {sid}: {e}")
+
+    to_remove = [sid for sid, d in _monitoring_quality_log.items()
+                 if d.get("resolved") and now - d["signal_time"] > 30 * 24 * 3600]
+    for sid in to_remove:
+        _monitoring_quality_log.pop(sid, None)
+        changed = True
+
+    if changed:
+        save_monitoring_quality_log()
+
+def generate_monitoring_quality_report():
+    """
+    Report on follow-up/monitoring event accuracy, broken down per-coin
+    where possible, so specific false-positive patterns can be identified
+    and fixed (user's exact request: 'resumed growth then dumped' and
+    'structure weakening then big pump missed' cases).
+    """
+    now = time.time()
+    recent = [d for d in _monitoring_quality_log.values()
+              if d.get("resolved") and now - d["signal_time"] < 30 * 24 * 3600]
+    if not recent:
+        return None
+
+    by_type = {}
+    for d in recent:
+        et = d["event_type"]
+        stats = by_type.setdefault(et, {"total": 0, "correct": 0, "false_positive": 0, "examples_fp": []})
+        stats["total"] += 1
+        if d.get("correct"):
+            stats["correct"] += 1
+        if d.get("false_positive"):
+            stats["false_positive"] += 1
+            stats["examples_fp"].append(f"{d['symbol']} ({d.get('final_gain_pct', 0):+.1f}% / {d.get('final_drawdown_pct', 0):+.1f}%)")
+
+    lines = [f"📊 <b>Monitoring/Follow-up Quality Report</b> (last 30 days, {len(recent)} events)\n"]
+    labels = {"resumed_growth": "🔄 Resumed Growth", "structure_weakening": "⚠️ Structure Weakening"}
+    for et, stats in by_type.items():
+        total = stats["total"]
+        correct_rate = stats["correct"] / total * 100 if total else 0
+        fp_rate = stats["false_positive"] / total * 100 if total else 0
+        label = labels.get(et, et)
+        flag = "⚠️ NEEDS REVIEW" if fp_rate > 30 and total >= 5 else "✅"
+        lines.append(f"\n<b>{label}</b> {flag}")
+        lines.append(f"   {total} events | {correct_rate:.0f}% correct | {fp_rate:.0f}% false positive")
+        if stats["examples_fp"]:
+            lines.append(f"   Recent false positives: {', '.join(stats['examples_fp'][-5:])}")
+
+    lines.append("\n💡 High false-positive rate on Structure Weakening = premature exit calls costing real moves. "
+                  "High false-positive rate on Resumed Growth = false all-clear signals. Both need their trigger conditions tightened if flagged.")
+    return "\n".join(lines)
+
+
 def track_bigpump_quality(symbol, source, current_price):
     """
     Quality-tracking automation for Big Pump / High Priority messages.
     Tags every signal that reaches these topics with its SOURCE (Extreme
     Pump bypass, High Confidence score>=4, Manual Line Break, BTC
-    Divergence, PUMP CONFIRMED, etc), then tracks its actual outcome over
-    the next 3 days (peak gain, worst drawdown). A periodic report (see
-    generate_bigpump_quality_report) breaks performance down BY SOURCE so
-    consistently underperforming trigger types can be identified and
-    tightened — this is how quality gets improved gradually, based on real
-    outcomes rather than guessing.
+    Divergence, PUMP CONFIRMED, Early Prospect (290-coin scan), etc), then
+    tracks its actual outcome over the next 3 days (peak gain, worst
+    drawdown). Also captures context (24h liquidity, BTC's condition at
+    signal time) so a failed signal can be root-caused later (low
+    liquidity vs BTC market-wide decline vs momentum just not sustaining).
+    A periodic report (see generate_bigpump_quality_report) breaks
+    performance down BY SOURCE so consistently underperforming trigger
+    types can be identified and tightened — this is how quality gets
+    improved gradually, based on real outcomes rather than guessing.
     """
     try:
         signal_id = f"{symbol}_{source}_{int(time.time())}"
+        ticker = get_ticker(symbol)
+        quote_vol_24h = float(ticker.get("quoteVolume", 0)) if ticker else 0
+        btc_ticker = get_ticker("BTCUSDT")
+        btc_change_at_signal = float(btc_ticker.get("priceChangePercent", 0)) if btc_ticker else 0
+
         _bigpump_quality_log[signal_id] = {
             "symbol": symbol, "source": source,
             "signal_time": time.time(), "signal_price": current_price,
             "peak_price": current_price, "peak_time": time.time(),
             "lowest_price": current_price,
             "resolved": False,
+            "liquidity_24h": quote_vol_24h,
+            "btc_change_at_signal": btc_change_at_signal,
         }
     except Exception as e:
         print(f"Big Pump quality tracking error {symbol}: {e}")
@@ -1071,7 +1221,32 @@ def check_bigpump_quality_tracking():
                 data["final_gain_pct"] = gain_pct
                 data["final_drawdown_pct"] = drawdown_pct
                 data["hit_15pct"] = gain_pct >= 15.0
+                data["hit_30pct"] = gain_pct >= 30.0  # "big pump" threshold
                 data["dumped"] = drawdown_pct <= -10.0
+
+                # Root-cause tagging (user request): WHY did a dumped/
+                # underperforming signal fail? Check liquidity at signal
+                # time, and whether BTC itself declined significantly
+                # during the 3-day window (market-wide vs coin-specific).
+                if data["dumped"] and not data["hit_15pct"]:
+                    reasons = []
+                    if data.get("liquidity_24h", 0) < 1_000_000:
+                        reasons.append("low liquidity")
+                    try:
+                        btc_klines_check = get_klines("BTCUSDT", interval="1d", limit=5)
+                        if btc_klines_check and len(btc_klines_check) >= 3:
+                            btc_closed = btc_klines_check[:-1]
+                            btc_start = float(btc_closed[0][1])
+                            btc_end = float(btc_closed[-1][4])
+                            btc_window_change = (btc_end - btc_start) / btc_start * 100 if btc_start > 0 else 0
+                            if btc_window_change <= -3.0:
+                                reasons.append("BTC market-wide decline")
+                    except Exception:
+                        pass
+                    if not reasons:
+                        reasons.append("momentum didn't sustain (volume dried up)")
+                    data["fail_reasons"] = reasons
+
                 data["resolved"] = True
                 changed = True
         except Exception as e:
@@ -1087,25 +1262,79 @@ def check_bigpump_quality_tracking():
     if changed:
         save_bigpump_quality_log()
 
+def generate_milestone_stats_report():
+    """
+    User request: how many Early Prospect coins go on to reach the full
+    progression (2%→4%→10%→20%+) vs how many fail/dump early (e.g. only
+    reach 2% before reversing)? Shows a distribution of the highest
+    milestone each tracked coin reached before its watch ended.
+    """
+    if not _milestone_outcome_log:
+        return None
+
+    now = time.time()
+    recent = [r for r in _milestone_outcome_log if now - r["ended"] < 14 * 24 * 3600]  # last 14 days
+    if not recent:
+        return None
+
+    buckets = {
+        "Only 1-2%": 0, "Reached 4%": 0, "Reached 10-15%": 0,
+        "Reached 20-30%": 0, "Reached 40%+": 0,
+    }
+    for r in recent:
+        m = r["max_milestone"]
+        if m <= 2:
+            buckets["Only 1-2%"] += 1
+        elif m == 4:
+            buckets["Reached 4%"] += 1
+        elif m in (10, 15):
+            buckets["Reached 10-15%"] += 1
+        elif m in (20, 25, 30):
+            buckets["Reached 20-30%"] += 1
+        else:
+            buckets["Reached 40%+"] += 1
+
+    total = len(recent)
+    failed_early = sum(1 for r in recent if r["outcome"] == "failed_reversed" and r["max_milestone"] <= 4)
+
+    lines = [f"📊 <b>Milestone Progression Stats</b> (last 14 days, {total} tracked)\n"]
+    for label, count in buckets.items():
+        pct = count / total * 100 if total else 0
+        lines.append(f"   {label}: {count} ({pct:.0f}%)")
+    lines.append(f"\n⚠️ Failed/reversed after only reaching ≤4%: {failed_early} ({failed_early/total*100:.0f}% of all tracked)")
+    return "\n".join(lines)
+
+
 def generate_bigpump_quality_report():
     """
-    Weekly quality report broken down by source type, sent to the admin —
+    Full quality report, sent to the admin / available via /quality —
     flags underperforming sources (low hit-rate on +15%+, high dump-rate)
     for manual review/threshold tightening. This is the "gradually upgrade
     quality" mechanism: real outcome data by source, not guesswork.
+
+    User request additions: (1) overall stats — what % of ALL signals hit
+    +10%/+30% ("big pump") vs dumped, (2) root-cause breakdown for dumped
+    signals (low liquidity / BTC market-wide decline / momentum didn't
+    sustain), (3) comparison between topic-specific triggers (My Setups/
+    High Priority/Big Pump/Scalping) and the watchlist-wide 290-coin
+    Early Prospect scan — which performs better.
     """
     now = time.time()
     by_source = {}
+    all_resolved = []
     for data in _bigpump_quality_log.values():
         if not data.get("resolved"):
             continue
         if now - data["signal_time"] > 30 * 24 * 3600:
             continue  # only last 30 days
+        all_resolved.append(data)
         src = data.get("source", "Unknown")
-        stats = by_source.setdefault(src, {"total": 0, "hit_15": 0, "dumped": 0, "gains": []})
+        stats = by_source.setdefault(src, {"total": 0, "hit_15": 0, "hit_30": 0, "dumped": 0, "gains": []})
         stats["total"] += 1
         if data.get("hit_15pct"):
             stats["hit_15"] += 1
+        if data.get("hit_30pct"):
+            stats["hit_30"] += 1
         if data.get("dumped"):
             stats["dumped"] += 1
         stats["gains"].append(data.get("final_gain_pct", 0))
@@ -1113,16 +1342,53 @@ def generate_bigpump_quality_report():
     if not by_source:
         return None
 
-    lines = ["📊 <b>Big Pump / High Priority Quality Report</b> (last 30 days)\n"]
+    total_all = len(all_resolved)
+    hit_10_all = sum(1 for d in all_resolved if d.get("final_gain_pct", 0) >= 10.0)
+    hit_30_all = sum(1 for d in all_resolved if d.get("hit_30pct"))
+    dumped_all = sum(1 for d in all_resolved if d.get("dumped"))
+
+    lines = [f"📊 <b>Full Quality Report</b> (last 30 days, {total_all} total signals)\n"]
+    lines.append(f"✅ Reached +10%+: {hit_10_all} ({hit_10_all/total_all*100:.0f}%)")
+    lines.append(f"🚀 Big pump (+30%+): {hit_30_all} ({hit_30_all/total_all*100:.0f}%)")
+    lines.append(f"❌ Dumped 10%+: {dumped_all} ({dumped_all/total_all*100:.0f}%)")
+
+    # Root-cause breakdown for dumped/failed signals
+    fail_reason_tally = {}
+    for d in all_resolved:
+        if d.get("dumped") and not d.get("hit_15pct"):
+            for r in d.get("fail_reasons", ["unknown"]):
+                fail_reason_tally[r] = fail_reason_tally.get(r, 0) + 1
+    if fail_reason_tally:
+        lines.append("\n🔍 <b>Why signals failed (root cause):</b>")
+        for reason, count in sorted(fail_reason_tally.items(), key=lambda x: -x[1]):
+            lines.append(f"   {reason}: {count}")
+
+    # Topic-specific vs 290-coin-scan comparison
+    scan_data = [d for d in all_resolved if d.get("source", "").startswith("Early Prospect")]
+    topic_data = [d for d in all_resolved if not d.get("source", "").startswith("Early Prospect")]
+    if scan_data and topic_data:
+        scan_hit10 = sum(1 for d in scan_data if d.get("final_gain_pct", 0) >= 10.0) / len(scan_data) * 100
+        topic_hit10 = sum(1 for d in topic_data if d.get("final_gain_pct", 0) >= 10.0) / len(topic_data) * 100
+        scan_dump = sum(1 for d in scan_data if d.get("dumped")) / len(scan_data) * 100
+        topic_dump = sum(1 for d in topic_data if d.get("dumped")) / len(topic_data) * 100
+        lines.append(f"\n⚖️ <b>290-coin scan vs Topic-specific sources:</b>")
+        lines.append(f"   Early Prospect (290-coin scan): {len(scan_data)} signals | {scan_hit10:.0f}% hit +10%+ | {scan_dump:.0f}% dumped")
+        lines.append(f"   Topic-specific (My Setups/High Priority/Big Pump/Scalping): {len(topic_data)} signals | {topic_hit10:.0f}% hit +10%+ | {topic_dump:.0f}% dumped")
+        better = "290-coin scan" if scan_hit10 > topic_hit10 else "Topic-specific sources"
+        lines.append(f"   → {better} performing better on hit-rate right now")
+
+    lines.append("\n📋 <b>By source:</b>")
     for src, stats in sorted(by_source.items(), key=lambda x: -x[1]["total"]):
         total = stats["total"]
         hit_rate = stats["hit_15"] / total * 100 if total else 0
+        hit30_rate = stats["hit_30"] / total * 100 if total else 0
         dump_rate = stats["dumped"] / total * 100 if total else 0
         avg_gain = sum(stats["gains"]) / total if total else 0
         flag = "⚠️ NEEDS REVIEW" if (hit_rate < 30 or dump_rate > 40) and total >= 5 else "✅"
         lines.append(
             f"\n<b>{src}</b> {flag}\n"
-            f"   {total} signals | {hit_rate:.0f}% hit +15%+ | {dump_rate:.0f}% dumped | avg peak +{avg_gain:.1f}%"
+            f"   {total} signals | {hit_rate:.0f}% hit +15%+ | {hit30_rate:.0f}% hit +30%+ | "
+            f"{dump_rate:.0f}% dumped | avg peak +{avg_gain:.1f}%"
         )
     lines.append("\n💡 Sources flagged \"NEEDS REVIEW\" have a low hit-rate or high dump-rate — consider tightening their trigger conditions.")
     return "\n".join(lines)
@@ -4867,6 +5133,153 @@ def _check_staircase_pattern(symbol, tf="1h"):
         return False
 
 
+def _fetch_backtest_klines(symbol, interval, total_needed):
+    """
+    Paginated historical klines fetch for backtesting (bypasses the normal
+    cache since historical data never changes, and Binance caps each call
+    at 1000 candles so longer lookbacks need multiple paginated requests
+    using endTime).
+    """
+    all_klines = []
+    end_time = None
+    remaining = total_needed
+    attempts = 0
+    while remaining > 0 and attempts < 10:
+        attempts += 1
+        batch_limit = min(remaining, 1000)
+        params = {"symbol": symbol, "interval": interval, "limit": batch_limit}
+        if end_time:
+            params["endTime"] = end_time
+        try:
+            r = http_session.get("https://api.binance.com/api/v3/klines", params=params, timeout=15)
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            all_klines = batch + all_klines
+            end_time = int(batch[0][0]) - 1  # go further back next call
+            remaining -= len(batch)
+            if len(batch) < batch_limit:
+                break  # no more historical data available
+        except Exception as e:
+            print(f"Backtest klines fetch error {symbol}: {e}")
+            break
+    return all_klines
+
+
+def run_backtest_symbol(symbol, days=30):
+    """
+    Backtest engine (user request — 'main challenge accuracy rate barano'):
+    replays the Early Prospect detection logic (price deviation + volume +
+    buy pressure, the same core check used live) against HISTORICAL 15M
+    candles for one symbol, walking through chronologically with NO
+    look-ahead (only data available up to each simulated point is used).
+    For every point where the same conditions would have fired live,
+    checks the ACTUAL subsequent 3-day price action (already in the
+    historical data) to get a real outcome. This generates many more
+    samples in seconds than waiting weeks for live signals to resolve.
+    Returns a result dict or None.
+    """
+    candles_per_day = 96  # 15m candles
+    total_needed = min(days * candles_per_day + 300, 5000)  # + buffer for lookback/lookahead windows
+    klines = _fetch_backtest_klines(symbol, "15m", total_needed)
+    if not klines or len(klines) < 400:
+        return None
+
+    results = []
+    lookback = 12
+    lookahead = 288  # 3 days of 15m candles
+    for i in range(lookback, len(klines) - lookahead):
+        window = klines[max(0, i - lookback):i + 1]
+        baseline_price = float(window[0][1])
+        last = window[-1]
+        last_close = float(last[4])
+        if baseline_price <= 0:
+            continue
+        gain_pct = (last_close - baseline_price) / baseline_price * 100
+        if gain_pct < 2.0:
+            continue
+
+        l_vol = float(last[5])
+        prior_vols = [float(k[5]) for k in window[:-1]]
+        avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 1
+        vol_ratio = l_vol / avg_vol if avg_vol > 0 else 0
+        l_buy = float(last[9]) if len(last) > 9 else l_vol * 0.5
+        buy_ratio = l_buy / l_vol if l_vol > 0 else 0.5
+
+        if vol_ratio < 2.0 or buy_ratio < 0.55:
+            continue
+
+        # Signal "fires" here in the simulation — check REAL subsequent
+        # price action already present in the historical data.
+        future = klines[i + 1:i + 1 + lookahead]
+        if not future:
+            continue
+        future_highs = [float(k[2]) for k in future]
+        future_lows = [float(k[3]) for k in future]
+        peak_gain = (max(future_highs) - last_close) / last_close * 100
+        max_drawdown = (min(future_lows) - last_close) / last_close * 100
+
+        results.append({
+            "peak_gain": peak_gain, "max_drawdown": max_drawdown,
+            "hit_10": peak_gain >= 10, "hit_30": peak_gain >= 30,
+            "dumped": max_drawdown <= -10,
+        })
+
+    if not results:
+        return {"symbol": symbol, "total": 0}
+
+    total = len(results)
+    return {
+        "symbol": symbol, "total": total,
+        "hit_10": sum(1 for r in results if r["hit_10"]),
+        "hit_30": sum(1 for r in results if r["hit_30"]),
+        "dumped": sum(1 for r in results if r["dumped"]),
+        "avg_peak": sum(r["peak_gain"] for r in results) / total,
+    }
+
+
+def run_backtest_batch(symbols, days=30):
+    """Runs run_backtest_symbol across multiple symbols in parallel and
+    aggregates the results — gives a much bigger, faster picture of overall
+    strategy accuracy than waiting weeks for live signals."""
+    all_results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(run_backtest_symbol, sym, days): sym for sym in symbols}
+        for future in as_completed(futures):
+            try:
+                r = future.result()
+                if r and r.get("total", 0) > 0:
+                    all_results.append(r)
+            except Exception as e:
+                print(f"Backtest batch error {futures[future]}: {e}")
+
+    if not all_results:
+        return None
+
+    total_signals = sum(r["total"] for r in all_results)
+    total_hit10 = sum(r["hit_10"] for r in all_results)
+    total_hit30 = sum(r["hit_30"] for r in all_results)
+    total_dumped = sum(r["dumped"] for r in all_results)
+
+    lines = [
+        f"📊 <b>Backtest — Full Watchlist</b> ({days} days, {len(all_results)} coins, {total_signals} simulated signals)\n",
+        f"✅ Hit +10%+: {total_hit10} ({total_hit10/total_signals*100:.0f}%)",
+        f"🚀 Hit +30%+: {total_hit30} ({total_hit30/total_signals*100:.0f}%)",
+        f"❌ Dumped 10%+: {total_dumped} ({total_dumped/total_signals*100:.0f}%)",
+    ]
+
+    top_coins = sorted(all_results, key=lambda r: -r["hit_10"]/r["total"] if r["total"] >= 3 else -1)[:10]
+    lines.append("\n🏆 <b>Best-performing coins (min 3 signals):</b>")
+    for r in top_coins:
+        if r["total"] < 3:
+            continue
+        lines.append(f"   {r['symbol']}: {r['total']} signals, {r['hit_10']/r['total']*100:.0f}% hit +10%+, avg peak +{r['avg_peak']:.1f}%")
+
+    return "\n".join(lines)
+
+
 def _compute_power_score(symbol, current_price, buy_ratio=None):
     """
     Composite quality score (0-10) so the user can quickly triage which
@@ -5135,6 +5548,17 @@ def scan_for_milestone_candidates():
             # lead-time signal, checked at every stage per user's request.
             micro_note = _check_micro_volume_suggestion(symbol)
 
+            # Structure-based SL suggestion (GUNUSDT case): these
+            # Early Prospect/Milestone messages had no SL guidance at all,
+            # so the user had to guess one — often too tight for the
+            # coin's actual volatility, leading to premature stop-outs.
+            # Suggest an SL below the most recent local swing low (not an
+            # arbitrary fixed %), which respects this coin's own volatility.
+            recent_lows_sl = [float(k[3]) for k in recent[-8:]]
+            suggested_sl = min(recent_lows_sl) * 0.98 if recent_lows_sl else last_close * 0.95
+            sl_pct_sugg = (last_close - suggested_sl) / last_close * 100
+            sl_note = f"🔴 If entering, consider SL below {format_price(suggested_sl)} (-{sl_pct_sugg:.1f}%) — below the recent local swing low, not a fixed %\n"
+
             _milestone_scan_alerted[symbol] = now
             msg = (
                 f"🔍 <b>Early Prospect — {symbol}</b>\n\n"
@@ -5144,6 +5568,7 @@ def scan_for_milestone_candidates():
                 f"{smc_note}\n"
                 f"{breakout_note}"
                 + (f"{micro_note}\n" if micro_note else "") + "\n"
+                + sl_note + "\n"
                 + (f"💡 {opinion}\n\n" if opinion else "")
                 + f"Early signs of an abnormal move — price and volume both breaking above normal "
                 f"levels together. Now tracking for +1%/+2%/+4%/+10%/+15%... milestones.\n"
@@ -5153,6 +5578,7 @@ def scan_for_milestone_candidates():
             # ONLY to the dedicated First Entry group, not Scalping anymore.
             send_to_first_entry_group(TOPIC_FIRST_ENTRY, msg)
             start_milestone_watch(symbol, baseline_price, TOPIC_SPIKES, initial_gain_pct=gain_pct)
+            track_bigpump_quality(symbol, "Early Prospect (290-coin scan)", last_close)
             print(f"🔍 Early prospect (direct scan): {symbol} +{gain_pct:.1f}% vol={vol_ratio:.1f}x")
         except Exception as e:
             print(f"Milestone candidate scan error {symbol}: {e}")
@@ -5160,6 +5586,48 @@ def scan_for_milestone_candidates():
     with ThreadPoolExecutor(max_workers=10) as executor:
         list(executor.map(_check_one, list(watchlist)))
 
+
+
+_milestone_outcome_log = []  # [{symbol, milestones_hit, max_milestone, outcome, started, ended}]
+MILESTONE_OUTCOME_FILE = os.path.join(_BOT_DIR, "milestone_outcomes.json")
+
+def save_milestone_outcome_log():
+    try:
+        with open(MILESTONE_OUTCOME_FILE, "w") as f:
+            _json.dump(_milestone_outcome_log[-2000:], f, indent=2)  # keep last 2000
+    except Exception as e:
+        print(f"Milestone outcome log save error: {e}")
+
+def load_milestone_outcome_log():
+    global _milestone_outcome_log
+    try:
+        if os.path.exists(MILESTONE_OUTCOME_FILE):
+            with open(MILESTONE_OUTCOME_FILE) as f:
+                _milestone_outcome_log = _json.load(f)
+            print(f"✅ Milestone outcome log loaded: {len(_milestone_outcome_log)}")
+    except Exception as e:
+        print(f"Milestone outcome log load error: {e}")
+
+def _record_milestone_outcome(symbol, w, outcome):
+    """
+    User request: track which coins go from Early Prospect through the FULL
+    progression (1→2→4→10→20%+) vs which ones stop/dump early (e.g. only
+    reach 2% before failing). Records the final state when a milestone
+    watch ends, for later distribution analysis via /milestonestats.
+    """
+    try:
+        milestones_hit = w.get("milestones_hit", [])
+        _milestone_outcome_log.append({
+            "symbol": symbol,
+            "milestones_hit": milestones_hit,
+            "max_milestone": max(milestones_hit) if milestones_hit else 0,
+            "outcome": outcome,
+            "started": w.get("started", time.time()),
+            "ended": time.time(),
+        })
+        save_milestone_outcome_log()
+    except Exception as e:
+        print(f"Milestone outcome record error {symbol}: {e}")
 
 
 def check_milestone_watches():
@@ -5170,6 +5638,7 @@ def check_milestone_watches():
     milestones = [1, 2, 4, 10, 15, 20, 25, 30, 40, 50, 75, 100]
     for symbol, w in list(_milestone_watch.items()):
         if now - w["started"] > 72 * 3600:
+            _record_milestone_outcome(symbol, w, "timeout_72h")
             to_remove.append(symbol)
             continue
         try:
@@ -5201,6 +5670,7 @@ def check_milestone_watches():
                         f"This setup didn't hold — treat as invalidated."
                     )
                     print(f"❌ Milestone breakout failed: {symbol} ({gain_pct:+.1f}%)")
+                _record_milestone_outcome(symbol, w, "failed_reversed")
                 to_remove.append(symbol)
                 continue
             if gain_pct < 0:
@@ -5246,11 +5716,27 @@ def check_milestone_watches():
                     else:
                         verdict = "⚡ <b>HOLD WITH CAUTION</b> — monitor closely, not a clean strong setup"
 
+                    # Structure-based SL suggestion (GUNUSDT case) — same
+                    # logic as Early Prospect: below recent local swing low,
+                    # not an arbitrary fixed %. Recalculated at each
+                    # milestone since the "recent" structure shifts as
+                    # price moves.
+                    klines_15m_sl = get_klines(symbol, interval="15m", limit=10)
+                    sl_note_m = ""
+                    if klines_15m_sl and len(klines_15m_sl) >= 8:
+                        recent_lows_sl_m = [float(k[3]) for k in klines_15m_sl[:-1][-8:]]
+                        if recent_lows_sl_m:
+                            suggested_sl_m = min(recent_lows_sl_m) * 0.98
+                            sl_pct_sugg_m = (current_price - suggested_sl_m) / current_price * 100
+                            if sl_pct_sugg_m > 0:
+                                sl_note_m = f"🔴 SL reference: below {format_price(suggested_sl_m)} (-{sl_pct_sugg_m:.1f}%) — below recent local swing low\n"
+
                     msg = (
                         f"📈 <b>+{m}% Milestone — {symbol}</b>\n\n"
                         f"{power_tier} (Power Score: {power_score}/10 — {power_reason})\n"
                         f"{verdict}\n\n"
-                        f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n\n"
+                        f"💰 Alert price: {format_price(w['alert_price'])} → Now: {format_price(current_price)} (+{gain_pct:.1f}%)\n"
+                        f"{sl_note_m}\n"
                         + freq_note
                         + (f"{fake_pump_note}\n\n" if fake_pump_note else "")
                         + (special_4pct_note + "\n" if special_4pct_note else "")
@@ -5303,6 +5789,7 @@ def check_milestone_watches():
                         f"💡 Consider securing profit — momentum may be turning."
                     )
                     print(f"⚠️ Milestone structure weakening: {symbol}")
+                    track_monitoring_quality(symbol, "structure_weakening", current_price)
 
             # FIX (ONDOUSDT case): after a Structure Weakening alert, there
             # was no follow-up if the coin recovered and resumed growing —
@@ -5336,6 +5823,7 @@ def check_milestone_watches():
                             f"⚠️ <i>Confirm on chart before entry.</i>"
                         )
                         print(f"🔄 Milestone resumed growth: {symbol}")
+                        track_monitoring_quality(symbol, "resumed_growth", current_price)
         except Exception as e:
             print(f"Milestone watch error {symbol}: {e}")
     for s in to_remove:
@@ -12508,6 +12996,70 @@ def handle_commands():
                         else:
                             reply("📊 Not enough resolved signals yet (each needs 3 days to resolve). Check back soon.")
 
+                elif text == "/MILESTONESTATS":
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        report = generate_milestone_stats_report()
+                        if report:
+                            reply(report)
+                        else:
+                            reply("📊 Not enough completed Early Prospect tracks yet. Check back soon.")
+
+                elif text == "/MONITORINGQUALITY":
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        report = generate_monitoring_quality_report()
+                        if report:
+                            reply(report)
+                        else:
+                            reply("📊 Not enough resolved monitoring events yet (each needs 24h to resolve). Check back soon.")
+
+                elif raw_text.upper().startswith("/BACKTEST ") and not raw_text.upper().startswith("/BACKTESTALL"):
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        parts_bt = raw_text.strip().split()
+                        sym_raw_bt = parts_bt[1].upper() if len(parts_bt) > 1 else ""
+                        days_bt = int(parts_bt[2]) if len(parts_bt) > 2 and parts_bt[2].isdigit() else 30
+                        if not is_plausible_symbol(sym_raw_bt):
+                            reply(f"⚠️ '{sym_raw_bt}' doesn't look like a valid symbol. Format: /backtest BTC 30")
+                        else:
+                            sym_bt = sym_raw_bt if sym_raw_bt.endswith("USDT") else sym_raw_bt + "USDT"
+                            reply(f"🔄 Running backtest on {sym_bt} ({days_bt} days)... this may take a moment.")
+
+                            def _run_single_backtest(_sym=sym_bt, _days=days_bt, _chat=chat_id, _thread=reply_thread_id):
+                                r = run_backtest_symbol(_sym, _days)
+                                if not r or r.get("total", 0) == 0:
+                                    send_to(_chat, f"📊 Not enough historical signal points found for {_sym} in {_days} days.", thread_id=_thread)
+                                    return
+                                msg_bt = (
+                                    f"📊 <b>Backtest — {_sym}</b> ({_days} days, {r['total']} simulated signals)\n\n"
+                                    f"✅ Hit +10%+: {r['hit_10']} ({r['hit_10']/r['total']*100:.0f}%)\n"
+                                    f"🚀 Hit +30%+: {r['hit_30']} ({r['hit_30']/r['total']*100:.0f}%)\n"
+                                    f"❌ Dumped 10%+: {r['dumped']} ({r['dumped']/r['total']*100:.0f}%)\n"
+                                    f"📈 Avg peak gain: +{r['avg_peak']:.1f}%"
+                                )
+                                send_to(_chat, msg_bt, thread_id=_thread)
+                            Thread(target=_run_single_backtest, daemon=True).start()
+
+                elif raw_text.upper().startswith("/BACKTESTALL"):
+                    if not is_admin:
+                        reply("⚠️ Admin only.")
+                    else:
+                        parts_bta = raw_text.strip().split()
+                        days_bta = int(parts_bta[1]) if len(parts_bta) > 1 and parts_bta[1].isdigit() else 30
+                        reply(f"🔄 Running backtest across the full watchlist ({days_bta} days)... this will take several minutes, I'll message when done.")
+
+                        def _run_batch_backtest(_days=days_bta, _chat=chat_id, _thread=reply_thread_id):
+                            report_bt = run_backtest_batch(list(watchlist), _days)
+                            if report_bt:
+                                send_to(_chat, report_bt, thread_id=_thread)
+                            else:
+                                send_to(_chat, "📊 Backtest found no qualifying historical signal points.", thread_id=_thread)
+                        Thread(target=_run_batch_backtest, daemon=True).start()
+
                 elif text == "/TRADES":
                     if not is_admin:
                         reply( "⚠️ Admin only.")
@@ -12813,6 +13365,16 @@ def main():
             time.sleep(3600)  # every hour — tracking peak/lowest price, not urgent
 
     Thread(target=run_bigpump_quality_checker, daemon=True).start()
+
+    def run_monitoring_quality_checker():
+        while True:
+            try:
+                check_monitoring_quality_tracking()
+            except Exception as e:
+                print(f"Monitoring quality tracking error: {e}")
+            time.sleep(1800)  # every 30 minutes — 24h resolution window needs closer tracking
+
+    Thread(target=run_monitoring_quality_checker, daemon=True).start()
 
     _last_quality_report = [0]
     def run_bigpump_quality_report():
